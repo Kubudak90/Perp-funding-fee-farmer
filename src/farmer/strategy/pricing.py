@@ -5,6 +5,8 @@ Everything here is side-effect free so it can be unit-tested exhaustively.
 
 from __future__ import annotations
 
+import math
+import time
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 
@@ -20,6 +22,52 @@ class Quote:
     hedge_price: Decimal  # taker VWAP used to derive the limit
     limit_price: Decimal  # edge-limit (worst acceptable maker price before tick rounding)
     expected_edge_bps: Decimal  # edge vs the hedge at the quoted price (after fees)
+
+
+class BasisTracker:
+    """EMA of the structural price gap ``basis = maker_mid / taker_mid - 1``.
+
+    Crypto pairs carry a persistent ~10 bps gap (Arcus USD oracle vs Lighter USDT index). Pricing
+    the hedge edge against ``taker_price * (1 + basis)`` keeps entry+exit round trips near zero
+    cost instead of making one side of every cycle unfillable.
+    """
+
+    def __init__(self, halflife_s: float = 600.0, *, clock=time.time) -> None:
+        self.halflife_s = max(halflife_s, 1e-9)
+        self._clock = clock
+        self.value: Decimal | None = None
+        self.last: Decimal | None = None  # most recent instantaneous sample
+        self._last_ts: float | None = None
+        self.first_ts: float | None = None
+        self.samples = 0
+
+    def update(self, maker_mid: Decimal | None, taker_mid: Decimal | None, ts: float | None = None) -> Decimal | None:
+        if not maker_mid or not taker_mid or maker_mid <= 0 or taker_mid <= 0:
+            return self.value
+        now = self._clock() if ts is None else ts
+        x = maker_mid / taker_mid - 1
+        self.last = x
+        if self.value is None or self._last_ts is None:
+            self.value = x
+            self.first_ts = now
+        else:
+            dt = max(0.0, now - self._last_ts)
+            alpha = Decimal(str(1.0 - math.exp(-math.log(2) * dt / self.halflife_s)))
+            self.value = self.value + alpha * (x - self.value)
+        self._last_ts = now
+        self.samples += 1
+        return self.value
+
+    def warmed_up(self, warmup_s: float, now: float | None = None) -> bool:
+        if self.value is None or self.first_ts is None:
+            return False
+        return ((self._clock() if now is None else now) - self.first_ts) >= warmup_s
+
+    def deviation_bps(self) -> Decimal:
+        """|instant - EMA| in bps (0 if unknown)."""
+        if self.value is None or self.last is None:
+            return ZERO
+        return abs(self.last - self.value) / BPS
 
 
 def pair_step(maker: MarketInfo, taker: MarketInfo) -> Decimal:
@@ -87,8 +135,14 @@ def compute_maker_quote(
     max_improve_ticks: int = 1_000_000,
     maker_fee: Decimal | None = None,
     taker_fee: Decimal | None = None,
+    basis: Decimal = ZERO,
+    buffer_bps: Decimal = ZERO,
 ) -> Quote | None:
     """Best (most aggressive) post-only maker price that keeps the hedge edge >= ``min_edge_bps``.
+
+    ``basis`` (maker_mid/taker_mid - 1) rescales the taker hedge price into maker-venue terms.
+    ``buffer_bps`` places the quote that much further behind the edge limit so small adverse
+    moves don't immediately force a protective requote (``limit_price`` stays the hard limit).
 
     Returns None if the quote cannot be built (empty books, insufficient taker depth, size too
     small, or the edge-limited price would be non-positive).
@@ -99,27 +153,32 @@ def compute_maker_quote(
     ft = taker_market.taker_fee if taker_fee is None else taker_fee
 
     hedge_side = side.opposite
-    hedge_vwap, _ = taker_book.vwap(hedge_side, size)
-    if hedge_vwap is None:
+    raw_vwap, _ = taker_book.vwap(hedge_side, size)
+    if raw_vwap is None:
         return None
-    mid = taker_book.mid
-    if mid is None or mid <= 0:
+    taker_mid = taker_book.mid
+    if taker_mid is None or taker_mid <= 0:
         return None
+    scale = 1 + basis
+    hedge_vwap = raw_vwap * scale
+    mid = taker_mid * scale
 
     limit = edge_limit_price(side, hedge_vwap, mid, min_edge_bps, fm, ft)
     if limit <= 0:
         return None
+    buf = buffer_bps * BPS * mid
+    target = limit - buf if side is Side.BUY else limit + buf
 
     m_bid, m_ask = maker_book.best_bid, maker_book.best_ask
     if side is Side.BUY:
-        px = limit
+        px = target
         if m_ask is not None:
             px = min(px, m_ask - maker_market.tick_for(m_ask))  # stay passive (post-only)
         if m_bid is not None and max_improve_ticks >= 0:
             px = min(px, m_bid + maker_market.tick_for(m_bid) * max_improve_ticks)
         px = maker_market.round_price(px, Side.BUY, passive=True)  # floor
     else:
-        px = limit
+        px = target
         if m_bid is not None:
             px = max(px, m_bid + maker_market.tick_for(m_bid))
         if m_ask is not None and max_improve_ticks >= 0:

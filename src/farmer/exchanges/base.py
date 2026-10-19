@@ -3,6 +3,13 @@
 Every venue (Arcus, Lighter, Paper) implements this interface. The strategy layer only talks
 to ``Exchange`` and never imports venue modules directly.
 
+Order acknowledgement model: venues are asynchronous (Arcus returns HTTP 202 and reports the
+outcome on its ``orders`` WS channel; Lighter accepts a signed tx and the sequencer matches it
+later). ``place_limit``/``modify_order`` therefore wait up to a short ack timeout for the first
+venue status (OPEN / REJECTED / FILLED) and return it; if none arrives in time the returned order
+is ``PENDING`` and later updates are delivered through order listeners. Fills are ONLY ever
+reported through fill listeners (never inferred from return values), exactly once per fill.
+
 Threading model: everything runs on ONE asyncio event loop. Listeners are plain (sync)
 callables invoked from the adapter's websocket reader task; they must be fast and must not
 block. Strategy code that needs to do async work in response schedules it itself
@@ -172,6 +179,20 @@ class Exchange(abc.ABC):
     async def arm_dead_mans_switch(self, timeout_s: float) -> None:
         """Optional venue-side cancel-all-after timer. Default: no-op."""
         return None
+
+    # ------------------------------------------------------------------ venue health hints
+    def budget_health(self) -> float:
+        """0..1 health of the venue's order-action budget (1 = plenty). Strategy slows requotes when low."""
+        return 1.0
+
+    def market_open(self, symbol: str) -> bool:
+        """False when the market is outside regular trading hours / offline (RWA) or reduce-only."""
+        m = self.markets.get(symbol)
+        return bool(m and m.active)
+
+    def can_increase_exposure(self) -> tuple[bool, str]:
+        """Venue-level permission to open/increase positions (e.g. Lighter Standard limit 52002)."""
+        return True, ""
 
     # ------------------------------------------------------------------ listeners
     def add_fill_listener(self, cb: FillListener) -> None:

@@ -23,14 +23,18 @@ class _Base(BaseModel):
 
 # --------------------------------------------------------------------------- venues
 class ArcusConfig(_Base):
-    rest_url: str = "https://api.arcus.xyz"
-    ws_url: str = "wss://api.arcus.xyz/v1/ws"
-    account_index: int = 0
+    rest_url: str = "https://api.arcus.xyz"  # testnet: https://api.testnet.arcus.xyz
+    ws_url: str = "wss://api.arcus.xyz/v1/ws"  # testnet: wss://api.testnet.arcus.xyz/v1/ws
+    chain_id: int = 4663  # EIP-712 chainId for API-key registration (testnet: 46630)
+    account_index: int = 0  # subaccount 0..9
     # Secrets (from env): ARCUS_ADDRESS, ARCUS_API_PRIVATE_KEY
     address: str | None = None
     api_private_key: str | None = Field(default=None, repr=False)
     request_timeout_s: float = 10.0
-    dead_mans_switch_s: float = 30.0  # venue-side cancel-all if the bot stops refreshing (0 = off)
+    dead_mans_switch_s: float = 60.0  # scheduleCancel deadline (5..300 s); refreshed at 1/3 of it (0 = off)
+    good_til_days: int = 180  # goodTilTime lead; modify requires >= ~1 month remaining
+    ack_timeout_s: float = 3.0  # how long place/modify waits for the WS `orders` frame before returning PENDING
+    requote_budget_per_s: float = 20.0  # local cap on order-pool actions (protects the 20k starting pool)
 
     @property
     def has_credentials(self) -> bool:
@@ -38,15 +42,20 @@ class ArcusConfig(_Base):
 
 
 class LighterConfig(_Base):
-    url: str = "https://mainnet.zklighter.elliot.ai"
-    ws_url: str = "wss://mainnet.zklighter.elliot.ai/stream"
+    url: str = "https://mainnet.zklighter.elliot.ai"  # Lighter RH: https://api.rh.lighter.xyz
+    ws_url: str = "wss://mainnet.zklighter.elliot.ai/stream"  # Lighter RH: wss://api.rh.lighter.xyz/stream
+    chain_id: int = 304  # mainnet 304, testnet 300, Lighter RH 466324
     # Secrets (from env): LIGHTER_API_PRIVATE_KEY, LIGHTER_ACCOUNT_INDEX, LIGHTER_API_KEY_INDEX
     account_index: int | None = None
     api_key_index: int | None = None
     api_private_key: str | None = Field(default=None, repr=False)
     request_timeout_s: float = 10.0
-    # Standard accounts: 60 REST requests / rolling minute (sendTx included). Keep headroom.
-    max_requests_per_minute: int = 50
+    # Standard accounts: ONE bucket of 60 requests / rolling minute per IP and L1 address shared by
+    # REST reads AND sendTx/sendTxBatch (REST or WS). Keep headroom.
+    max_requests_per_minute: int = 55
+    read_reserve: int = 25  # REST reads may only run while at least this many slots stay free for txs
+    auth_token_ttl_s: float = 6 * 3600  # WS/REST auth token lifetime (server max 8 h)
+    ws_ping_interval_s: float = 30.0  # server drops clients idle > ~120 s
 
     @property
     def has_credentials(self) -> bool:
@@ -71,11 +80,13 @@ class MarketConfig(_Base):
 class StrategyConfig(_Base):
     maker_venue: Venue = "arcus"
     taker_venue: Venue = "lighter"
-    markets: list[MarketConfig] = Field(default_factory=lambda: [MarketConfig(symbol="BTC"), MarketConfig(symbol="ETH")])
+    markets: list[MarketConfig] = Field(
+        default_factory=lambda: [MarketConfig(symbol="BTC"), MarketConfig(symbol="ETH"), MarketConfig(symbol="SOL")]
+    )
 
     # --- sizing (USD notional)
-    target_notional: Decimal = Decimal("1000")  # |position| per leg at the top of a cycle
-    order_notional: Decimal = Decimal("250")  # maker clip size
+    target_notional: Decimal = Decimal("2000")  # |position| per leg at the top of a cycle
+    order_notional: Decimal = Decimal("500")  # maker clip size
     leverage: int = 5
 
     # --- pricing
@@ -84,15 +95,27 @@ class StrategyConfig(_Base):
     min_edge_bps: Decimal = Decimal("0.5")
     max_slippage_bps: Decimal = Decimal("8")  # taker hedge worst price vs touch
     reprice_threshold_bps: Decimal = Decimal("0.5")  # move the maker quote if fair price moved this much
-    min_quote_lifetime_s: float = 0.5  # don't amend faster than this
+    requote_buffer_bps: Decimal = Decimal("0.3")  # quote this far behind the edge limit to absorb noise
+    min_quote_lifetime_s: float = 0.5  # don't amend (improvement reprices) faster than this
+    max_requotes_per_min: int = 120  # per market, protective + improvement amends
     max_improve_ticks: int = 1_000_000  # how far inside the maker book we may go (capped by post-only)
+
+    # --- basis (structural price gap between venues, e.g. USD vs USDT index ~10 bps on crypto)
+    use_basis: bool = True  # price the edge vs taker_price*(1+basis) instead of the raw taker price
+    basis_halflife_s: float = 600.0  # EMA half-life of maker_mid/taker_mid - 1
+    basis_warmup_s: float = 30.0  # don't quote until the basis estimate has this much data
+
+    # --- hedging
+    hedge_aggregate_ms: float = 250.0  # coalesce maker fills before sending one taker hedge
+    hedge_timeout_s: float = 8.0  # in-flight hedge without a terminal update -> reconcile from REST/WS
+    hedge_retry_backoff_s: float = 0.5
 
     # --- cycle / volume churn
     churn: bool = True  # open -> hold -> close -> reopen to generate volume
     churn_floor_frac: Decimal = Decimal("0")  # close down to this fraction of target (0 = flat)
     hold_seconds: float = 0.0  # minimum time at target before closing
     hold_through_funding: bool = False  # wait for the next funding settlement before closing
-    protect_funding_window_s: float = 90.0  # never be below floor this close to a settlement
+    protect_funding_window_s: float = 120.0  # don't close below floor / flip this close to a settlement
 
     # --- funding direction
     direction_mode: Literal["auto", "long_maker", "short_maker"] = "auto"
@@ -146,14 +169,16 @@ class RiskConfig(_Base):
     max_unhedged_notional: Decimal = Decimal("150")  # USD delta tolerated before emergency action
     unhedged_timeout_s: float = 5.0  # how long a delta above min-size may persist
     max_total_notional: Decimal = Decimal("20000")  # sum |position notional| over all markets per venue
-    max_divergence_bps: Decimal = Decimal("75")  # pause if venue mids disagree by more than this
+    max_divergence_bps: Decimal = Decimal("60")  # pause if |maker_mid/taker_mid - 1| exceeds this (absolute)
+    max_basis_dev_bps: Decimal = Decimal("5")  # pause if the instant basis deviates from its EMA by more
     stale_book_s: float = 5.0  # cancel quotes if a book is older than this
     max_margin_ratio: Decimal = Decimal("0.6")  # maintenance/equity per venue: stop opening above this
     reduce_margin_ratio: Decimal = Decimal("0.8")  # actively reduce positions above this
     max_daily_loss: Decimal = Decimal("100")  # USD realized+fees+funding; stop the bot if breached
     max_consecutive_errors: int = 20
     close_on_exit: bool = False  # flatten both legs on shutdown
-    skip_rwa_off_hours: bool = True
+    skip_rwa_off_hours: bool = True  # RWA pairs only while Arcus isOutsideRth == false
+    emergency_flatten: bool = True  # flatten the maker leg with a taker order if hedging keeps failing
 
 
 # --------------------------------------------------------------------------- misc

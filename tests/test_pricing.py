@@ -88,3 +88,41 @@ def test_violation_and_worst_price():
     assert w == D("99890.0") or w == D("99890")
     w2 = worst_taker_price(Side.BUY, tb, D("0.01"), D("10"), LM)
     assert w2 == D("100101.1")
+
+
+def test_basis_shifts_limit_both_sides():
+    # Arcus trades 10 bps below Lighter structurally
+    mb = book("arcus", [(99890, 1)], [(99910, 1)])
+    tb = book("lighter", [(99999, 1)], [(100001, 1)])
+    basis = D("99900") / D("100000") - 1
+    sell = compute_maker_quote(side=Side.SELL, size=D("0.01"), maker_market=AM, taker_market=LM, maker_book=mb,
+                               taker_book=tb, min_edge_bps=D("0.5"), basis=basis)
+    buy = compute_maker_quote(side=Side.BUY, size=D("0.01"), maker_market=AM, taker_market=LM, maker_book=mb,
+                              taker_book=tb, min_edge_bps=D("0.5"), basis=basis)
+    # without basis a maker SELL would need >= 100001 (unfillable at 99910); with basis it's near 99906
+    assert sell.price < D("99911") and buy.price > D("99889")
+    assert sell.price > buy.price
+
+
+def test_buffer_moves_quote_behind_limit():
+    mb = book("arcus", [(99980, 1)], [(100020, 1)])
+    tb = book("lighter", [(100000, 1)], [(100001, 1)])
+    q0 = compute_maker_quote(side=Side.BUY, size=D("0.01"), maker_market=AM, taker_market=LM, maker_book=mb,
+                             taker_book=tb, min_edge_bps=D("0.5"))
+    q1 = compute_maker_quote(side=Side.BUY, size=D("0.01"), maker_market=AM, taker_market=LM, maker_book=mb,
+                             taker_book=tb, min_edge_bps=D("0.5"), buffer_bps=D("1"))
+    assert q1.price < q0.price and q1.limit_price == q0.limit_price
+
+
+def test_basis_tracker():
+    from farmer.strategy.pricing import BasisTracker
+    t = [0.0]
+    bt = BasisTracker(halflife_s=10, clock=lambda: t[0])
+    bt.update(D("99900"), D("100000"))
+    assert bt.value == D("-0.001")
+    assert not bt.warmed_up(5)
+    t[0] = 10
+    bt.update(D("100000"), D("100000"))
+    assert abs(bt.value - D("-0.0005")) < D("0.000001")
+    assert bt.warmed_up(5)
+    assert bt.deviation_bps() > 0
