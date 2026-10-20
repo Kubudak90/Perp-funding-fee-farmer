@@ -1,0 +1,208 @@
+# =============================================================================
+# farmer - örnek yapılandırma (config.example.yaml)
+#
+# Kullanım:  cp config.example.yaml config.yaml   ve sonra düzenleyin.
+# Gizli bilgiler (özel anahtarlar, Telegram token) BU DOSYAYA YAZILMAZ; .env dosyasından
+# okunur (bkz. .env.example). Aşağıdaki değerler varsayılanlardır; yazmadığınız alan
+# varsayılanı kullanır. Bilinmeyen alan adı yazarsanız program hata verir (yazım hatası koruması).
+#
+# Birimler: notional = USD; bps = 0.01 % (1 bps = 0.0001); funding = saatlik oran (0.0001 = %0.01/saat).
+# =============================================================================
+
+# paper = canlı halka açık veri + SİMÜLE emirler (gerçek para yok).  live = GERÇEK emirler.
+# `farmer run` bu değeri kullanır; `--paper` / `--live` bayrakları geçersiz kılar.
+# live için iki borsada da anahtar gerekir ve ya burada `mode: live` ya da `--yes` gerekir.
+mode: paper
+log_level: INFO            # DEBUG çok ayrıntılıdır (her kotasyon); normalde INFO
+data_dir: ./data           # SQLite veritabanı (farmer.db / farmer-paper.db) ve logs/farmer.log burada
+
+# -----------------------------------------------------------------------------
+# Arcus (maker bacağı: post-only ALO emirler, maker ücreti 0 ppm)
+# Gizli: ARCUS_ADDRESS, ARCUS_API_PRIVATE_KEY, (opsiyonel) ARCUS_ACCOUNT_INDEX  -> .env
+# NOT: Arcus mainnet erişimi beyaz listeye/davet koduna bağlıdır (HTTP 403 "address not on access whitelist").
+# -----------------------------------------------------------------------------
+arcus:
+  rest_url: https://api.arcus.xyz          # testnet: https://api.testnet.arcus.xyz
+  ws_url: wss://api.arcus.xyz/v1/ws        # testnet: wss://api.testnet.arcus.xyz/v1/ws
+  chain_id: 4663                           # API anahtarı kaydı için EIP-712 chainId (testnet: 46630)
+  account_index: 0                         # alt hesap 0..9 (bot için ayrı bir alt hesap önerilir)
+  request_timeout_s: 10.0
+  dead_mans_switch_s: 60.0                 # bot ölürse borsa tüm emirleri bu kadar saniye sonra iptal eder (5..300, 0=kapalı)
+  good_til_days: 180                       # emir geçerlilik süresi (en az 35 gün zorlanır)
+  ack_timeout_s: 3.0                       # emir onayı (WS) için bekleme
+  requote_budget_per_s: 20.0               # emir havuzu koruması: saniyede en fazla bu kadar emir/değişiklik
+  # --- ileri seviye ayarlar (genelde dokunmayın)
+  markets_refresh_s: 60.0
+  clock_resync_s: 300.0
+  ratelimit_poll_s: 30.0
+  book_depth: 20
+  book_seed_levels: 100
+  book_heartbeat_s: 1.0                    # sakin defteri sağlıklı bağlantıda taze zaman damgasıyla yeniden yayınla (0=kapalı)
+  book_resync_timeout_s: 15.0
+  bbo_fallback: true
+  subscribe_predicted_funding: true
+  ws_watchdog_s: 45.0                      # bu kadar süre hiç mesaj gelmezse yeniden bağlan
+  ws_ping_interval_s: 20.0
+  ws_max_lifetime_s: 84600.0               # sunucunun 24 saat sınırından önce soketi yenile
+  market_price_band: "0.095"               # piyasa (IOC) emir fiyat sınırı, mark'a göre ±%9.5
+  min_modify_gtt_lead_days: 32.0
+  private_ready_timeout_s: 10.0
+  fills_snapshot_n: 500
+
+# -----------------------------------------------------------------------------
+# Lighter (taker/hedge bacağı: IOC emirler, Standard hesapta 0 ücret)
+# Gizli: LIGHTER_API_PRIVATE_KEY, LIGHTER_ACCOUNT_INDEX, LIGHTER_API_KEY_INDEX  -> .env
+# NOT: Lighter, kısıtlı ülkelerden işlem göndermeyi engeller (kod 20558). Botu izin verilen bir
+#      yargı bölgesinden çalıştırın ve Lighter kullanım şartlarını kontrol edin.
+# -----------------------------------------------------------------------------
+lighter:
+  url: https://mainnet.zklighter.elliot.ai             # Lighter RH: https://api.rh.lighter.xyz
+  ws_url: wss://mainnet.zklighter.elliot.ai/stream     # Lighter RH: wss://api.rh.lighter.xyz/stream
+  chain_id: 304                                        # mainnet 304, testnet 300, Lighter RH 466324
+  request_timeout_s: 10.0
+  # Standard hesap: IP ve L1 adresi başına dakikada 60 istek; REST okumaları VE sendTx aynı kovadan yer.
+  max_requests_per_minute: 55              # payı biraz boş bırakın
+  read_reserve: 25                         # REST okumaları ancak bu kadar slot işlemlere boş kalırsa yapılır
+  auth_token_ttl_s: 21600                  # WS/REST auth token ömrü (sunucu en fazla 8 saat)
+  ws_ping_interval_s: 30.0
+  # --- ileri seviye ayarlar
+  ws_watchdog_s: 20.0
+  ws_max_msgs_per_min: 180
+  tx_ack_timeout_s: 1.5
+  tx_rest_timeout_s: 3.0
+  tx_budget_wait_s: 10.0
+  max_tx_per_minute: 40                    # dakikada en fazla imzalı işlem (borsa: 40/dk)
+  order_ack_timeout_s: 2.0
+  order_confirm_timeout_s: 6.0
+  fill_wait_s: 2.0
+  markets_refresh_s: 600.0
+  standard_limit_cooldown_s: 3600.0        # 52002 (Standard işlem limiti) sonrası yeni pozisyon açmayı bu kadar durdur
+  book_quiet_grace_s: 10.0
+  verify_api_key: true
+
+# -----------------------------------------------------------------------------
+# Strateji
+# -----------------------------------------------------------------------------
+strategy:
+  maker_venue: arcus
+  taker_venue: lighter
+
+  # İşlem yapılacak piyasalar. Önerilen başlangıç: BTC, ETH, SOL (7/24, derin defter, düşük maliyet).
+  # Her alanı piyasa bazında geçersiz kılabilirsiniz (target_notional, order_notional, leverage,
+  # min_edge_bps, max_slippage_bps, arcus_symbol, lighter_symbol).
+  markets:
+    - symbol: BTC
+    - symbol: ETH
+    - symbol: SOL
+    # - symbol: BONK                 # Arcus KBONK <-> Lighter 1000BONK (otomatik eşleşir, fiyat oranı kontrol edilir)
+    #   order_notional: 200
+    #
+    # RWA (hisse/ETF) örnekleri. Arcus'ta yalnızca normal işlem saatlerinde (isOutsideRth == false,
+    # yaklaşık 04:00-20:00 ET, hafta içi) kotasyon verilir; saat dışında yeni pozisyon açılmaz.
+    # Funding taşıma getirisi RWA'da genelde daha yüksektir ama hafta sonu/gece pozisyon taşınır.
+    # - symbol: SPY
+    #   target_notional: 2000
+    # - symbol: QQQ                  # Arcus açık pozisyon (OI) tavanına yakın olabilir, `farmer scan` ile kontrol edin
+    # - symbol: NVDA
+    # - symbol: AAPL
+    # - symbol: TSLA
+
+  # --- boyutlar (USD notional, bacak başına)
+  target_notional: 2000            # döngünün tepesinde hedeflenen pozisyon büyüklüğü
+  order_notional: 500              # tek maker emir (clip) büyüklüğü
+  leverage: 5                      # iki borsada da ayarlanır; düşük tutun (likidasyon riski her bacakta ayrı!)
+
+  # --- fiyatlama
+  min_edge_bps: 0.5                # Lighter'da hedge sonrası en az bu kadar kâr kalacak şekilde kotasyon (negatif = hacim için küçük maliyet kabul)
+  max_slippage_bps: 8              # hedge IOC emrinin en kötü fiyatı (touch'a göre)
+  reprice_threshold_bps: 0.5       # adil fiyat bu kadar oynarsa kotasyonu güncelle
+  requote_buffer_bps: 0.3          # edge sınırının biraz gerisinde kotasyon (gürültüye karşı)
+  min_quote_lifetime_s: 0.5        # iyileştirme amaçlı değişiklikler arası en az süre
+  max_requotes_per_min: 120        # piyasa başına dakikada en fazla değişiklik (Arcus emir havuzunu korur)
+  max_improve_ticks: 1000000
+
+  # --- baz (borsalar arası yapısal fiyat farkı; kriptoda Lighter endeksi USDT bazlı ~10 bps)
+  use_basis: true
+  basis_halflife_s: 600.0
+  basis_warmup_s: 30.0             # bu kadar veri toplanmadan kotasyon verilmez
+
+  # --- hedge
+  hedge_aggregate_ms: 250.0        # maker dolumlarını tek hedge'de birleştirme penceresi
+  hedge_timeout_s: 8.0             # sonuç gelmeyen hedge -> pozisyonlardan uzlaştırma
+  hedge_retry_backoff_s: 0.5
+  hedge_retry_max_s: 10.0
+  hedge_fill_wait_s: 1.0
+  hedge_io_timeout_s: 15.0
+  max_hedge_notional: null         # büyük hedge'leri bu USD büyüklüğünde parçalara böl (null = bölme)
+
+  # --- döngü / hacim üretimi
+  churn: true                      # aç -> tut -> kapat -> yeniden aç (hacim üretir)
+  churn_floor_frac: 0              # kapanışta hedefin bu oranına kadar küçült (0 = tamamen kapat)
+  hold_seconds: 0.0                # hedefe ulaşınca kapatmadan önce en az bekleme
+  hold_through_funding: false      # true: kapatmadan önce bir sonraki funding ödemesini bekle (taşıma getirisi için)
+  protect_funding_window_s: 120.0  # funding ödemesine bu kadar kala kapanış/yön değişimi ertelenir
+
+  # --- funding yönü
+  direction_mode: auto             # auto | long_maker | short_maker
+  funding_refresh_s: 60.0
+  flip_hysteresis_apr: 0.02        # yön değiştirmek için en az %2 APR daha iyi olmalı
+
+  # --- zamanlamalar
+  loop_interval_s: 0.25
+  reconcile_interval_s: 15.0       # pozisyonları borsadan periyodik doğrula
+  reconcile_confirm_s: 1.0
+  reconcile_quiet_s: 2.0
+  reconcile_retry_s: 1.0
+  order_ack_timeout_s: 10.0
+  amend_ack_timeout_s: 3.0
+  cancel_confirm_timeout_s: 2.0
+  funding_settle_grace_s: 5.0
+
+  # --- başlatma / kapatma
+  shutdown_flush_s: 30.0           # kapanışta açık deltanın hedge edilmesi için süre
+  close_on_exit_timeout_s: 120.0
+  check_prices: true               # eşleşen piyasaların fiyat oranını doğrula (farklı varlıkları yakalar, ör. QNT)
+  startup_position_retries: 3
+  set_leverage_on_start: true
+
+# -----------------------------------------------------------------------------
+# Risk
+# -----------------------------------------------------------------------------
+risk:
+  max_unhedged_notional: 150       # bu kadar USD hedgelenmemiş delta varsa kotasyonu durdur
+  unhedged_grace_s: 1.0            # ...ama ancak bu süre boyunca devam ederse (normal dolum+hedge ~0.6 s)
+  unhedged_timeout_s: 5.0          # delta bu kadar sürerse agresif hedge / acil durum
+  max_total_notional: 20000        # borsa başına toplam pozisyon notional üst sınırı
+  max_divergence_bps: 60           # iki borsanın orta fiyatı bundan fazla ayrışırsa dur
+  max_basis_dev_bps: 5             # anlık baz, ortalamasından bundan fazla saparsa dur
+  stale_book_s: 5.0                # defter bu kadar eskiyse kotasyonları iptal et
+  max_margin_ratio: 0.6            # bakım marjı / özsermaye bunu aşarsa yeni pozisyon açma
+  reduce_margin_ratio: 0.8         # bunu aşarsa pozisyonları aktif olarak küçült
+  max_daily_loss: 100              # USD (gerçekleşen + ücret + funding); aşılırsa bot durur (0 = kapalı)
+  max_consecutive_errors: 20
+  close_on_exit: false             # true: kapanışta iki bacağı da taker emirle düzle
+  skip_rwa_off_hours: true         # RWA yalnızca Arcus işlem saatlerinde
+  emergency_flatten: true          # hedge sürekli başarısızsa maker bacağı taker emirle kapat
+  check_interval_s: 10.0           # bakiye/marj/günlük zarar kontrol aralığı
+  balance_timeout_s: 10.0
+  balance_max_age_s: 60.0          # son başarılı bakiye bundan eskiyse yeni pozisyon açma
+
+# -----------------------------------------------------------------------------
+# Paper (simülasyon) ayarları
+# -----------------------------------------------------------------------------
+paper:
+  initial_balance: 10000           # her borsa için başlangıç bakiyesi (bellekte; yeniden başlatınca sıfırlanır)
+  maker_latency_ms: {arcus: 50.0, lighter: 0.0}
+  taker_latency_ms: {arcus: 50.0, lighter: 300.0}   # Lighter Standard taker gecikmesi ~300 ms
+  maker_fee: {}                    # ör. {arcus: 0}; boş = borsa piyasa verisinden
+  taker_fee: {}                    # ör. {lighter: 0}
+  default_leverage: 5
+
+# -----------------------------------------------------------------------------
+# İzleme
+# Gizli: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID -> .env (ikisi de varsa Telegram bildirimi açılır)
+# -----------------------------------------------------------------------------
+monitoring:
+  report_interval_s: 60.0          # istatistik raporu (log) aralığı
+  notify_every: 60                 # her N. raporu Telegram'a gönder (60 x 60 s = saatlik)
+  funding_collect_s: 300.0         # gerçekleşen funding ödemelerini veritabanına çekme aralığı

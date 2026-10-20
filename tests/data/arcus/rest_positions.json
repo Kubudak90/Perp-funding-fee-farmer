@@ -1,0 +1,110 @@
+{
+ "positions": {
+  "1": {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 1,
+   "marketDisplayName": "BTC-USD",
+   "side": "SHORT",
+   "size": "-0.80201535",
+   "averageEntryPrice": "81983.2",
+   "cumulativeFunding": {
+    "allTime": "-31.779884204",
+    "sinceOpen": "-20.754036262",
+    "sinceChange": "0"
+   },
+   "leverage": "40",
+   "marginMode": "CROSS",
+   "borrowedCapital": "65751.857040859",
+   "marginUsed": "1643.060777007",
+   "positionValueNotional": "-65722.43108031",
+   "unrealizedPnl": "29.425960549",
+   "markPx": "81946.6"
+  },
+  "3": {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 3,
+   "marketDisplayName": "SOL-USD",
+   "side": "SHORT",
+   "size": "-155.330068",
+   "averageEntryPrice": "104.532",
+   "cumulativeFunding": {
+    "allTime": "-5.200455047",
+    "sinceOpen": "-5.200455047",
+    "sinceChange": "0"
+   },
+   "leverage": "20",
+   "marginMode": "CROSS",
+   "borrowedCapital": "16236.999195596",
+   "marginUsed": "812.321890116",
+   "positionValueNotional": "-16246.437802324",
+   "unrealizedPnl": "-9.438606728",
+   "markPx": "104.593"
+  },
+  "23": {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 23,
+   "marketDisplayName": "SPY-USD",
+   "side": "LONG",
+   "size": "195.5862855",
+   "averageEntryPrice": "766.94",
+   "cumulativeFunding": {
+    "allTime": "-60.276309522",
+    "sinceOpen": "-60.276309522",
+    "sinceChange": "-2.248176337"
+   },
+   "leverage": "50",
+   "marginMode": "CROSS",
+   "borrowedCapital": "-150003.897906543",
+   "marginUsed": "3000.058916027",
+   "positionValueNotional": "150002.94580137",
+   "unrealizedPnl": "-0.952105173",
+   "markPx": "766.94"
+  },
+  "30": {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 30,
+   "marketDisplayName": "AAPL-USD",
+   "side": "SHORT",
+   "size": "-106.4333629",
+   "averageEntryPrice": "342.74",
+   "cumulativeFunding": {
+    "allTime": "-23.769166219",
+    "sinceOpen": "-23.769166219",
+    "sinceChange": "0"
+   },
+   "leverage": "20",
+   "marginMode": "CROSS",
+   "borrowedCapital": "36478.981279106",
+   "marginUsed": "1824.214623424",
+   "positionValueNotional": "-36484.292468491",
+   "unrealizedPnl": "-5.311189385",
+   "markPx": "342.79"
+  },
+  "2": {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 2,
+   "marketDisplayName": "ETH-USD",
+   "side": "SHORT",
+   "size": "-0.621386",
+   "averageEntryPrice": "2397.81",
+   "cumulativeFunding": {
+    "allTime": "-57.128758365",
+    "sinceOpen": "-57.128758365",
+    "sinceChange": "0"
+   },
+   "leverage": "25",
+   "marginMode": "CROSS",
+   "borrowedCapital": "1489.969496843",
+   "marginUsed": "59.669709144",
+   "positionValueNotional": "-1491.74272862",
+   "unrealizedPnl": "-1.773231777",
+   "markPx": "2400.67"
+  }
+ },
+ "total": 5
+}

@@ -84,11 +84,12 @@ def test_absolute_sizes_zero_removes_and_last_write_wins():
     assert book.apply_delta({"bids": [], "asks": [], "lastSequenceId": 18}) is DeltaResult.GAP
 
 
-def test_crossed_after_delta_is_flagged():
+def test_crossing_stale_snapshot_level_is_dropped():
     book = L2Book("X", "X-USD")
     book.apply_snapshot({"bids": [["100", "1"]], "asks": [["101", "1"]], "lastSequenceId": 1})
-    assert book.apply_delta({"bids": [["101", "1"]], "asks": [], "lastSequenceId": 2}) is DeltaResult.CROSSED
-    assert not book.synced
+    # a fresh bid at 101 proves the (never confirmed) snapshot ask at 101 is gone
+    assert book.apply_delta({"bids": [["101", "1"]], "asks": [], "lastSequenceId": 2}) is DeltaResult.APPLIED
+    assert book.best_bid == (D("101"), D("1")) and book.best_ask is None and book.repairs == 1
 
 
 def test_bbo_check_detects_mismatch():
@@ -119,3 +120,94 @@ def test_rest_and_bbo_conversions():
     tob = bbo_to_order_book("BTC", bbo["contents"])
     assert len(tob.bids) == len(tob.asks) == 1 and tob.best_bid < tob.best_ask
     assert bbo_to_order_book("BTC", {"bestBid": None, "bestAsk": None}).mid is None
+
+
+# ---------------------------------------------------------------------------------------------------
+# Live finding: the documented first-delta "boundary gap" is a LOSS window. Changes between the
+# snapshot's lastSequenceId and the first delta are never delivered, so some snapshot levels are stale.
+def replay(name: str, *, repair: bool):
+    book = None
+    out = {"crossed": 0, "bbo_false": 0, "bbo_true": 0, "applied": 0}
+    for f in load_jsonl(name):
+        c = f["contents"]
+        if f["channel"] == "l2OrderbookUpdates":
+            if f["type"] == "subscribed":
+                book = L2Book("X", f["id"])
+                book.apply_snapshot(c)
+                continue
+            if not repair:
+                book._unconfirmed.clear()  # behave like a naive snapshot+delta book
+            r = book.apply_delta(c)
+            if r is DeltaResult.CROSSED:
+                out["crossed"] += 1
+                if not repair:
+                    return out, book
+            elif r is DeltaResult.APPLIED:
+                out["applied"] += 1
+        elif f["channel"] == "bbo" and book is not None:
+            chk = book.reconcile_bbo(c) if repair else book.check_bbo(c)
+            if chk is False:
+                out["bbo_false"] += 1
+            elif chk is True:
+                out["bbo_true"] += 1
+                assert book.check_bbo(c) is True
+    return out, book
+
+
+def test_eth_loss_window_stale_ask_is_repaired_from_bbo():
+    naive, _ = replay("book_eth_losswindow.jsonl", repair=False)
+    assert naive["bbo_false"] > 0  # a stale snapshot ask (2405.09) survives in a naive book
+    fixed, book = replay("book_eth_losswindow.jsonl", repair=True)
+    assert fixed["bbo_false"] == 0 and fixed["crossed"] == 0 and fixed["bbo_true"] > 0
+    assert book.repairs >= 1 and book.synced
+    assert D("2405.09") not in {lv.price for lv in book.top(50)[1]}
+
+
+def test_sol_loss_window_cross_is_repaired():
+    naive, _ = replay("book_sol_losswindow.jsonl", repair=False)
+    assert naive["crossed"] == 1  # a stale snapshot ask crosses a fresh bid
+    fixed, book = replay("book_sol_losswindow.jsonl", repair=True)
+    assert fixed["crossed"] == 0 and fixed["bbo_false"] == 0 and book.repairs >= 1
+    assert not book.is_crossed()
+
+
+def _book_after_first_delta() -> L2Book:
+    book = L2Book("X", "X-USD")
+    book.apply_snapshot({"bids": [["99", "1"], ["98", "1"]], "asks": [["101", "1"], ["102", "2"]], "lastSequenceId": 10})
+    assert book.apply_delta({"bids": [["97", "3"]], "asks": [], "lastSequenceId": 20}) is DeltaResult.APPLIED
+    return book
+
+
+def test_reconcile_bbo_rules():
+    book = L2Book("X", "X-USD")
+    book.apply_snapshot({"bids": [["99", "1"]], "asks": [["101", "1"]], "lastSequenceId": 10})
+    bbo0 = {"bestBid": {"price": "99", "size": "1"}, "bestAsk": {"price": "102", "size": "2"}, "lastSequenceId": 10}
+    assert book.reconcile_bbo(bbo0) is None  # before the first delta: as stale as the snapshot
+
+    # stale snapshot ask 101 (filled in the loss window) is dropped; the top then matches the bbo
+    book = _book_after_first_delta()
+    bbo = {"bestBid": {"price": "99", "size": "1"}, "bestAsk": {"price": "102", "size": "2"}, "lastSequenceId": 20}
+    assert book.reconcile_bbo(bbo) is True
+    assert book.best_ask == (D("102"), D("2")) and book.repairs == 1 and book.check_bbo(bbo)
+
+    # a level inserted during the loss window is added; a stale (unconfirmed) size is corrected
+    book = _book_after_first_delta()
+    bbo = {"bestBid": {"price": "99.5", "size": "4"}, "bestAsk": {"price": "101", "size": "1.5"}, "lastSequenceId": 20}
+    assert book.reconcile_bbo(bbo) is True
+    assert book.best_bid == (D("99.5"), D("4")) and book.best_ask == (D("101"), D("1.5")) and book.repairs == 2
+
+    # disagreement with a delta-confirmed level means the stream is broken
+    book = _book_after_first_delta()
+    assert book.apply_delta({"bids": [], "asks": [["100.5", "1"]], "lastSequenceId": 21}) is DeltaResult.APPLIED
+    bad = {"bestBid": {"price": "99", "size": "1"}, "bestAsk": {"price": "101", "size": "1"}, "lastSequenceId": 21}
+    assert book.reconcile_bbo(bad) is False
+    assert book.reconcile_bbo({**bad, "lastSequenceId": 99}) is None  # different sequence: not comparable
+    ok = {"bestBid": {"price": "99", "size": "1"}, "bestAsk": {"price": "100.5", "size": "1"}, "lastSequenceId": 21}
+    assert book.reconcile_bbo(ok) is True
+
+
+def test_crossed_by_confirmed_levels_still_fails():
+    book = L2Book("X", "X-USD")
+    book.apply_snapshot({"bids": [["100", "1"]], "asks": [["105", "1"]], "lastSequenceId": 1})
+    assert book.apply_delta({"bids": [], "asks": [["103", "1"]], "lastSequenceId": 2}) is DeltaResult.APPLIED
+    assert book.apply_delta({"bids": [["103.5", "1"]], "asks": [], "lastSequenceId": 3}) is DeltaResult.CROSSED

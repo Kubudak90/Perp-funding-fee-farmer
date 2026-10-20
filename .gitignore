@@ -5,9 +5,12 @@ __pycache__/
 *.egg-info/
 build/
 dist/
-data/
-logs/
+/data/
+/logs/
 .env
 config.yaml
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
+.ruff_cache/

@@ -1,0 +1,159 @@
+{
+ "snapshot": {
+  "type": "subscribed",
+  "channel": "userFills",
+  "id": "0xabcdef1234567890abcdef1234567890abcdef12",
+  "accountIndex": 0,
+  "contents": {
+   "isSnapshot": true,
+   "fills": [
+    {
+     "tradeId": "21085331",
+     "orderId": "52d5f8c3ff6d4da8",
+     "marketId": 9,
+     "marketDisplayName": "AMD-USD",
+     "clientId": "amd-usd_b1_695009",
+     "side": "BUY",
+     "originalSize": "0.3899857",
+     "size": "0.3899857",
+     "price": "538.48",
+     "fee": "-0.004199989",
+     "closedPnl": "0.004199989",
+     "role": "MAKER",
+     "remainingSize": "0",
+     "positionEffect": "ADD_LONG",
+     "createdAt": 1792432507264041,
+     "sequenceNumber": 377957622
+    },
+    {
+     "tradeId": "21085304",
+     "orderId": "377f12d375c741ec",
+     "marketId": 46,
+     "marketDisplayName": "NBIS-USD",
+     "clientId": "nbis-usd_a1_695400",
+     "side": "SELL",
+     "originalSize": "1.2501767",
+     "size": "1.2501767",
+     "price": "167.98",
+     "fee": "-0.004200093",
+     "closedPnl": "0.004200093",
+     "role": "MAKER",
+     "remainingSize": "0",
+     "positionEffect": "OPEN_SHORT",
+     "createdAt": 1792432497584730,
+     "sequenceNumber": 377956865
+    },
+    {
+     "tradeId": "21085288",
+     "orderId": "6e8aec3df3354e51",
+     "marketId": 36,
+     "marketDisplayName": "CRWV-USD",
+     "clientId": "crwv-usd_a1_695671",
+     "side": "SELL",
+     "originalSize": "3.5032715",
+     "size": "3.5032715",
+     "price": "59.94",
+     "fee": "-0.004199721",
+     "closedPnl": "0.004199721",
+     "role": "MAKER",
+     "remainingSize": "0",
+     "positionEffect": "ADD_SHORT",
+     "createdAt": 1792432497322983,
+     "sequenceNumber": 377956816
+    }
+   ]
+  }
+ },
+ "updates": [
+  {
+   "type": "channel_data",
+   "channel": "userFills",
+   "id": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "market": "BOT-USD",
+   "contents": {
+    "isSnapshot": false,
+    "fills": [
+     {
+      "tradeId": "21085396",
+      "orderId": "9c2b4c76e46a4c4c",
+      "marketId": 49,
+      "marketDisplayName": "BOT-USD",
+      "clientId": "bot-usd_a1_687155",
+      "side": "SELL",
+      "originalSize": "9.1264668",
+      "size": "9.1264668",
+      "price": "23.01",
+      "fee": "-0.0042",
+      "closedPnl": "0.0042",
+      "role": "MAKER",
+      "remainingSize": "0",
+      "positionEffect": "OPEN_SHORT",
+      "createdAt": 1792432514459925,
+      "sequenceNumber": 377958697
+     }
+    ]
+   }
+  },
+  {
+   "type": "channel_data",
+   "channel": "userFills",
+   "id": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "market": "USAR-USD",
+   "contents": {
+    "isSnapshot": false,
+    "fills": [
+     {
+      "tradeId": "21085397",
+      "orderId": "c6be613e9ecf4a49",
+      "marketId": 40,
+      "marketDisplayName": "USAR-USD",
+      "clientId": "usar-usd_b1_696733",
+      "side": "BUY",
+      "originalSize": "20.7559803",
+      "size": "20.7559803",
+      "price": "10.12",
+      "fee": "-0.00420101",
+      "closedPnl": "0.00420101",
+      "role": "MAKER",
+      "remainingSize": "0",
+      "positionEffect": "ADD_LONG",
+      "createdAt": 1792432514869258,
+      "sequenceNumber": 377958790
+     }
+    ]
+   }
+  },
+  {
+   "type": "channel_data",
+   "channel": "userFills",
+   "id": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "market": "SNDK-USD",
+   "contents": {
+    "isSnapshot": false,
+    "fills": [
+     {
+      "tradeId": "21085398",
+      "orderId": "58cfa24f037e4004",
+      "marketId": 33,
+      "marketDisplayName": "SNDK-USD",
+      "clientId": "r1a14814c73ea04-1ddcff",
+      "side": "SELL",
+      "originalSize": "8.0261775",
+      "size": "0.0727202",
+      "price": "1375.66",
+      "fee": "0.009503635",
+      "closedPnl": "-0.009503635",
+      "role": "TAKER",
+      "remainingSize": "7.9534573",
+      "positionEffect": "ADD_SHORT",
+      "createdAt": 1792432515462193,
+      "sequenceNumber": 532711085
+     }
+    ]
+   }
+  }
+ ]
+}

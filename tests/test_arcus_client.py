@@ -161,9 +161,18 @@ async def test_bbo_mismatch_triggers_resync(env):
     md.push({"type": "subscribed", "channel": "l2OrderbookUpdates", "id": "BTC-USD",
              "contents": {"bids": [["100", "1"]], "asks": [["101", "1"]], "lastSequenceId": 50}})
     assert await wait_for(lambda: ex._books["BTC"].synced)
+    md.push({"type": "channel_data", "channel": "l2OrderbookUpdates", "id": "BTC-USD",
+             "contents": {"bids": [["100", "1"]], "asks": [], "lastSequenceId": 60}})  # confirms bid 100 @ 1
+    # a stale-snapshot style disagreement on an UNCONFIRMED ask is repaired silently ...
     md.push({"type": "channel_data", "channel": "bbo", "id": "BTC-USD",
-             "contents": {"bestBid": {"price": "100", "size": "3"}, "bestAsk": {"price": "101", "size": "1"},
-                          "lastSequenceId": 50}})
+             "contents": {"bestBid": {"price": "100", "size": "1"}, "bestAsk": {"price": "101", "size": "7"},
+                          "lastSequenceId": 60}})
+    assert await wait_for(lambda: ex.get_book("BTC").asks[0].size == D("7"))
+    assert ex.stats()["books"]["BTC"]["repairs"] == 1 and not md.subs("l2OrderbookUpdates", kind="unsubscribe")
+    # ... but a disagreement on a delta-confirmed level forces a fresh snapshot
+    md.push({"type": "channel_data", "channel": "bbo", "id": "BTC-USD",
+             "contents": {"bestBid": {"price": "100", "size": "3"}, "bestAsk": {"price": "101", "size": "7"},
+                          "lastSequenceId": 60}})
     assert await wait_for(lambda: len(md.subs("l2OrderbookUpdates", kind="unsubscribe")) == 1)
 
 

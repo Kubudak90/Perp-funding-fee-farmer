@@ -1,0 +1,83 @@
+{
+ "accountIndex": 0,
+ "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+ "netQuoteBalance": "-25220.179995631",
+ "equity": "36342.726898966",
+ "freeCollateral": "1463.414756127",
+ "netDeposits": "1176.167329",
+ "pendingDeposits": "0",
+ "pendingWithdrawals": "0",
+ "positions": {
+  "1": {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 1,
+   "marketDisplayName": "BTC-USD",
+   "side": "SHORT",
+   "size": "-0.80201535",
+   "averageEntryPrice": "81983.2",
+   "cumulativeFunding": {
+    "allTime": "-31.779884204",
+    "sinceOpen": "-20.754036262",
+    "sinceChange": "0"
+   },
+   "leverage": "40",
+   "marginMode": "CROSS",
+   "borrowedCapital": "65751.857040859",
+   "marginUsed": "1643.056766931",
+   "positionValueNotional": "-65722.27067724",
+   "unrealizedPnl": "29.586363619",
+   "markPx": "81946.4"
+  },
+  "2": {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 2,
+   "marketDisplayName": "ETH-USD",
+   "side": "SHORT",
+   "size": "-0.621386",
+   "averageEntryPrice": "2397.81",
+   "cumulativeFunding": {
+    "allTime": "-57.128758365",
+    "sinceOpen": "-57.128758365",
+    "sinceChange": "0"
+   },
+   "leverage": "25",
+   "marginMode": "CROSS",
+   "borrowedCapital": "1489.969496843",
+   "marginUsed": "59.669709144",
+   "positionValueNotional": "-1491.74272862",
+   "unrealizedPnl": "-1.773231777",
+   "markPx": "2400.67"
+  },
+  "3": {
+   "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+   "accountIndex": 0,
+   "marketId": 3,
+   "marketDisplayName": "SOL-USD",
+   "side": "SHORT",
+   "size": "-155.330068",
+   "averageEntryPrice": "104.532",
+   "cumulativeFunding": {
+    "allTime": "-5.200455047",
+    "sinceOpen": "-5.200455047",
+    "sinceChange": "0"
+   },
+   "leverage": "20",
+   "marginMode": "CROSS",
+   "borrowedCapital": "16236.999195596",
+   "marginUsed": "812.321890116",
+   "positionValueNotional": "-16246.437802324",
+   "unrealizedPnl": "-9.438606728",
+   "markPx": "104.593"
+  }
+ },
+ "sequenceNumber": 537935756,
+ "netDepositsByAsset": [
+  {
+   "spotAssetId": 0,
+   "spotAssetDisplayName": "USDG",
+   "netAmount": "1176.167329"
+  }
+ ]
+}

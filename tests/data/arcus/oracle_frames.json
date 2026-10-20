@@ -1,0 +1,65 @@
+[
+ {
+  "type": "subscribed",
+  "channel": "oraclePrices",
+  "id": "",
+  "contents": {
+   "epoch": 0,
+   "prices": [
+    {
+     "marketDisplayName": "SOL-USD",
+     "marketId": 3,
+     "price": "104.64",
+     "markPrice": "104.604"
+    },
+    {
+     "marketDisplayName": "KBONK-USD",
+     "marketId": 67,
+     "price": "0.0029213",
+     "markPrice": "0.0029175"
+    },
+    {
+     "marketDisplayName": "ETH-USD",
+     "marketId": 2,
+     "price": "2400.79",
+     "markPrice": "2400.7"
+    },
+    {
+     "marketDisplayName": "AAPL-USD",
+     "marketId": 30,
+     "price": "342.86",
+     "markPrice": "342.79"
+    },
+    {
+     "marketDisplayName": "SPY-USD",
+     "marketId": 23,
+     "price": "766.96",
+     "markPrice": "766.94"
+    },
+    {
+     "marketDisplayName": "BTC-USD",
+     "marketId": 1,
+     "price": "81951.4",
+     "markPrice": "81947"
+    }
+   ]
+  }
+ },
+ {
+  "type": "channel_data",
+  "channel": "oraclePrices",
+  "id": "",
+  "contents": {
+   "epoch": 1792445887642106323,
+   "prices": [
+    {
+     "marketDisplayName": "MRVL-USD",
+     "marketId": 48,
+     "price": "237.75",
+     "markPrice": "237.66",
+     "markEpochNanos": 1792445887637391270
+    }
+   ]
+  }
+ }
+]

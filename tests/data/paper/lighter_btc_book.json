@@ -1,0 +1,65 @@
+{
+ "_source": "tests/data/lighter/rest_order_book_orders_btc.json (live Lighter mainnet capture, BTC, aggregated per price); market from order_book_details.json",
+ "market": {
+  "symbol": "BTC",
+  "market_id": 1,
+  "taker_fee": "0.0000",
+  "maker_fee": "0.0000",
+  "min_base_amount": "0.00007",
+  "min_quote_amount": "10.000000",
+  "size_decimals": 5,
+  "price_decimals": 1
+ },
+ "bids": [
+  [
+   "82013.4",
+   "0.06507"
+  ],
+  [
+   "82009.6",
+   "0.03299"
+  ],
+  [
+   "82009.1",
+   "0.20248"
+  ],
+  [
+   "82008.7",
+   "0.05000"
+  ],
+  [
+   "82008.3",
+   "0.03284"
+  ],
+  [
+   "82008.0",
+   "0.02194"
+  ]
+ ],
+ "asks": [
+  [
+   "82015.3",
+   "0.00609"
+  ],
+  [
+   "82015.7",
+   "0.00408"
+  ],
+  [
+   "82016.9",
+   "0.03299"
+  ],
+  [
+   "82017.4",
+   "0.09906"
+  ],
+  [
+   "82017.9",
+   "0.04876"
+  ],
+  [
+   "82018.3",
+   "0.02191"
+  ]
+ ]
+}

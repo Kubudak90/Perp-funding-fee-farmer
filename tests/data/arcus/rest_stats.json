@@ -1,0 +1,7 @@
+{
+ "address": "0xabcdef1234567890abcdef1234567890abcdef12",
+ "tradingFeeTier": {
+  "level": 5,
+  "feeDiscountPpm": 50000
+ }
+}

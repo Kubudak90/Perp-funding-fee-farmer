@@ -35,6 +35,23 @@ class ArcusConfig(_Base):
     good_til_days: int = 180  # goodTilTime lead; modify requires >= ~1 month remaining
     ack_timeout_s: float = 3.0  # how long place/modify waits for the WS `orders` frame before returning PENDING
     requote_budget_per_s: float = 20.0  # local cap on order-pool actions (protects the 20k starting pool)
+    # --- adapter tunables (defaults are the verified-safe values; rarely need changes)
+    markets_refresh_s: float = 60.0  # /v1/markets re-read (status, OI caps, fees)
+    clock_resync_s: float = 300.0  # re-sync the ns signing clock with /v1/time
+    ratelimit_poll_s: float = 30.0  # poll /v1/rateLimit (order/cancel pools) this often (needs address)
+    book_depth: int = 20  # levels exposed per side in OrderBook
+    book_seed_levels: int = 100  # levels requested in the book snapshot subscription
+    book_heartbeat_s: float = 1.0  # re-emit a quiet book with a fresh timestamp while the socket is healthy (0 = off)
+    book_resync_timeout_s: float = 15.0  # give up waiting for a resnapshot after this long -> resubscribe
+    bbo_fallback: bool = True  # serve top-of-book from the bbo channel while the full book resyncs
+    subscribe_predicted_funding: bool = True  # stream predicted funding (else REST /v1/markets only)
+    ws_watchdog_s: float = 45.0  # reconnect if no frame arrives for this long
+    ws_ping_interval_s: float = 20.0  # JSON ping cadence
+    ws_max_lifetime_s: float = 84600.0  # roll the socket before the server's 24 h limit (23.5 h)
+    market_price_band: Decimal = Decimal("0.095")  # MARKET/IOC price clamp around mark (venue band ~10 %)
+    min_modify_gtt_lead_days: float = 32.0  # below this goodTilTime lead, modify = cancel + new order
+    private_ready_timeout_s: float = 10.0  # wait for the private stream snapshot (orders/fills) on connect
+    fills_snapshot_n: int = 500  # fills requested in the userFills snapshot after (re)connect
 
     @property
     def has_credentials(self) -> bool:
@@ -56,6 +73,20 @@ class LighterConfig(_Base):
     read_reserve: int = 25  # REST reads may only run while at least this many slots stay free for txs
     auth_token_ttl_s: float = 6 * 3600  # WS/REST auth token lifetime (server max 8 h)
     ws_ping_interval_s: float = 30.0  # server drops clients idle > ~120 s
+    # --- adapter tunables
+    ws_watchdog_s: float = 20.0  # reconnect after this long without any frame
+    ws_max_msgs_per_min: int = 180  # subscribe/ping budget per connection (server cap 200)
+    tx_ack_timeout_s: float = 1.5  # websocket sendtx ack wait before outcome resolution
+    tx_rest_timeout_s: float = 3.0  # REST sendTx timeout
+    tx_budget_wait_s: float = 10.0  # max wait for the shared 60/min budget; then the tx is refused unsent (retryable)
+    max_tx_per_minute: int = 40  # local cap on signed txs ("Default 40 requests/minute")
+    order_ack_timeout_s: float = 2.0  # place_limit/modify wait for the first venue status
+    order_confirm_timeout_s: float = 6.0  # then confirm via REST accountOrders / tx lookup
+    fill_wait_s: float = 2.0  # hold a terminal order update until its fills were emitted
+    markets_refresh_s: float = 600.0  # orderBookDetails re-read
+    standard_limit_cooldown_s: float = 3600.0  # code 52002 blocks NEW exposure this long before probing again
+    book_quiet_grace_s: float = 10.0  # get_book extends a quiet book's timestamp while the stream is healthy
+    verify_api_key: bool = True  # SDK check_client() at startup (runs in a thread)
 
     @property
     def has_credentials(self) -> bool:
@@ -109,6 +140,10 @@ class StrategyConfig(_Base):
     hedge_aggregate_ms: float = 250.0  # coalesce maker fills before sending one taker hedge
     hedge_timeout_s: float = 8.0  # in-flight hedge without a terminal update -> reconcile from REST/WS
     hedge_retry_backoff_s: float = 0.5
+    hedge_retry_max_s: float = 10.0  # backoff cap between failed hedge sends
+    hedge_fill_wait_s: float = 1.0  # wait for fills a terminal hedge update announced
+    hedge_io_timeout_s: float = 15.0  # timeout of one hedge place / position read call
+    max_hedge_notional: Decimal | None = None  # split hedges larger than this (USD); None = one order
 
     # --- cycle / volume churn
     churn: bool = True  # open -> hold -> close -> reopen to generate volume
@@ -125,6 +160,22 @@ class StrategyConfig(_Base):
     # --- loop timings
     loop_interval_s: float = 0.25
     reconcile_interval_s: float = 15.0
+    reconcile_confirm_s: float = 1.0  # gap between the two position reads a reconcile must agree on
+    reconcile_quiet_s: float = 2.0  # only reconcile when no fill arrived for this long
+    reconcile_retry_s: float = 1.0  # retry delay after a failed reconcile
+
+    # --- order handling (maker quotes)
+    order_ack_timeout_s: float = 10.0  # unacknowledged quote older than this -> cancel
+    amend_ack_timeout_s: float = 3.0  # don't amend again while an amend is unconfirmed for up to this long
+    cancel_confirm_timeout_s: float = 2.0  # cancel without terminal update -> retry / cancel_all
+    funding_settle_grace_s: float = 5.0  # hold_through_funding: wait this long after the settlement
+
+    # --- startup / shutdown
+    shutdown_flush_s: float = 30.0  # let hedgers flatten the delta this long on shutdown
+    close_on_exit_timeout_s: float = 120.0  # risk.close_on_exit: max time for close_all("taker")
+    check_prices: bool = True  # verify maker/taker price ratio when mapping markets (catches different assets)
+    startup_position_retries: int = 3
+    set_leverage_on_start: bool = True
 
     @model_validator(mode="after")
     def _check(self) -> "StrategyConfig":
@@ -179,6 +230,10 @@ class RiskConfig(_Base):
     close_on_exit: bool = False  # flatten both legs on shutdown
     skip_rwa_off_hours: bool = True  # RWA pairs only while Arcus isOutsideRth == false
     emergency_flatten: bool = True  # flatten the maker leg with a taker order if hedging keeps failing
+    unhedged_grace_s: float = 1.0  # max_unhedged_notional only pauses quoting after the delta persisted this long
+    check_interval_s: float = 10.0  # balance / margin / daily-loss poll interval
+    balance_timeout_s: float = 10.0  # per-venue fetch_balance timeout
+    balance_max_age_s: float = 60.0  # check_open refuses once a venue's last good balance is older (never fetched = ok)
 
 
 # --------------------------------------------------------------------------- misc
@@ -189,10 +244,13 @@ class PaperConfig(_Base):
     # Fee overrides for simulation (fractions). None = use venue market metadata.
     maker_fee: dict[str, Decimal] = Field(default_factory=dict)
     taker_fee: dict[str, Decimal] = Field(default_factory=dict)
+    default_leverage: int = 5  # paper leverage until set_leverage is called
 
 
 class MonitoringConfig(_Base):
-    report_interval_s: float = 60.0
+    report_interval_s: float = 60.0  # stats report (log) cadence
+    notify_every: int = 60  # send every N-th report to Telegram (60 x 60 s = hourly)
+    funding_collect_s: float = 300.0  # pull realized funding payments into the DB this often
     # Secrets (from env): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
     telegram_bot_token: str | None = Field(default=None, repr=False)
     telegram_chat_id: str | None = None

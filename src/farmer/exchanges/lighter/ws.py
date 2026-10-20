@@ -54,7 +54,7 @@ class LighterWS:
         open_timeout_s: float = 10.0,
         backoff_initial_s: float = 0.5,
         backoff_max_s: float = 30.0,
-        stable_after_s: float = 10.0,
+        stable_after_s: float = 5.0,
         protocol_ping_s: float | None = 20.0,
         name: str = "farmer.lighter.ws",
     ) -> None:
@@ -340,11 +340,14 @@ class LighterWS:
                         self.log.exception("on_disconnect handler failed")
             if self._stopping:
                 break
-            if time.monotonic() - started >= self.stable_after_s and was_connected:
+            stable = was_connected and time.monotonic() - started >= self.stable_after_s
+            if stable:
                 backoff = self.backoff_initial_s
-            if self._fast_reconnect:
+            if self._fast_reconnect or stable:
+                # a healthy session that dropped (or a shutdown notice / watchdog trip): reconnect right away;
+                # repeated failures fall back to exponential backoff
                 self._fast_reconnect = False
-                delay = 0.0
+                delay = random.random() * 0.1
             else:
                 delay = backoff + random.random() * min(1.0, backoff)
                 backoff = min(backoff * 2, self.backoff_max_s)

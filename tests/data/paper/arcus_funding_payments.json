@@ -1,0 +1,37 @@
+{
+ "_source": "tests/data/arcus/rest_funding.json (live Arcus fundingPayments)",
+ "fundingPayments": [
+  {
+   "marketId": 71,
+   "marketDisplayName": "STRK-USD",
+   "fundingRate": "0.0000125",
+   "size": "52169.4107",
+   "payment": "-0.037568236",
+   "time": 1792443600000000
+  },
+  {
+   "marketId": 68,
+   "marketDisplayName": "PONS-USD",
+   "fundingRate": "0.000002276849992135",
+   "size": "-6369.4263",
+   "payment": "0.003871464",
+   "time": 1792443600000000
+  },
+  {
+   "marketId": 66,
+   "marketDisplayName": "USELESS-USD",
+   "fundingRate": "0.000072406015722501",
+   "size": "14407.685",
+   "payment": "-0.144598264",
+   "time": 1792443600000000
+  },
+  {
+   "marketId": 65,
+   "marketDisplayName": "UNI-USD",
+   "fundingRate": "0.0000125",
+   "size": "94.116513",
+   "payment": "-0.008479897",
+   "time": 1792443600000000
+  }
+ ]
+}

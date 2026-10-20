@@ -235,22 +235,21 @@ class LighterExchange(Exchange):
         super().__init__()
         self.cfg = cfg
         self._signer_factory = signer_factory
-        g = lambda k, d: getattr(cfg, k, d)  # noqa: E731 - optional config fields (see module docs)
-        self._ws_watchdog_s = float(g("ws_watchdog_s", 20.0))
-        self._tx_ack_timeout_s = float(g("tx_ack_timeout_s", 1.5))
-        self._tx_rest_timeout_s = float(g("tx_rest_timeout_s", 3.0))
-        self._tx_budget_wait_s = float(g("tx_budget_wait_s", 10.0))
-        self._order_ack_timeout_s = float(g("order_ack_timeout_s", 2.0))
-        self._order_confirm_timeout_s = float(g("order_confirm_timeout_s", 6.0))
-        self._fill_wait_s = float(g("fill_wait_s", 2.0))
-        self._markets_refresh_s = float(g("markets_refresh_s", 600.0))
-        self._std_limit_cooldown_s = float(g("standard_limit_cooldown_s", 3600.0))
-        self._book_quiet_grace_s = float(g("book_quiet_grace_s", 10.0))
-        self._verify_api_key = bool(g("verify_api_key", True))
+        self._ws_watchdog_s = float(cfg.ws_watchdog_s)
+        self._tx_ack_timeout_s = float(cfg.tx_ack_timeout_s)
+        self._tx_rest_timeout_s = float(cfg.tx_rest_timeout_s)
+        self._tx_budget_wait_s = float(cfg.tx_budget_wait_s)
+        self._order_ack_timeout_s = float(cfg.order_ack_timeout_s)
+        self._order_confirm_timeout_s = float(cfg.order_confirm_timeout_s)
+        self._fill_wait_s = float(cfg.fill_wait_s)
+        self._markets_refresh_s = float(cfg.markets_refresh_s)
+        self._std_limit_cooldown_s = float(cfg.standard_limit_cooldown_s)
+        self._book_quiet_grace_s = float(cfg.book_quiet_grace_s)
+        self._verify_api_key = bool(cfg.verify_api_key)
         # ONE bucket for every REST call and every tx (Standard: 60/min per IP and L1 address)
         self._limiter = SlidingWindowLimiter(max(1, int(cfg.max_requests_per_minute)), 60.0)
         # per tx-type cap ("Default 40 requests/minute"); keeps order/cancel bursts inside it
-        self._tx_limiter = SlidingWindowLimiter(max(1, int(g("max_tx_per_minute", 40))), 60.0)
+        self._tx_limiter = SlidingWindowLimiter(max(1, int(cfg.max_tx_per_minute)), 60.0)
         self._cooldown_until = 0.0
         self._http: aiohttp.ClientSession | None = None
         self._connected = False
@@ -266,7 +265,7 @@ class LighterExchange(Exchange):
             readonly_fallback_url=readonly_url(cfg.ws_url) if creds else None,
             ping_interval_s=float(cfg.ws_ping_interval_s),
             watchdog_s=self._ws_watchdog_s,
-            max_msgs_per_min=int(g("ws_max_msgs_per_min", 180)),
+            max_msgs_per_min=int(cfg.ws_max_msgs_per_min),
         )
         self._ws.subscribe("market_stats/all")
         # markets / data caches

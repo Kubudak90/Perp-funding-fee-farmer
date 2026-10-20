@@ -78,14 +78,23 @@ def next_hour_ts(now: float | None = None) -> float:
 class FundingMonitor:
     """Polls ``fetch_funding`` on both venues every ``refresh_s`` seconds."""
 
-    def __init__(self, maker: Exchange, taker: Exchange, symbols: list[str], refresh_s: float = 60.0) -> None:
+    def __init__(self, maker: Exchange, taker: Exchange, symbols: list[str], refresh_s: float = 60.0, *,
+                 maker_symbols: dict[str, str] | None = None, taker_symbols: dict[str, str] | None = None) -> None:
+        """``symbols`` are the snapshot keys (pair names); the optional maps translate them to each venue's own
+        market key (e.g. pair ``KBONK`` -> taker ``1000BONK``). Unmapped symbols are used as-is."""
         self.maker = maker
         self.taker = taker
         self.symbols = list(symbols)
         self.refresh_s = refresh_s
+        self.maker_symbols = dict(maker_symbols or {})
+        self.taker_symbols = dict(taker_symbols or {})
         self._snap: dict[str, FundingSnapshot] = {}
         self._stop = asyncio.Event()
         self.updated = asyncio.Event()
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop.is_set()
 
     def latest(self, symbol: str) -> FundingSnapshot | None:
         return self._snap.get(symbol)
@@ -94,8 +103,10 @@ class FundingMonitor:
         return dict(self._snap)
 
     async def refresh(self) -> None:
+        m_syms = [self.maker_symbols.get(s, s) for s in self.symbols]
+        t_syms = [self.taker_symbols.get(s, s) for s in self.symbols]
         m_res, t_res = await asyncio.gather(
-            self.maker.fetch_funding(self.symbols), self.taker.fetch_funding(self.symbols), return_exceptions=True
+            self.maker.fetch_funding(m_syms), self.taker.fetch_funding(t_syms), return_exceptions=True
         )
         if isinstance(m_res, BaseException):
             log.warning("maker funding fetch failed: %s", m_res)
@@ -104,7 +115,7 @@ class FundingMonitor:
             log.warning("taker funding fetch failed: %s", t_res)
             t_res = {}
         for s in self.symbols:
-            m, t = m_res.get(s), t_res.get(s)
+            m, t = m_res.get(self.maker_symbols.get(s, s)), t_res.get(self.taker_symbols.get(s, s))
             if m is None or t is None:
                 continue
             if m.next_funding_ts is None:

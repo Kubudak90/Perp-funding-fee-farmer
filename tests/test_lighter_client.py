@@ -776,8 +776,9 @@ async def test_auth_refresh_resubscribes(mocked):
         ex._maybe_refresh_auth()
         assert ex._auth_token() != tok1
         assert set(ex._ws.resubs) == {f"account_all_orders/{ACCT}", f"account_tx/{ACCT}"}
+        before = ex._ws.resubs.count(f"account_tx/{ACCT}")
         ex._on_ws_message({"error": {"code": 20013, "message": "invalid auth"}})
-        assert ex._ws.resubs.count(f"account_tx/{ACCT}") == 2
+        assert ex._ws.resubs.count(f"account_tx/{ACCT}") == before + 1
     finally:
         await ex.close()
 

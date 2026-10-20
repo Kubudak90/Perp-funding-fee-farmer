@@ -1,0 +1,24 @@
+[
+ {
+  "type": "subscribed",
+  "channel": "predictedFunding",
+  "id": "BTC-USD",
+  "contents": {
+   "market": "BTC-USD",
+   "rate1h": "0.0000125",
+   "sampleCount": 61,
+   "timestampMs": 1792445845125
+  }
+ },
+ {
+  "type": "channel_data",
+  "channel": "predictedFunding",
+  "id": "BTC-USD",
+  "contents": {
+   "market": "BTC-USD",
+   "rate1h": "0.0000125",
+   "sampleCount": 60,
+   "timestampMs": 1792445888932
+  }
+ }
+]

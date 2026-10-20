@@ -65,7 +65,6 @@ from farmer.exchanges.base import AuthRequired, Exchange, ExchangeError
 from farmer.models import (
     ZERO,
     Balance,
-    Fill,
     FundingInfo,
     FundingPayment,
     MarketInfo,
@@ -121,24 +120,23 @@ class ArcusExchange(Exchange):
             self._signer = ArcusSigner(Ed25519Signer(cfg.api_private_key or ""), cfg.address or "",
                                        self.account_index, self.clock)
 
-        # tunables (read with defaults; see the adapter report for the list)
-        g = lambda k, d: getattr(cfg, k, d)  # noqa: E731
-        self.markets_refresh_s = float(g("markets_refresh_s", 60.0))
-        self.clock_resync_s = float(g("clock_resync_s", 300.0))
-        self.ratelimit_poll_s = float(g("ratelimit_poll_s", 30.0))
-        self.book_depth = int(g("book_depth", 20))
-        self.book_seed_levels = int(g("book_seed_levels", 100))
-        self.book_heartbeat_s = float(g("book_heartbeat_s", 1.0))
-        self.book_resync_timeout_s = float(g("book_resync_timeout_s", 15.0))
-        self.bbo_fallback = bool(g("bbo_fallback", True))
-        self.subscribe_predicted_funding = bool(g("subscribe_predicted_funding", True))
-        self.ws_watchdog_s = float(g("ws_watchdog_s", 45.0))
-        self.ws_ping_interval_s = float(g("ws_ping_interval_s", 20.0))
-        self.ws_max_lifetime_s = float(g("ws_max_lifetime_s", 23.5 * 3600))
-        self.market_price_band = Decimal(str(g("market_price_band", "0.095")))
-        self.min_modify_gtt_lead_days = float(g("min_modify_gtt_lead_days", 32.0))
-        self.private_ready_timeout_s = float(g("private_ready_timeout_s", 10.0))
-        self.fills_snapshot_n = int(g("fills_snapshot_n", 500))
+        # tunables (see ArcusConfig)
+        self.markets_refresh_s = float(cfg.markets_refresh_s)
+        self.clock_resync_s = float(cfg.clock_resync_s)
+        self.ratelimit_poll_s = float(cfg.ratelimit_poll_s)
+        self.book_depth = int(cfg.book_depth)
+        self.book_seed_levels = int(cfg.book_seed_levels)
+        self.book_heartbeat_s = float(cfg.book_heartbeat_s)
+        self.book_resync_timeout_s = float(cfg.book_resync_timeout_s)
+        self.bbo_fallback = bool(cfg.bbo_fallback)
+        self.subscribe_predicted_funding = bool(cfg.subscribe_predicted_funding)
+        self.ws_watchdog_s = float(cfg.ws_watchdog_s)
+        self.ws_ping_interval_s = float(cfg.ws_ping_interval_s)
+        self.ws_max_lifetime_s = float(cfg.ws_max_lifetime_s)
+        self.market_price_band = Decimal(str(cfg.market_price_band))
+        self.min_modify_gtt_lead_days = float(cfg.min_modify_gtt_lead_days)
+        self.private_ready_timeout_s = float(cfg.private_ready_timeout_s)
+        self.fills_snapshot_n = int(cfg.fills_snapshot_n)
 
         # goodTilTime must be >= ~1 month ahead, also when echoed on modify -> never below 35 days
         self.good_til_days = max(35, int(cfg.good_til_days))
@@ -576,16 +574,21 @@ class ArcusExchange(Exchange):
             return
         now = time.time()
         if book.synced:
-            chk = book.check_bbo(c)
+            repairs = book.repairs
+            chk = book.reconcile_bbo(c)  # same-sequence bbo is authoritative for the top of book
             if chk is False:
-                self._request_resync(sym, f"bbo mismatch at seq {c.get('lastSequenceId')}")
-            elif chk is None and c.get("lastSequenceId") is not None and book.seq is not None \
+                self._request_resync(sym, f"bbo disagrees with confirmed levels at seq {c.get('lastSequenceId')}")
+            elif chk is None and book.applying and c.get("lastSequenceId") is not None and book.seq is not None \
                     and int(c["lastSequenceId"]) > book.seq:
                 since = self._bbo_ahead_since.setdefault(sym, now)
                 if now - since > 2.0:
                     self._request_resync(sym, "book lags bbo for > 2s")
             else:
                 self._bbo_ahead_since.pop(sym, None)
+                if chk is True and book.repairs != repairs:
+                    self.log.debug("arcus %s: repaired %d stale snapshot level(s) from bbo", sym,
+                                   book.repairs - repairs)
+                    self._publish(book, now)
             return
         if self.bbo_fallback and c.get("bestBid") and c.get("bestAsk"):
             ob = bbo_to_order_book(sym, c, venue=self.name, ts=now)
@@ -1360,7 +1363,7 @@ class ArcusExchange(Exchange):
         """Diagnostics for monitoring."""
         return {
             "books": {s: {"synced": b.synced, "seq": b.seq, "gaps": b.gaps, "resyncs": b.resyncs,
-                          "levels": b.levels()} for s, b in self._books.items()},
+                          "repairs": b.repairs, "levels": b.levels()} for s, b in self._books.items()},
             "md": None if self._md is None else {"connected": self._md.connected, "connects": self._md.connects,
                                                   "frame_age": self._md.frame_age()},
             "acct": None if self._acct is None else {"connected": self._acct.connected,
