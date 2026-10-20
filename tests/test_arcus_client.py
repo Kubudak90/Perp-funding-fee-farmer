@@ -566,10 +566,46 @@ async def test_modify_action_reject_leaves_order_intact(env):
         acct_sock(server).push(orders_frame(ph))
         return Resp(202, {"orderId": OID, "status": "ACK"})
 
+    # the venue still lists the order: the placeholder reject never touches it
+    m.get(f"/v1/order/{OID}", payload=order_row(oid=OID, cid=r.order.client_id, seq=10))
     m.post("/v1/modifyOrder", callback=cb)
     res = await ex.modify_order(r.order, price=D("60000.2"))
-    assert not res.ok and res.retryable and res.error == "ORDER_NOT_FOUND_FOR_MODIFY"
+    assert not res.ok and res.order is r.order
+    assert await wait_for(lambda: len(m.calls("GET", f"/v1/order/{OID}")) == 1)
+    await asyncio.sleep(0.02)
     assert r.order.status is OrderStatus.OPEN and r.order.price == D("60000")
+
+
+async def test_modify_not_found_for_confirmed_order_is_final_and_verified(env):
+    """ORDER_NOT_FOUND_FOR_MODIFY for an order the stream already confirmed = it is gone (e.g. closed during
+    a private-stream outage): not retryable (the trader stops amending a phantom) and checked over REST."""
+    factory, server, m = env
+    ex = await factory()
+    r, _ = await place_open(ex, server, m)
+    ph = dict(load("orders_frames.json")["reject_not_found_modify"]["contents"], orderId=OID)
+
+    def cb(call):
+        acct_sock(server).push(orders_frame(ph))
+        return Resp(202, {"orderId": OID, "status": "ACK"})
+
+    m.get(f"/v1/order/{OID}", payload=order_row(oid=OID, cid=r.order.client_id, status="CANCELED", seq=12))
+    m.post("/v1/modifyOrder", callback=cb)
+    res = await ex.modify_order(r.order, price=D("60000.2"))
+    assert not res.ok and not res.retryable and "not found" in res.error.lower()
+    assert await wait_for(lambda: r.order.status is OrderStatus.CANCELED)
+    # 200 REJECTED response body takes the same path
+    r2, _ = await place_open(ex, server, m, oid="00000000000000b2", seq=20)
+    m.get("/v1/order/00000000000000b2", payload=order_row(oid="00000000000000b2", cid=r2.order.client_id, seq=20))
+    m.post("/v1/modifyOrder", payload={"orderId": "00000000000000b2", "status": "REJECTED",
+                                       "rejectionReason": "ORDER_NOT_FOUND_FOR_MODIFY"})
+    res2 = await ex.modify_order(r2.order, price=D("60000.2"))
+    assert not res2.ok and not res2.retryable and "not found" in res2.error.lower()
+    # while a modify replacement is still unsequenced the reject is transient -> retryable
+    ex._find_rec("00000000000000b2", None).in_modify = True
+    m.post("/v1/modifyOrder", payload={"orderId": "00000000000000b2", "status": "REJECTED",
+                                       "rejectionReason": "ORDER_NOT_FOUND_FOR_MODIFY"})
+    res3 = await ex.modify_order(r2.order, price=D("60000.3"))
+    assert not res3.ok and res3.retryable
 
 
 async def test_modify_local_cross_guard(env):
@@ -613,6 +649,8 @@ async def test_fills_emitted_once_and_recovered_after_reconnect(env):
     assert await wait_for(lambda: len(fills) == 2)
     await asyncio.sleep(0.05)
     assert [f.trade_id for f in fills] == [f0["tradeId"], "2"]
+    # the replayed fill is flagged: positions may already have been re-read from REST and include it
+    assert getattr(fills[1], "recovered", False) is True and not getattr(fills[0], "recovered", False)
 
 
 async def test_orders_snapshot_after_reconnect_updates_known_orders(env):
@@ -660,20 +698,51 @@ async def test_dead_mans_switch_clamp_and_signature(env):
     assert "time" not in m.calls("POST", "/v1/scheduleCancel")[-1].json()
 
 
-async def test_dms_refresher_only_while_private_stream_healthy(env):
+async def test_dms_armed_only_while_orders_rest(env):
+    """Every arm/refresh is charged to the lifetime cancel pool: arm before the first resting order, refresh
+    while something rests, disarm once when idle; never refresh while the private stream is unhealthy."""
     factory, server, m = env
     m.post("/v1/scheduleCancel", payload={"status": "scheduled"}, repeat=True)
     ex = await factory(dead_mans_switch_s=60)
-    assert await wait_for(lambda: len(m.calls("POST", "/v1/scheduleCancel")) == 1)
-    first = m.calls("POST", "/v1/scheduleCancel")[0].json()
-    assert 58 < first["time"] / 1e6 - time.time() <= 60
+    await asyncio.sleep(0.05)
+    assert not m.calls("POST", "/v1/scheduleCancel")  # nothing rests -> not armed
+    assert ex.can_increase_exposure() == (True, "")
+    r, _ = await place_open(ex, server, m)
+    [arm] = m.calls("POST", "/v1/scheduleCancel")
+    assert 58 < arm.json()["time"] / 1e6 - time.time() <= 60
+    assert m.log.index(arm) < m.log.index(m.calls("POST", "/v1/placeOrder")[0])  # armed BEFORE the place
+    await ex._refresh_dms()  # an order rests -> refresh
+    arms = m.calls("POST", "/v1/scheduleCancel")
+    assert len(arms) == 2 and "time" in arms[-1].json()
+    ex._dms_last_ok = time.monotonic() - 50  # refreshes failing: orders rest without protection
+    ok, why = ex.can_increase_exposure()
+    assert not ok and "dead man" in why
+    ex._dms_last_ok = time.monotonic()
+    acct_sock(server).push(orders_frame(order_row(oid=OID, cid=r.order.client_id, status="CANCELED", seq=99)))
+    assert await wait_for(lambda: r.order.status is OrderStatus.CANCELED)
+    await ex._refresh_dms()  # idle -> disarm once (saves the pool and the 10/day auto-fire quota)
+    assert "time" not in m.calls("POST", "/v1/scheduleCancel")[-1].json() and ex._dms_last_ok is None
+    n = len(m.calls("POST", "/v1/scheduleCancel"))
+    await ex._refresh_dms()
+    assert len(m.calls("POST", "/v1/scheduleCancel")) == n
+    # the next quote arms again; a dead private stream stops the refresh (the switch fires)
+    await place_open(ex, server, m, oid="00000000000000b2", seq=120)
+    assert len(m.calls("POST", "/v1/scheduleCancel")) == n + 1
     server.fail_connects = 10**6  # private socket goes down and stays down
     await acct_sock(server).close()
     assert await wait_for(lambda: not ex._acct.connected)
     await ex._refresh_dms()
-    assert len(m.calls("POST", "/v1/scheduleCancel")) == 1  # not refreshed -> it will fire
+    assert len(m.calls("POST", "/v1/scheduleCancel")) == n + 1  # not refreshed -> it will fire
     await ex.close()
-    # nothing live -> clean shutdown disarms
+    assert len(m.calls("POST", "/v1/scheduleCancel")) == n + 1  # an order may rest -> no disarm at close
+
+
+async def test_dms_disarmed_at_close_when_nothing_rests(env):
+    factory, server, m = env
+    m.post("/v1/scheduleCancel", payload={"status": "scheduled"}, repeat=True)
+    ex = await factory(dead_mans_switch_s=60)
+    await ex.arm_dead_mans_switch(60)
+    await ex.close()
     assert "time" not in m.calls("POST", "/v1/scheduleCancel")[-1].json()
 
 
@@ -684,6 +753,13 @@ async def test_budget_health(env):
     ex._rate_limit = {"order": {"used": 15000, "cap": 20000, "nextAvailableMs": 0}}
     assert ex.budget_health() == pytest.approx(0.25)
     ex._rate_limit = {"order": {"used": 25000, "cap": 20000, "nextAvailableMs": 9000}}
+    assert ex.budget_health() == 0.0
+    # the lifetime cancel pool (cancels + DMS refreshes) counts too
+    ex._rate_limit = {"order": {"used": 0, "cap": 20000}, "cancel": {"used": 30000, "cap": 40000}}
+    assert ex.budget_health() == pytest.approx(0.25)
+    ex._pool_remaining["cancel"] = 4000
+    assert ex.budget_health() == pytest.approx(0.1)
+    ex._pool_blocked_until["cancel"] = time.monotonic() + 5  # cancel pool 429 (drip)
     assert ex.budget_health() == 0.0
 
 
@@ -698,3 +774,177 @@ async def test_market_open_and_market_refresh_in_place(env):
             r["initialMarginFraction"] = "0.05"
     ex._apply_markets(rows)
     assert ex.markets["BTC"] is btc and btc.max_leverage == D("20")
+
+
+# ------------------------------------------------------------------ review fixes (private stream, cancels, resync)
+async def test_quotes_refused_while_private_stream_down_or_unsynced(env):
+    """Acks, fills and rejections only arrive on the private stream: no new resting quotes without it."""
+    factory, server, m = env
+    ex = await factory()
+    ex._acct.backoff_max_s = 0.05
+    assert ex.can_increase_exposure() == (True, "")
+    server.fail_connects = 10**6
+    await acct_sock(server).close()
+    assert await wait_for(lambda: not ex._acct.connected)
+    ok, why = ex.can_increase_exposure()
+    assert not ok and "private stream" in why
+    for kw in ({}, {"reduce_only": True}):
+        r = await ex.place_limit("BTC", Side.SELL, D("0.001"), D("90000"), **kw)
+        assert not r.ok and r.retryable and "private stream" in r.error
+    assert not m.calls("POST", "/v1/placeOrder")
+    # IOC (hedge / emergency close) orders stay allowed
+    m.post("/v1/placeOrder", status=202, payload={"orderId": OID, "status": "ACK"})
+    await ex.place_market("BTC", Side.BUY, D("0.001"), worst_price=D("100000"))
+    assert len(m.calls("POST", "/v1/placeOrder")) == 1
+    # back, but the userFills snapshot never arrives -> still unsynced
+    server.on_subscribe = lambda s, msg: {} if msg["channel"] == "userFills" else None
+    server.fail_connects = 0
+    assert await wait_for(lambda: ex._acct.connected and ex._orders_synced.is_set(), timeout=5.0)
+    ok, why = ex.can_increase_exposure()
+    assert not ok and "not synced" in why
+    acct_sock(server).push({"type": "subscribed", "channel": "userFills", "id": ADDR.lower(), "accountIndex": 0,
+                            "contents": {"isSnapshot": True, "fills": []}})
+    assert await wait_for(lambda: ex.can_increase_exposure() == (True, ""))
+    # a degraded (server-side pending) orders subscription is not healthy either
+    acct_sock(server).push({"type": "degraded", "channel": "orders", "id": ADDR.lower(), "accountIndex": 0,
+                            "reason": "snapshot_stale", "retryAfterMs": 5000})
+    assert await wait_for(lambda: not ex.private_ok()[0])
+
+
+async def test_cancel_overtaken_by_its_own_unsequenced_place_is_resent(env):
+    """Spec 6.5: a cancel may overtake its own queued place (ORDER_NOT_FOUND) and the place rests later."""
+    factory, server, m = env
+    ex = await factory(ack_timeout_s=0.05)
+    ex.cancel_recheck_s = 0.02
+    m.post("/v1/placeOrder", drop=True)  # transport error -> outcome unknown -> cancel by clientId
+    m.post("/v1/cancelOrder", payload={"status": "REJECTED", "rejectionReason": "ORDER_NOT_FOUND", "marketId": 0})
+    m.post("/v1/cancelOrder", payload={"status": "CANCEL_ACKNOWLEDGED"})
+    r = await ex.place_limit("BTC", Side.BUY, D("0.001"), D("60000"), client_id="q-88")
+    assert r.order.status is OrderStatus.UNKNOWN
+    assert await wait_for(lambda: len(m.calls("POST", "/v1/cancelOrder")) == 1)
+    assert m.calls("POST", "/v1/cancelOrder")[0].json()["kind"] == "clientId"
+    # the async ORDER_NOT_FOUND placeholder carries no usable id and changes nothing
+    acct_sock(server).push(orders_frame(load("orders_frames.json")["reject_not_found"]["contents"]))
+    # ... then the place is sequenced after all and rests
+    acct_sock(server).push(orders_frame(order_row(oid=OID, cid="q-88", seq=30)))
+    assert await wait_for(lambda: r.order.status is OrderStatus.OPEN)
+    assert await wait_for(lambda: len(m.calls("POST", "/v1/cancelOrder")) == 2)
+    body = m.calls("POST", "/v1/cancelOrder")[1].json()
+    assert body["kind"] == "orderId" and body["orderId"] == OID
+    acct_sock(server).push(orders_frame(order_row(oid=OID, cid="q-88", status="CANCELED", seq=31)))
+    assert await wait_for(lambda: r.order.status is OrderStatus.CANCELED)
+    await asyncio.sleep(0.05)
+    assert len(m.calls("POST", "/v1/cancelOrder")) == 2
+
+
+async def test_cancel_rejected_for_a_live_order_reports_failure(env):
+    factory, server, m = env
+    ex = await factory()
+    r, _ = await place_open(ex, server, m)
+    m.post("/v1/cancelOrder", payload={"status": "REJECTED", "rejectionReason": "ORDER_NOT_FOUND"})
+    m.get(f"/v1/order/{OID}", payload=order_row(oid=OID, cid=r.order.client_id, status="FILLED", filled="0.001",
+                                                seq=11))
+    assert await ex.cancel_order("BTC", order_id=OID) is False  # we still believe it lives: not "done"
+    assert await wait_for(lambda: r.order.status is OrderStatus.FILLED)  # the venue says why
+    assert await ex.cancel_order("BTC", order_id=OID) is True  # terminal now: nothing to do
+    assert len(m.calls("POST", "/v1/cancelOrder")) == 1
+
+
+async def test_order_missing_from_resync_snapshot_is_verified(env):
+    """openOrders + only the last nRecentClosed closed orders: an order that closed during the outage and is
+    in neither list must not stay OPEN forever."""
+    factory, server, m = env
+    ex = await factory()
+    r, _ = await place_open(ex, server, m)
+    r2, _ = await place_open(ex, server, m, oid="00000000000000b2", seq=11)
+    r3, _ = await place_open(ex, server, m, oid="00000000000000b3", seq=12)
+    m.get(f"/v1/order/{OID}", payload=order_row(oid=OID, cid=r.order.client_id, status="CANCELED", seq=40))
+    m.get("/v1/order/00000000000000b2", status=404, payload={"error": "order not found"})
+    still = order_row(oid="00000000000000b3", cid=r3.order.client_id, seq=12)
+    server.on_subscribe = lambda s, msg: ({"type": "subscribed", "channel": "orders", "id": msg["id"],
+                                           "accountIndex": 0,
+                                           "contents": {"isSnapshot": True, "lastSequenceId": 100,
+                                                        "openOrders": [still], "recentClosedOrders": []}}
+                                          if msg["channel"] == "orders" else None)
+    await acct_sock(server).close()
+    assert await wait_for(lambda: r.order.status is OrderStatus.CANCELED and r2.order.status is OrderStatus.CANCELED,
+                          timeout=4.0)
+    assert "missing" in r2.order.error
+    assert r3.order.status is OrderStatus.OPEN and not m.calls("GET", "/v1/order/00000000000000b3")
+    assert ex.stats()["live_orders"] == 1
+
+
+async def test_place_ambiguous_5xx_is_unknown_not_forgotten(env):
+    """A CDN/LB 502 page (no gateway errorType) may follow a forwarded place: keep tracking + cancel it."""
+    factory, server, m = env
+    ex = await factory(ack_timeout_s=0.05)
+    m.post("/v1/placeOrder", status=502, payload="<html>502 Bad Gateway</html>")
+    m.post("/v1/cancelOrder", payload={"status": "CANCEL_ACKNOWLEDGED"})
+    r = await ex.place_limit("BTC", Side.BUY, D("0.001"), D("60000"), client_id="q-5")
+    assert not r.ok and r.retryable and r.order.status is OrderStatus.UNKNOWN and "q-5" in ex._recs_by_cid
+    assert await wait_for(lambda: len(m.calls("POST", "/v1/cancelOrder")) == 1)
+    assert m.calls("POST", "/v1/cancelOrder")[0].json()["clientId"] == "q-5"
+    # the forwarded order shows up: it is ours (tracked), not a foreign order
+    acct_sock(server).push(orders_frame(order_row(oid=OID, cid="q-5", seq=7)))
+    assert await wait_for(lambda: r.order.status is OrderStatus.OPEN)
+    assert not ex._find_rec(OID, "q-5").foreign
+    # the gateway's own "not submitted" marker -> safe to forget and resend
+    m.post("/v1/placeOrder", status=502, payload={"error": "not submitted", "errorType": "Transmission"})
+    r2 = await ex.place_limit("BTC", Side.BUY, D("0.001"), D("60000"), client_id="q-6")
+    assert not r2.ok and r2.retryable and r2.order.status is OrderStatus.REJECTED and "q-6" not in ex._recs_by_cid
+
+
+async def test_market_attributes_flip_rth_without_waiting_for_rest(env):
+    factory, server, m = env
+    ex = await factory(creds=False)
+    ex.rwa_close_buffer_s = 0  # independent of the wall clock
+    md = md_sock(server)
+    assert md.subs("marketAttributes") == [{"type": "subscribe", "channel": "marketAttributes"}]
+    spy = ex.markets["SPY"]
+    entry = {"marketId": spy.market_id, "marketDisplayName": "SPY-USD", "offHoursInitialMarginFraction": "0.03",
+             "isOutsideRth": False, "currentSettlementPrice": None, "upperTradingBound": None,
+             "lowerTradingBound": None}
+    md.push({"type": "subscribed", "channel": "marketAttributes", "id": "",
+             "contents": {"isSnapshot": True, "entries": [entry]}})
+    assert await wait_for(lambda: ex._attrs.get("SPY") is not None)
+    assert ex.market_open("SPY")
+    md.push({"type": "channel_data", "channel": "marketAttributes", "id": "", "contents": {
+        "isSnapshot": False, "entries": [dict(entry, isOutsideRth=True, currentSettlementPrice="660.1",
+                                              upperTradingBound="680", lowerTradingBound="640",
+                                              boundEvent="exitRth", boundSide=None)]}})
+    assert await wait_for(lambda: not ex.market_open("SPY"))
+    assert spy.extra["trading_bounds"]["upperTradingBound"] == "680" and spy.extra["off_hours_imf"] == D("0.03")
+    await ex._refresh_markets()  # a (cached) REST read still saying in-RTH does not undo the pushed state
+    assert ex.markets["SPY"] is spy and not ex.market_open("SPY")
+
+
+async def test_bbo_checks_loss_window_and_resync_resubscribes_bbo(env):
+    factory, server, m = env
+    ex = await factory(creds=False)
+    await ex.subscribe_books(["ETH"])
+    md = md_sock(server)
+    md.push({"type": "subscribed", "channel": "l2OrderbookUpdates", "id": "ETH-USD",
+             "contents": {"bids": [["2000", "1"]], "asks": [["2000.5", "1"], ["2001", "2"]], "lastSequenceId": 10}})
+    # the ask 2000.5 was lifted inside the loss window; this bbo arrives before any delta (book can't use it yet)
+    md.push({"type": "channel_data", "channel": "bbo", "id": "ETH-USD", "contents": {
+        "bestBid": {"price": "2000", "size": "1"}, "bestAsk": {"price": "2001", "size": "2"}, "lastSequenceId": 19}})
+    md.push({"type": "channel_data", "channel": "l2OrderbookUpdates", "id": "ETH-USD",
+             "contents": {"bids": [["1990", "1"]], "asks": [], "lastSequenceId": 20}})  # first delta: deep only
+    assert await wait_for(lambda: ex.get_book("ETH") is not None and ex.get_book("ETH").best_ask == D("2001"))
+    # a gap -> resync resubscribes the bbo too (a fresh bbo snapshot right after the new l2 snapshot)
+    md.push({"type": "channel_data", "channel": "l2OrderbookUpdates", "id": "ETH-USD",
+             "contents": {"bids": [], "asks": [], "lastSequenceId": 25}})
+    assert await wait_for(lambda: len(md.subs("bbo", kind="unsubscribe")) == 1 and len(md.subs("bbo")) == 2)
+    # quiet market: the top is still a snapshot-only level well after the snapshot -> one bbo re-poll
+    md.push({"type": "subscribed", "channel": "l2OrderbookUpdates", "id": "ETH-USD",
+             "contents": {"bids": [["2000", "1"]], "asks": [["2001", "2"]], "lastSequenceId": 30}})
+    md.push({"type": "channel_data", "channel": "l2OrderbookUpdates", "id": "ETH-USD",
+             "contents": {"bids": [["1990", "2"]], "asks": [], "lastSequenceId": 40}})
+    book = ex._books["ETH"]
+    assert await wait_for(lambda: book.applying and book.seq == 40)
+    book.snapshot_ts -= 5
+    await ex._book_monitor()
+    assert await wait_for(lambda: len(md.subs("bbo")) == 3)
+    await ex._book_monitor()
+    await asyncio.sleep(0.02)
+    assert len(md.subs("bbo")) == 3  # once per snapshot

@@ -107,3 +107,20 @@ async def test_network_failure_on_get_is_retryable_exchange_error():
         assert ei.value.retryable
     finally:
         await rest.close()
+
+
+async def test_bare_5xx_is_not_transmission(srv):
+    """Only the gateway's JSON ``errorType`` says "not submitted"; a CDN 502 page may follow a forwarded write."""
+    srv.post("/v1/placeOrder", status=502, payload="<html>502 Bad Gateway</html>")
+    srv.post("/v1/placeOrder", status=503, payload={"error": "path temporarily disabled", "errorType": "Unavailable"})
+    rest = await make(srv)
+    try:
+        with pytest.raises(ArcusHTTPError) as e1:
+            await rest.post("/v1/placeOrder", "{}", {})
+        assert e1.value.status == 502 and e1.value.retryable
+        assert not e1.value.is_transmission and not e1.value.is_definitive_5xx
+        with pytest.raises(ArcusHTTPError) as e2:
+            await rest.post("/v1/placeOrder", "{}", {})
+        assert e2.value.is_definitive_5xx and not e2.value.is_transmission
+    finally:
+        await rest.close()

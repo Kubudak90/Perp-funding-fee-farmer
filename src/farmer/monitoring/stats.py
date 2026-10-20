@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import threading
 import time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Callable
@@ -25,6 +26,7 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger("farmer.stats")
 
 FUNDING_COLLECT_S = 300.0
+FUNDING_LOOKBACK_S = 6 * 3600.0  # re-request this much funding history every collection (the store dedupes)
 
 
 # --------------------------------------------------------------------------- aggregation helpers
@@ -56,21 +58,43 @@ def net_base(summary: dict[str, VenueSummary]) -> dict[str, Decimal]:
     return net
 
 
-def pnl_from_summary(summary: dict[str, VenueSummary], marks: dict[str, Decimal]) -> Decimal:
-    """Exactly ``Store.pnl`` applied to an already computed summary (cash flow + funding + marked net base)."""
+def pnl_from_summary(summary: dict[str, VenueSummary], marks: dict[str, Decimal],
+                     venue_marks: dict[tuple[str, str], Decimal] | None = None) -> Decimal:
+    """Cash flow + funding + marked net base of an already computed summary.
+
+    ``venue_marks`` ({(venue, symbol): mid}) values each venue's leg at that venue's own mid: a hedged pair entered
+    across the structural basis (Arcus ~10 bps below Lighter) is then ~0, not a phantom loss/gain of the basis.
+    A symbol with a leg whose venue mark is missing falls back to the net base across venues at the common
+    ``marks[symbol]`` (exactly ``Store.pnl``; hedged legs net out).
+    """
     total = sum((s.cash_flow + s.funding for s in summary.values()), ZERO)
-    for sym, q in net_base(summary).items():
-        if q != 0 and sym in marks:
-            total += q * marks[sym]
+    legs: dict[str, list[tuple[str, Decimal]]] = {}
+    for venue, s in summary.items():
+        for sym, q in (s.net_base or {}).items():
+            if q != 0:
+                legs.setdefault(sym, []).append((venue, q))
+    vm = venue_marks or {}
+    for sym, items in legs.items():
+        if vm and all((v, sym) in vm for v, _ in items):
+            total += sum((q * vm[(v, sym)] for v, q in items), ZERO)
+            continue
+        net = sum((q for _, q in items), ZERO)
+        if net != 0 and sym in marks:
+            total += net * marks[sym]
     return total
 
 
-class IncrementalSummary:
-    """``store.summary(since)`` for a FIXED ``since`` without rescanning every row on each call.
+def _hour_floor(ts: float) -> float:
+    return float(int(ts // 3600) * 3600)
 
-    SQLite reads are synchronous (they run on the event loop): rows older than ``tail_s`` are
-    aggregated once per ``rebase_s`` and only the recent tail is rescanned per call. A row inserted
-    late with a timestamp older than the tail is picked up at the next rebase.
+
+class IncrementalSummary:
+    """``store.summary(since)`` for a FIXED ``since`` without re-summing the whole window on each call.
+
+    The part older than an hour-aligned checkpoint (``tail_s`` .. ``tail_s`` + 1 h back) is aggregated once per
+    ``rebase_s``; each call only adds the tail (a few hourly aggregate rows plus the raw rows of the current hour).
+    A row inserted late with a timestamp older than the checkpoint is picked up at the next rebase. ``aget`` runs
+    the store reads in a worker thread when the store supports it, so they never block the event loop.
     """
 
     def __init__(self, store: "Store", *, tail_s: float = 7200.0, rebase_s: float = 600.0,
@@ -83,15 +107,24 @@ class IncrementalSummary:
         self._cp = 0.0
         self._base: dict[str, VenueSummary] = {}
         self._base_ts: float | None = None
+        self._lock = threading.Lock()  # a cancelled aget() may still run in its worker thread
 
     def get(self, since: float) -> dict[str, VenueSummary]:
-        now = self._clock()
-        if self._since != since or self._base_ts is None or now - self._base_ts >= self.rebase_s:
-            self._since = since
-            self._cp = max(since, now - self.tail_s)
-            self._base = self.store.summary(since, self._cp) if self._cp > since else {}
-            self._base_ts = now
-        return merge_summaries(self._base, self.store.summary(self._cp))
+        with self._lock:
+            now = self._clock()
+            if self._since != since or self._base_ts is None or now - self._base_ts >= self.rebase_s:
+                self._since = since
+                self._cp = max(since, _hour_floor(now - self.tail_s))
+                self._base = self.store.summary(since, self._cp) if self._cp > since else {}
+                self._base_ts = now
+            base, cp = self._base, self._cp
+        return merge_summaries(base, self.store.summary(cp))
+
+    async def aget(self, since: float) -> dict[str, VenueSummary]:
+        """``get`` off the event loop (worker thread) when the store has a separate read connection."""
+        if getattr(self.store, "concurrent_reads", False):
+            return await asyncio.to_thread(self.get, since)
+        return self.get(since)
 
 
 # --------------------------------------------------------------------------- formatting helpers
@@ -240,6 +273,7 @@ class StatsReporter:
         notify_every: int = 60,
         *,
         funding_interval_s: float = FUNDING_COLLECT_S,
+        funding_lookback_s: float = FUNDING_LOOKBACK_S,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.store = store
@@ -249,6 +283,7 @@ class StatsReporter:
         self.interval_s = float(interval_s)
         self.notify_every = max(1, int(notify_every))
         self.funding_interval_s = float(funding_interval_s)
+        self.funding_lookback_s = max(0.0, float(funding_lookback_s))
         self._clock = clock
         self.start_ts = clock()
         self.reports = 0
@@ -278,7 +313,8 @@ class StatsReporter:
 
     async def report_once(self) -> str:
         try:
-            text = self.render_report()
+            now = self._clock()
+            text = self.render_report(await self._summaries_async(now), now)
         except Exception as exc:  # never kill the loop over a formatting bug
             log.exception("render_report failed")
             text = f"stats report failed: {exc!r}"
@@ -291,9 +327,30 @@ class StatsReporter:
                 log.warning("stats notification failed: %r", exc)
         return text
 
+    def _funding_floor(self, venue: str) -> float:
+        """Oldest funding timestamp ever collected for ``venue`` into this database: the first run's start (older
+        payments belong to positions held before the bot). Persisted, so restarts still backfill their downtime."""
+        key = f"funding_floor:{getattr(self.store, 'paper', 0)}:{venue}"
+        try:
+            v = self.store.get_meta(key)
+            if v is not None:
+                return float(v)
+            first = self.store.first_funding_ts(venue)
+            floor = min(first, self.start_ts) if first is not None else self.start_ts
+            self.store.set_meta(key, repr(float(floor)))
+            return float(floor)
+        except Exception:  # a store without meta support: the session start
+            return self.start_ts
+
     async def collect_funding(self) -> int:
-        """Pull realized funding from every venue with credentials into the store (store dedupes)."""
+        """Pull realized funding from every venue with credentials into the store; returns the NEW rows stored.
+
+        Every collection re-requests ``funding_lookback_s`` of history (not just "after the newest stored row"):
+        an hour whose payment the WebSocket missed and whose REST backfill was skipped (budget, 429, error) is
+        filled in later even after a newer payment was stored. ``UNIQUE(venue, symbol, ts)`` dedupes the rest.
+        """
         n = 0
+        now = self._clock()
         for key, ex in self.venues.items():
             try:
                 if not ex.has_credentials:
@@ -301,24 +358,24 @@ class StatsReporter:
             except Exception:
                 continue
             venue = getattr(ex, "name", None) or key
-            since = self.store.last_funding_ts(venue)
-            if since is None:
-                since = self.start_ts
+            floor = self._funding_floor(venue)
+            last = self.store.last_funding_ts(venue)
+            since = floor if last is None else max(floor, min(last, now - self.funding_lookback_s))
             try:
                 pays = await asyncio.wait_for(ex.fetch_funding_payments(since_ts=since), 30.0)
             except Exception as exc:
                 log.warning("%s fetch_funding_payments failed: %r", venue, exc)
                 continue
             for p in pays or []:
-                if p.ts < since:
+                if p.ts < floor:
                     continue
                 try:
-                    self.store.record_funding(p)
-                    n += 1
+                    if self.store.record_funding(p) is not False:
+                        n += 1
                 except Exception:
                     log.exception("record_funding failed for %s", p)
         if n:
-            log.debug("collected %d funding payment(s)", n)
+            log.debug("collected %d new funding payment(s)", n)
         return n
 
     # ------------------------------------------------------------------ report
@@ -363,15 +420,59 @@ class StatsReporter:
                 marks[sym] = sum(mids, ZERO) / len(mids)
         return marks
 
+    def _venue_marks(self, status: dict, summary: dict[str, VenueSummary]) -> dict[tuple[str, str], Decimal]:
+        """{(venue, venue symbol): that venue's mid} for every open leg in ``summary`` (trader books first, then
+        the venue adapters' live books)."""
+        legs = {(v, sym) for v, s in summary.items() for sym, q in (s.net_base or {}).items() if q != 0}
+        out: dict[tuple[str, str], Decimal] = {}
+        if not legs:
+            return out
+        mv, tv = status.get("maker_venue"), status.get("taker_venue")
+        for _sym, m in _markets(status):
+            books = m.get("books") if isinstance(m.get("books"), dict) else {}
+            for venue, sym_key, mid_key in ((mv, "maker_symbol", "maker_mid"), (tv, "taker_symbol", "taker_mid")):
+                vsym, px = m.get(sym_key), _num(books.get(mid_key))
+                if isinstance(venue, str) and isinstance(vsym, str) and px is not None and px > 0:
+                    out[(venue, vsym)] = px
+        by_name = {getattr(ex, "name", None) or k: ex for k, ex in self.venues.items()}
+        for venue, sym in legs:
+            if (venue, sym) in out or venue not in by_name:
+                continue
+            try:
+                book = by_name[venue].get_book(sym)
+            except Exception:
+                book = None
+            mid = book.mid if book is not None else None
+            if mid is not None and mid > 0:
+                out[(venue, sym)] = mid
+        return out
+
     def _pnl(self, status: dict, summary: dict[str, VenueSummary]) -> tuple[Decimal, list[str]]:
-        """``Store.pnl`` of the window ``summary`` covers (computed from it, no extra scan)."""
+        """PnL of the window ``summary`` covers (computed from it, no extra scan); each venue's leg at its own mid
+        when known (see ``pnl_from_summary``)."""
         held = {sym for sym, q in net_base(summary).items() if q != 0}
         marks = self._marks(status, held)
         missing = sorted(sym for sym in held if sym not in marks)
-        return pnl_from_summary(summary, marks), missing
+        return pnl_from_summary(summary, marks, self._venue_marks(status, summary)), missing
 
-    def render_report(self) -> str:
-        now = self._clock()
+    def _summaries(self, now: float) -> tuple[dict[str, VenueSummary], dict[str, VenueSummary],
+                                              dict[str, VenueSummary]]:
+        """(last hour, last 24 h, all time) from the store."""
+        return self.store.summary(now - 3600), self.store.summary(now - 86400), self._all_time.get(0.0)
+
+    async def _summaries_async(self, now: float) -> tuple[dict[str, VenueSummary], dict[str, VenueSummary],
+                                                          dict[str, VenueSummary]]:
+        """``_summaries`` in a worker thread when the store has a separate read connection (never blocks the loop
+        that drives the websockets, hedgers and traders)."""
+        if getattr(self.store, "concurrent_reads", False):
+            return await asyncio.to_thread(self._summaries, now)
+        return self._summaries(now)
+
+    def render_report(self, summaries: tuple[dict[str, VenueSummary], dict[str, VenueSummary],
+                                             dict[str, VenueSummary]] | None = None,
+                      now: float | None = None) -> str:
+        """Format the report. ``summaries`` = ``_summaries(now)`` (read synchronously here when omitted)."""
+        now = self._clock() if now is None else now
         status = self._status()
         lines: list[str] = []
 
@@ -385,9 +486,7 @@ class StatsReporter:
             head += f" | HALTED: {reason}"
         lines.append(head)
 
-        s1h = self.store.summary(now - 3600)
-        s24 = self.store.summary(now - 86400)
-        sall = self._all_time.get(0.0)
+        s1h, s24, sall = summaries if summaries is not None else self._summaries(now)
         venue_names = list(dict.fromkeys([getattr(v, "name", k) for k, v in self.venues.items()] + list(sall)))
         width = max([len(v) for v in venue_names] + [5])
         for v in venue_names:

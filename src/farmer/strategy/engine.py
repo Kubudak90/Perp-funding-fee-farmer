@@ -5,8 +5,9 @@ Lifecycle:
   subscribe books, start the funding monitor, the risk manager and one Hedger per pair (pre-existing delta is
   hedged right away). Traders are created but do not quote yet.
 - ``run()``: ``start()`` + traders + periodic status log, until ``request_stop()``; then ``shutdown()``.
-- ``shutdown()``: stop traders (cancel quotes), let hedgers flush, optionally ``close_all("taker")``
-  (``risk.close_on_exit``), stop background tasks, close venues.
+- ``shutdown()``: stop traders (cancel quotes; then cancel_all on every maker market as insurance), let hedgers
+  flush and settle (fills racing the cancels), optionally ``close_all("taker")`` (``risk.close_on_exit``, only if
+  ``start()`` completed), stop background tasks, check every pair is hedged, close venues, deliver alerts.
 
 Every background task is supervised: exceptions are logged and the task restarts with backoff.
 """
@@ -56,6 +57,7 @@ class Engine:
         self._trading = False
         self._stopping = False
         self._shutdown_done = False
+        self._traders_started = False
         self._bg: set[asyncio.Future] = set()
         self.started_ts: float | None = None
         self.flush_timeout_s = float(cfg.strategy.shutdown_flush_s)
@@ -63,6 +65,10 @@ class Engine:
         self.status_interval_s = float(cfg.monitoring.report_interval_s or 60.0)
         self.check_prices = bool(cfg.strategy.check_prices)
         self.position_retries = int(cfg.strategy.startup_position_retries)
+        # shutdown: hedgers keep running this long after the last maker fill (fills racing the quote cancels)
+        self.settle_s = float(cfg.strategy.shutdown_settle_s)
+        # runtime sweep of untracked open quotes (e.g. a place that landed after its cancel); 0 = off
+        self.orphan_sweep_s = float(cfg.strategy.orphan_sweep_s)
 
     # ------------------------------------------------------------------ lifecycle
     @property
@@ -145,6 +151,8 @@ class Engine:
             for sym, h in self.hedgers.items():
                 self._spawn(f"hedger:{sym}", h.run, should_run=lambda h=h: not h.stopped)
             await self._setup_dms()
+            if self.orphan_sweep_s > 0:
+                self._spawn("orphan-sweep", self._orphan_sweep_loop)
         self._spawn("status", self._status_loop)
 
     async def run(self) -> None:
@@ -172,21 +180,39 @@ class Engine:
             self._stopping = True
             log.info("engine shutting down")
             # 1. stop quoting (hedgers keep running)
+            unconfirmed: list[str] = []
             if self.traders:
-                await asyncio.gather(*(self._stop_trader(t) for t in self.traders.values()), return_exceptions=True)
-            # 2. let hedgers flush outstanding deltas
+                res = await asyncio.gather(*(self._stop_trader(t) for t in self.traders.values()),
+                                           return_exceptions=True)
+                unconfirmed = [s for s, r in zip(self.traders, res, strict=True) if r is not True]
+            quoted = self._trading and self._traders_started
+            if quoted:
+                await self._final_cancel_all()  # insurance: quotes whose cancel is unconfirmed / in transit
+                if unconfirmed:
+                    msg = f"shutdown: quote cancel unconfirmed for {', '.join(unconfirmed)}; a quote may still rest"
+                    log.critical(msg)
+                    self._notify(msg)
+            # 2. let hedgers flush outstanding deltas (and settle: maker fills racing the cancels)
             if self.hedgers and self._trading:
-                ok = await asyncio.gather(*(h.flush(self.flush_timeout_s) for h in self.hedgers.values()),
-                                          return_exceptions=True)
+                if quoted and unconfirmed:
+                    await self._wait_quotes_gone(max(self._dms_seconds(), self.flush_timeout_s))
+                settle = min(self.settle_s, self.flush_timeout_s) if quoted else 0.0
+                ok = await asyncio.gather(*(h.flush(self.flush_timeout_s, settle_s=settle)
+                                            for h in self.hedgers.values()), return_exceptions=True)
                 bad = [s for s, r in zip(self.hedgers, ok, strict=True) if r is not True]
                 if bad:
                     self._notify(f"shutdown: hedgers not flat for {', '.join(bad)}")
-            # 3. optional flatten
+            # 3. optional flatten (never re-runs a startup that did not complete)
             if self.cfg.risk.close_on_exit and self._trading and self.hedgers:
-                try:
-                    await self.close_all("taker", timeout_s=self.close_timeout_s)
-                except Exception:
-                    log.exception("close_on_exit failed")
+                if self._started:
+                    try:
+                        await self.close_all("taker", timeout_s=self.close_timeout_s)
+                    except Exception:
+                        log.exception("close_on_exit failed")
+                else:
+                    msg = "close_on_exit skipped: engine did not finish starting; positions left as they are"
+                    log.critical(msg)
+                    self._notify(msg)
             # 4. stop background tasks
             for h in self.hedgers.values():
                 h.stop()
@@ -204,6 +230,8 @@ class Engine:
             await asyncio.gather(*tasks, return_exceptions=True)
             self._tasks.clear()
             self._trader_tasks.clear()
+            if self._trading:
+                self._final_delta_check()
             # 5. close venues
             venues = list(dict.fromkeys([self.maker, self.taker, *self.venues.values()]))
             await asyncio.gather(*(self._close_venue(v) for v in venues), return_exceptions=True)
@@ -212,8 +240,59 @@ class Engine:
             except Exception:
                 log.exception("session stats failed")
             self._record("shutdown", self._summary())
+            # 6. deliver queued alerts before the caller closes the notifier
+            await self._drain_notifications()
             self._shutdown_done = True
             log.info("engine stopped")
+
+    async def _final_cancel_all(self) -> None:
+        for sym in dict.fromkeys(p.maker_symbol for p in self.pairs):
+            try:
+                await asyncio.wait_for(self.maker.cancel_all(sym), 15.0)
+            except Exception as exc:
+                log.error("%s: shutdown cancel_all(%s) failed: %r", self.maker.name, sym, exc)
+
+    async def _wait_quotes_gone(self, timeout_s: float) -> bool:
+        """Poll the maker's open orders on our markets until none rest (hedgers keep running meanwhile)."""
+        syms = {p.maker_symbol for p in self.pairs}
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            try:
+                orders = await asyncio.wait_for(self.maker.fetch_open_orders(), 15.0)
+                left = [o for o in orders if o.symbol in syms and o.is_open]
+            except Exception as exc:
+                log.warning("%s: open-order check failed: %r", self.maker.name, exc)
+                left = None
+            if left == []:
+                return True
+            if time.monotonic() >= deadline:
+                msg = f"shutdown: maker orders may still rest on {sorted(syms)} (venue dead man's switch pending)"
+                log.critical(msg)
+                self._notify(msg)
+                return False
+            if left:
+                await self._final_cancel_all()
+            await asyncio.sleep(1.0)
+
+    def _final_delta_check(self) -> None:
+        for s, h in self.hedgers.items():
+            try:
+                hedged = h.is_hedged()
+            except Exception:
+                hedged = False
+            if not hedged:
+                msg = (f"shutdown: {s} NOT hedged: maker={fmt(h.maker_pos)} taker={fmt(h.taker_pos)} "
+                       f"delta={fmt(h.delta)} inflight={fmt(h.inflight)}")
+                log.critical(msg)
+                self._notify(msg)
+
+    async def _drain_notifications(self, timeout_s: float = 10.0) -> None:
+        pending = set(self._bg)
+        for h in self.hedgers.values():
+            pending |= set(getattr(h, "_bg", ()))
+        pending = {f for f in pending if not f.done()}
+        if pending:
+            await asyncio.wait(pending, timeout=timeout_s)
 
     # ------------------------------------------------------------------ start helpers
     async def _set_leverage(self) -> None:
@@ -324,11 +403,14 @@ class Engine:
             if task is not None and not task.done():
                 continue
             t.resume()
+            self._traders_started = True
             self._trader_tasks[sym] = self._supervise(f"trader:{sym}", t.run, should_run=lambda t=t: not t.stopped)
 
-    async def _stop_trader(self, t: PairTrader) -> None:
+    async def _stop_trader(self, t: PairTrader) -> bool:
+        """Stop one trader; False if its quote cancel was not confirmed."""
+        ok = False
         try:
-            await asyncio.wait_for(t.stop(cancel_quotes=True), 15.0)
+            ok = await asyncio.wait_for(t.stop(cancel_quotes=True), 15.0) is not False
         except Exception as exc:
             log.error("%s: trader stop failed: %r", t.symbol, exc)
         task = self._trader_tasks.pop(t.symbol, None)
@@ -337,6 +419,28 @@ class Engine:
                 await asyncio.wait_for(asyncio.shield(task), 5.0)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 task.cancel()
+        return ok
+
+    async def _orphan_sweep_loop(self) -> None:
+        """Every ``orphan_sweep_s``: hand the maker's open orders to the running traders, which cancel quotes of
+        theirs they no longer track (the WS order stream is the primary source; this catches what it missed)."""
+        while not self._stopping:
+            await asyncio.sleep(self.orphan_sweep_s)
+            if self._stopping:
+                return
+            live = [t for t in self.traders.values() if t.running]
+            if not live:
+                continue
+            try:
+                orders = await asyncio.wait_for(self.maker.fetch_open_orders(), 20.0)
+            except Exception as exc:
+                log.warning("%s: open-order sweep failed: %r", self.maker.name, exc)
+                continue
+            for t in live:
+                try:
+                    t.handle_open_orders(orders)
+                except Exception:
+                    log.exception("%s: open-order sweep failed", t.symbol)
 
     async def _close_venue(self, v: Exchange) -> None:
         try:
@@ -391,6 +495,8 @@ class Engine:
         """
         if mode not in ("maker", "taker"):
             raise ValueError(f"unknown close mode {mode!r}")
+        if self._stopping and not self._started:
+            raise RuntimeError("engine did not finish starting; not (re)starting it during shutdown")
         await self.start()
         if not self._trading:
             raise RuntimeError("cannot close without credentials on both venues")
@@ -406,7 +512,7 @@ class Engine:
                 t.force_close(True)
             self._start_traders()
             while time.monotonic() < deadline:
-                if all(h.is_flat() for h in self.hedgers.values()):
+                if all(self._is_flat(h, mode) for h in self.hedgers.values()):
                     break
                 await asyncio.sleep(0.05 if self.cfg.strategy.loop_interval_s < 0.05 else 0.25)
         else:
@@ -428,7 +534,7 @@ class Engine:
             finally:
                 for h in self.hedgers.values():
                     h.close_mode = False
-        result = {s: {"maker_pos": h.maker_pos, "taker_pos": h.taker_pos, "flat": h.is_flat()}
+        result = {s: {"maker_pos": h.maker_pos, "taker_pos": h.taker_pos, "flat": self._is_flat(h, mode)}
                   for s, h in self.hedgers.items()}
         not_flat = [s for s, r in result.items() if not r["flat"]]
         msg = (f"close_all({mode}) done" if not not_flat else
@@ -438,6 +544,15 @@ class Engine:
         self._notify(msg)
         self._record("close_all", {"mode": mode, "result": result})
         return result
+
+    @staticmethod
+    def _is_flat(h: Hedger, mode: str) -> bool:
+        """Maker mode: a maker residual below the PAIR minimum can never be quoted (the forced-close trader stops
+        there), so it is dust like in the trader; taker mode uses the per-venue minimums (``flatten``)."""
+        if mode != "maker":
+            return h.is_flat()
+        px = h.ref_price()
+        return h.is_flat(maker_min=h.pair.min_size(px) if px is not None and px > 0 else None)
 
     # ------------------------------------------------------------------ status
     def _venue_status(self, v: Exchange) -> dict:
@@ -526,10 +641,12 @@ class Engine:
             t = self.traders.get(s)
             ts = t.stats if t is not None else {}
             hs = h.stats
-            log.info("%s session: places=%s amends=%s (protective %s, improve %s, %.1f/min) cancels=%s would_cross=%s "
+            log.info("%s session: places=%s amends=%s (protective %s, improve %s, resize %s, %.1f/min) cancels=%s "
+                     "would_cross=%s "
                      "rejects=%s maker_fills=%s hedges=%s hedge_fills=%s failures=%s reconciles=%s adoptions=%s "
                      "emergencies=%s cycles=%s flips=%s vol maker=%s hedge=%s", s, ts.get("places"), ts.get("amends"),
-                     ts.get("protective"), ts.get("improve"), 60.0 * float(ts.get("amends") or 0) / up,
+                     ts.get("protective"), ts.get("improve"), ts.get("resize"),
+                     60.0 * float(ts.get("amends") or 0) / up,
                      ts.get("cancels"), ts.get("would_cross"), ts.get("rejects"), hs.get("maker_fills"),
                      hs.get("hedges_sent"), hs.get("hedge_fills"), hs.get("hedge_failures"), hs.get("reconciles"),
                      hs.get("adoptions"), hs.get("emergencies"), ts.get("cycles"), ts.get("flips"),

@@ -256,11 +256,12 @@ async def test_daily_loss_halts_with_marks_from_books():
     store.record_fill(_fill("lighter", Side.SELL, 1000, 1, today, "l1", fee="5", maker=False), "hedge")
     venues["arcus"].set_book("BTC", [(990, 1)], [(991, 1)])
     venues["lighter"].set_book("BTC", [(989, 1)], [(990, 1)])
-    assert rm.check_daily_loss() == D("-15")
+    # each leg at its own venue's mid: -5 entry spread - 10 fees + (+1 x 990.5 - 1 x 989.5) = -14
+    assert rm.check_daily_loss() == D("-14")
     assert not rm.halted
     store.record_fill(_fill("arcus", Side.BUY, 1100, 1, today, "a2"), "maker")  # unhedged leg
-    pnl = rm.check_daily_loss()  # -15 - 1100 + 1 * mean mid 990.0
-    assert pnl == D("-15") - D("1100") + D("990.0")
+    pnl = rm.check_daily_loss()  # cash -1115 + 2 x 990.5 (arcus) - 1 x 989.5 (lighter)
+    assert pnl == D("-1115") + 2 * D("990.5") - D("989.5")
     assert rm.halted and "daily loss" in rm.halt_reason
     await _drain()
     assert notifier.sent and "daily loss" in notifier.sent[0]
@@ -337,3 +338,130 @@ async def test_daily_loss_matches_store_pnl_and_resets_at_midnight():
     rm.resume()
     now[0] += 120  # new UTC day: yesterday's loss no longer counts
     assert rm.check_daily_loss() == D("0") and not rm.halted
+
+
+# ------------------------------------------------------------------ free collateral / margin reduction / equity drift
+async def test_check_open_requires_free_collateral_for_the_clip():
+    """The hedge venue must be able to post the clip's initial margin (with a buffer) BEFORE the maker leg opens;
+    the margin ratio alone stays far below its limit while free collateral runs out."""
+    venues = {"arcus": FakeExchange("arcus"), "lighter": FakeExchange("lighter")}
+    rm = RiskManager(RiskConfig(min_free_collateral_mult=D("1.5")), venues, leverage={"BTC": 5}, default_leverage=2)
+    venues["lighter"].balance = Balance("lighter", equity=D("1000"), available=D("149"), maintenance_margin=D("60"))
+    await rm.refresh_balances()
+    assert rm.balance("lighter").margin_ratio < D("0.1")
+    ok, why = rm.check_open("BTC", D("500"))  # 500 / 5x * 1.5 = 150 > 149
+    assert not ok and "lighter" in why and "free collateral" in why
+    assert rm.check_open("BTC", D("490"))[0]  # 147 <= 149
+    assert not rm.check_open("ETH", D("200"))[0]  # unknown symbol -> default 2x: 150 > 149
+    assert rm.check_open("ETH", D("200"), leverage=5)[0]  # explicit leverage wins
+    rm.cfg = RiskConfig(min_free_collateral_mult=D("0"))  # 0 disables the check
+    assert rm.check_open("BTC", D("5000"))[0]
+
+
+def test_default_margin_limits_leave_real_headroom_before_liquidation():
+    cfg = RiskConfig()
+    # liquidation at 1.0; reducing must start while equity is still >= 2.5 x maintenance
+    assert cfg.reduce_margin_ratio <= D("0.4") and cfg.max_margin_ratio < cfg.reduce_margin_ratio
+
+
+async def test_margin_reduce_halts_and_runs_the_reducer_once_until_cooldown():
+    rm, venues, store, notifier = setup(reduce_margin_ratio=D("0.4"))
+    calls = []
+    gate = asyncio.Event()
+
+    async def reducer():
+        calls.append(1)
+        await gate.wait()
+
+    rm.set_reducer(reducer)
+    await rm.refresh_balances()
+    assert rm.check_margin() is False and calls == [] and not rm.halted
+    venues["lighter"].balance = Balance("lighter", equity=D("1000"), available=D("0"), maintenance_margin=D("450"))
+    await rm.refresh_balances()
+    assert rm.check_margin() is True
+    await _drain()
+    assert rm.halted and "reduce_margin_ratio" in rm.halt_reason and "lighter 0.450" in rm.halt_reason
+    assert calls == [1] and rm.status()["reducing"]
+    assert rm.check_margin() and calls == [1]  # still running: not started twice
+    gate.set()
+    await _drain()
+    assert not rm.status()["reducing"]
+    assert rm.check_margin() and calls == [1]  # cooldown after a run
+    rm.reduce_retry_s = 0.0
+    assert rm.check_margin()
+    await _drain()
+    assert calls == [1, 1]  # margin still high after the cooldown: reduce again
+    gate.clear()
+    rm.reduce_retry_s = 0.0
+    rm.check_margin()
+    await _drain()
+    task = rm._reduce_task
+    rm.stop()  # shutdown cancels a running reduction
+    await _drain()
+    assert task is not None and task.cancelled()
+    assert any(k == "margin_reduce" for _, k, _ in store.recent_events(20))
+
+
+async def test_run_loop_triggers_margin_reduction():
+    rm, venues, *_ = setup()
+    rm.interval_s = 0.01
+    done = asyncio.Event()
+
+    async def reducer():
+        done.set()
+
+    rm.set_reducer(reducer)
+    venues["arcus"].balance = Balance("arcus", equity=D("100"), available=D("0"), maintenance_margin=D("90"))
+    task = asyncio.create_task(rm.run())
+    await asyncio.wait_for(done.wait(), 1.0)
+    rm.stop()
+    await asyncio.wait_for(task, 1.0)
+    assert rm.halted
+
+
+async def test_equity_divergence_alert_on_transitions():
+    rm, venues, store, notifier = setup(max_equity_divergence_frac=D("0.3"))
+    await rm.refresh_balances()
+    assert not rm.status()["equity_diverged"]
+    venues["lighter"].balance = Balance("lighter", equity=D("6000"), available=D("6000"))
+    await rm.refresh_balances()
+    await rm.refresh_balances()  # no repeat while still diverged
+    await _drain()
+    assert rm.status()["equity_diverged"]
+    assert len([m for m in notifier.sent if "equities diverge" in m]) == 1 and "lighter 6000.00" in notifier.sent[0]
+    venues["lighter"].balance = Balance("lighter", equity=D("9000"), available=D("9000"))
+    await rm.refresh_balances()
+    assert not rm.status()["equity_diverged"]
+    assert not rm.halted  # a warning, not a halt
+
+
+async def test_daily_loss_values_each_leg_at_its_own_venue_mid():
+    """A hedged pair entered across the structural basis (Arcus ~10 bps below Lighter) is not a loss."""
+    rm, venues, store, _ = setup(max_daily_loss=D("5"))
+    now = time.time()
+    store.record_fill(_fill("arcus", Side.SELL, "99.9", 100, now, "a"), "maker")  # maker SHORT at the Arcus mid
+    store.record_fill(_fill("lighter", Side.BUY, "100.0", 100, now, "l", maker=False), "hedge")
+    venues["arcus"].set_book("BTC", [("99.89", 1)], [("99.91", 1)])
+    venues["lighter"].set_book("BTC", [("99.99", 1)], [("100.01", 1)])
+    assert rm.check_daily_loss() == 0 and not rm.halted  # common mark: -10 USD of phantom basis "loss" -> halt
+
+
+async def test_daily_loss_async_reads_in_a_worker_thread(tmp_path):
+    import threading
+
+    store = Store(tmp_path / "r.db")
+    venues = {"arcus": FakeExchange("arcus", [make_market("arcus", "BTC")])}
+    rm = RiskManager(RiskConfig(max_daily_loss=D("50")), venues, store)
+    venues["arcus"].set_book("BTC", [(99, 1)], [(101, 1)])
+    store.record_fill(_fill("arcus", Side.BUY, 160, 1, time.time(), "a1"), "maker")
+    seen = []
+    orig = store.summary
+
+    def spy(*a, **k):
+        seen.append(threading.current_thread() is threading.main_thread())
+        return orig(*a, **k)
+
+    store.summary = spy  # type: ignore[method-assign]
+    assert await rm.check_daily_loss_async() == D("-60") and rm.halted
+    assert seen and not any(seen)  # never on the event loop thread
+    assert rm.check_daily_loss() == D("-60")

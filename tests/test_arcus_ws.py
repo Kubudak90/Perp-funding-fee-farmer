@@ -162,3 +162,37 @@ async def test_real_websockets_server_reconnect_and_resubscribe():
         assert await wait_for(lambda: any(m.get("type") == "subscribe" for m in received[1]), timeout=2.0)
         assert await wait_for(lambda: any(m.get("type") == "pong" for m in msgs), timeout=2.0)
         await ws.stop()
+
+
+async def test_unacknowledged_subscription_is_resent_and_degraded_rearms_timer():
+    server, msgs = FakeWsServer(), []
+    attempts = {"orders": 0}
+
+    def on_sub(sock, msg):
+        if msg["channel"] == "orders":
+            attempts["orders"] += 1
+            return {} if attempts["orders"] == 1 else None  # the first subscribe is silently lost
+        if msg["channel"] == "userFills":
+            return {"type": "degraded", "channel": "userFills", "id": msg["id"].lower(), "accountIndex": 0,
+                    "reason": "snapshot_stale", "retryAfterMs": 1000}
+        return None
+
+    server.on_subscribe = on_sub
+    ws = make(server, msgs, subscribe_timeout_s=0.1)
+    await ws.subscribe({"channel": "orders", "id": "0xAB", "accountIndex": 0})
+    ws.start()
+    assert await wait_for(lambda: ws.connected)
+    s = server.sockets[0]
+    assert await wait_for(lambda: len(s.subs("orders")) == 2, timeout=3.0)  # re-sent (unsubscribe + subscribe)
+    assert len(s.subs("orders", kind="unsubscribe")) == 1
+    assert await wait_for(lambda: not ws._pending_subs)  # the second attempt was acknowledged
+    # degraded = pending on the server: the ack timer restarts after retryAfterMs, no immediate re-send
+    key = await ws.subscribe({"channel": "userFills", "id": "0xAB", "accountIndex": 0})
+    assert await wait_for(lambda: key in ws.degraded)
+    await asyncio.sleep(0.3)
+    assert len(s.subs("userFills")) == 1 and key in ws._pending_subs
+    s.push({"type": "subscribed", "channel": "userFills", "id": "0xab", "accountIndex": 0,
+            "contents": {"isSnapshot": True, "fills": []}})
+    assert await wait_for(lambda: key not in ws.degraded and key not in ws._pending_subs)
+    assert len(server.sockets) == 1
+    await ws.stop()

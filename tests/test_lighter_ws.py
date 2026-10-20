@@ -274,3 +274,21 @@ async def test_send_tx_not_connected():
     ws, _ = make_client("ws://127.0.0.1:9/stream", [])
     with pytest.raises(TxNotSent):
         await ws.send_tx(14, {}, "f" * 80, 0.1)
+
+
+async def test_stalled_socket_does_not_take_transactions(server):
+    """Connected but silent (downlink stalled): sendtx acks cannot be trusted -> the caller must use REST."""
+    msgs: list = []
+    ws, _ = make_client(server.url, msgs, ping_interval_s=10, watchdog_s=30, tx_rx_fresh_s=0.2)
+    await ws.start()
+    try:
+        await wait_for(lambda: ws.connected)
+        assert ws.can_send_tx
+        server.silent = True
+        await wait_for(lambda: not ws.can_send_tx, timeout=2)
+        assert ws.connected  # the watchdog has not tripped yet
+        with pytest.raises(TxNotSent):
+            await ws.send_tx(14, {"x": 1}, "e" * 80, 0.1)
+        assert server.of_type("jsonapi/sendtx") == []
+    finally:
+        await ws.stop()

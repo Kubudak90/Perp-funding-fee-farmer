@@ -25,12 +25,13 @@ from farmer.config import RiskConfig, StrategyConfig
 from farmer.exchanges.base import Exchange
 from farmer.models import BPS, ZERO, Fill, Order, OrderBook, OrderStatus, Side
 from farmer.strategy.funding import MAKER_LONG, choose_direction, next_hour_ts
-from farmer.strategy.hedger import Hedger
+from farmer.strategy.hedger import Hedger, private_stream_ok
 from farmer.strategy.mapping import PairSpec
 from farmer.strategy.pricing import (
     BasisTracker,
     Quote,
     compute_maker_quote,
+    mid_excluding_own,
     price_moved_bps,
     quote_violates_edge,
     round_pair_size,
@@ -39,6 +40,8 @@ from farmer.utils.decimals import fmt
 from farmer.utils.ids import new_client_id
 
 log = logging.getLogger("farmer.trader")
+
+QUOTE_TAG = "fq"  # client-id prefix of maker quotes (hedger: fh / fe)
 
 
 class Phase(str, enum.Enum):
@@ -54,11 +57,11 @@ def _sign(x: Decimal) -> int:
 class _Dying:
     __slots__ = ("order", "first_ts", "last_ts", "attempts", "accepted")
 
-    def __init__(self, order: Order, now: float, accepted: bool) -> None:
+    def __init__(self, order: Order, now: float, accepted: bool, attempts: int = 1) -> None:
         self.order = order
         self.first_ts = now
         self.last_ts = now
-        self.attempts = 1
+        self.attempts = attempts
         self.accepted = accepted
 
 
@@ -104,15 +107,24 @@ class PairTrader:
         self._next_settle: float | None = None
         self._in_window = False
         self._forced = False
+        pre = float(scfg.protect_funding_window_s)
+        post = scfg.protect_funding_post_s
+        # the venues snapshot positions up to ~0.5 s AFTER the hour: keep closes / flips away from it too
+        self.protect_post_s = min(3.0, pre) if post is None else float(post)
+        self.funding_stale_s = max(3.0 * float(scfg.funding_refresh_s), 180.0)
+        self._funding_stale_warned = False
+        self._taker_budget_low = False
 
         self._order: Order | None = None
         self._order_born = 0.0
         self._order_ts = 0.0  # last place / amend
+        self._full_since: tuple[str, float] | None = None  # (client id, ts) quote fully filled, terminal pending
         self._placing_cid: str | None = None
         self._amend_target: Decimal | None = None
         self._amend_until = 0.0
         self._amend_sent = 0.0
         self._dying: dict[str, _Dying] = {}
+        self._done_cids: collections.OrderedDict[str, None] = collections.OrderedDict()  # recently terminal
         self._cid_fills: collections.OrderedDict[str, Decimal] = collections.OrderedDict()
         self._actions: collections.deque[float] = collections.deque()
         self._backoff_until = 0.0
@@ -124,7 +136,7 @@ class PairTrader:
         self._stop = asyncio.Event()
         self._running = False
         self.stats: dict[str, Any] = {
-            "places": 0, "amends": 0, "protective": 0, "improve": 0, "cancels": 0, "would_cross": 0,
+            "places": 0, "amends": 0, "protective": 0, "improve": 0, "resize": 0, "cancels": 0, "would_cross": 0,
             "rejects": 0, "place_failures": 0, "maker_fills": 0, "maker_volume": ZERO, "cycles": 0, "flips": 0,
         }
 
@@ -153,7 +165,41 @@ class PairTrader:
         except Exception:
             return
         if mb is not None and tb is not None:
-            self.basis.update(mb.mid, tb.mid)
+            self.basis.update(self._maker_mid_ex_own(mb), tb.mid)
+
+    def _maker_mid_ex_own(self, mb: OrderBook) -> Decimal | None:
+        """Maker mid without our own resting quote (the live venue book contains it; paper books do not)."""
+        o = self._order
+        if (o is None or o.status not in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
+                or getattr(self.maker, "is_paper", False)):
+            return mb.mid
+        return mid_excluding_own(mb, o.side, o.price, self._remaining(o))
+
+    def _is_own_quote_id(self, cid: str | None) -> bool:
+        return bool(cid) and cid.startswith(QUOTE_TAG)  # type: ignore[union-attr]
+
+    def _track_orphan(self, o: Order, why: str) -> None:
+        """A live quote of ours that we no longer track (e.g. a place that landed after its cancel was
+        acknowledged): schedule a cancel through the dying set."""
+        if (o.status.is_terminal or o.symbol != self.ms or not self._is_own_quote_id(o.client_id)
+                or o.client_id == self._placing_cid or o.client_id in self._dying or o.client_id in self._done_cids):
+            return
+        cur = self._order
+        if cur is not None and (o.client_id == cur.client_id or (o.order_id and o.order_id == cur.order_id)):
+            return
+        if self._remaining(o) <= 0:  # fully filled by our own fill count: nothing can rest
+            return
+        log.warning("%s: untracked live quote %s %s %s @ %s (%s) -> cancel", self.symbol, o.client_id,
+                    o.side.value, o.size, o.price, why)
+        d = _Dying(o, self.clock() - self.cancel_confirm_s, accepted=False, attempts=0)  # cancel on the next tick
+        self._dying[o.client_id] = d
+        self._wake.set()
+
+    def handle_open_orders(self, orders: list[Order]) -> None:
+        """Runtime sweep: cancel open quotes of ours on this market that we do not track."""
+        for o in orders:
+            if o.symbol == self.ms and o.is_open:
+                self._track_orphan(o, "open-order sweep")
 
     def _on_maker_order(self, o: Order) -> None:
         if o.symbol != self.ms:
@@ -173,6 +219,12 @@ class PairTrader:
                     log.info("%s maker order %s rejected: %s", self.symbol, o.client_id, o.error)
         if o.status.is_terminal:
             self._dying.pop(o.client_id, None)
+            if o.client_id:
+                self._done_cids[o.client_id] = None
+                while len(self._done_cids) > 500:
+                    self._done_cids.popitem(last=False)
+        elif o.status is not OrderStatus.PENDING and o.status is not OrderStatus.UNKNOWN:
+            self._track_orphan(o, "venue reports it live")
         self._wake.set()
 
     def _on_maker_fill(self, f: Fill) -> None:
@@ -248,13 +300,16 @@ class PairTrader:
         except asyncio.TimeoutError:
             pass
 
-    async def stop(self, cancel_quotes: bool = True) -> None:
+    async def stop(self, cancel_quotes: bool = True) -> bool:
+        """Stop quoting. Returns False if the quote cancel could not be confirmed (a quote may still rest)."""
         self._stop.set()
         self._wake.set()
+        ok = True
         if cancel_quotes:
-            await self.cancel_quotes()
+            ok = await self.cancel_quotes()
         if self._owns_hedger:
             self.hedger.stop()
+        return ok
 
     async def cancel_quotes(self, wait_s: float | None = None) -> bool:
         """Cancel our resting quote(s) and wait briefly for confirmation; cancel_all(symbol) as a fallback."""
@@ -321,16 +376,40 @@ class PairTrader:
         mpos = self.hedger.maker_pos
         self._report_exposure(mb, tb)
         snap = self.funding.latest(self.symbol) if self.funding is not None else None
-        nxt = (snap.next_settlement_ts if snap is not None else None) or next_hour_ts(now)
+        snap_next = snap.next_settlement_ts if snap is not None else None
+        # a snapshot not refreshed since the hour passed still names that (past) settlement: use the clock
+        nxt = snap_next if snap_next is not None and snap_next > now else next_hour_ts(now)
         self._next_settle = nxt
-        self._in_window = 0 <= nxt - now <= float(self.scfg.protect_funding_window_s)
+        prev = (int(now) // 3600) * 3600.0  # both venues settle at the top of the hour
+        if snap_next is not None and snap_next <= now:
+            prev = max(prev, snap_next)  # the settlement the snapshot names has just passed
+        self._in_window = (0 <= nxt - now <= float(self.scfg.protect_funding_window_s)
+                           or 0 <= now - prev < self.protect_post_s)
         self._forced = self._forced_close or self._must_reduce()
-        chosen = choose_direction(snap, self.direction, self.scfg.flip_hysteresis_apr, self.scfg.direction_mode)
+        chosen = choose_direction(self._direction_snapshot(snap), self.direction, self.scfg.flip_hysteresis_apr,
+                                  self.scfg.direction_mode)
         mid = self._mid(mb, tb)
         self._advance(now, mpos, mid, chosen)
         quote, reduce_only, reason = self._desired(mb, tb, mpos, mid)
         self.block_reason = reason
         await self._sync(quote, reduce_only, reason, mid, now)
+
+    def _direction_snapshot(self, snap: Any) -> Any:
+        """The snapshot used for direction choice; a stale one (funding refresh failing) keeps the direction."""
+        if snap is None or self.direction is None:
+            return snap
+        try:
+            age = float(snap.age)
+        except Exception:
+            return snap
+        if age <= self.funding_stale_s:
+            self._funding_stale_warned = False
+            return snap
+        if not self._funding_stale_warned:
+            self._funding_stale_warned = True
+            log.warning("%s: funding snapshot is %.0fs old (refresh failing?) -> keeping direction %s", self.symbol,
+                        age, self.direction)
+        return None
 
     # ------------------------------------------------------------------ phases
     def _freeze(self, mid: Decimal) -> None:
@@ -466,7 +545,10 @@ class PairTrader:
             return None, False, "stopped"
         if self.risk is not None and getattr(self.risk, "halted", False):
             return None, False, f"halted: {getattr(self.risk, 'halt_reason', None)}"
-        hb = self.hedger.quoting_blocked()
+        ok, why = private_stream_ok(self.maker)
+        if not ok:  # acks / fills of a resting quote would be invisible: pull it
+            return None, False, f"maker private stream down: {why}"
+        hb = self.hedger.quoting_blocked() or self._taker_budget_block()
         if hb:
             return None, False, hb
         if self.phase is Phase.HOLDING:
@@ -493,7 +575,9 @@ class PairTrader:
         size = round_pair_size(min(self.pair.cfg.order_notional / mid, abs(diff)), mm, tm)
         if size < min_sz:
             size = min_sz
-        reducing = mpos != 0 and _sign(mpos) == -side.sign
+        # an opposite position below the pair minimum is dust (same rule as _advance): quote the normal clip
+        # through zero instead of a reduce-only remainder that could never be placed
+        reducing = abs(mpos) >= min_sz and _sign(mpos) == -side.sign
         if reducing:
             size = min(size, round_pair_size(abs(mpos), mm, tm))
             if size < min_sz:
@@ -516,6 +600,9 @@ class PairTrader:
         else:
             if not self._venues_open():
                 return None, False, "market closed (trading hours)"
+            ok, why = private_stream_ok(self.taker)
+            if not ok:
+                return None, False, f"taker private stream down: {why}"
             if self.risk is not None:
                 ok, why = self.risk.check_open(self.symbol, q.size * q.price)
                 if not ok:
@@ -523,9 +610,41 @@ class PairTrader:
         return q, reducing, None
 
     # ------------------------------------------------------------------ order management
+    def _size_cap(self, q: Quote) -> Decimal:
+        """Largest resting size still useful: what remains to the goal (and, reduce-only, the position)."""
+        g = self.goal()
+        if g is None:
+            return q.size
+        mpos = self.hedger.maker_pos
+        need = abs(g - mpos)
+        if self._order is not None and self._order.reduce_only:
+            need = min(need, abs(mpos))
+        return max(q.size, round_pair_size(need, self.pair.maker_market, self.pair.taker_market))
+
     def _remaining(self, o: Order) -> Decimal:
         filled = max(o.filled, self._cid_fills.get(o.client_id, ZERO))
         return max(ZERO, o.size - filled)
+
+    def _taker_budget_block(self) -> str | None:
+        """Every maker fill needs a hedge tx on the taker venue: pause quoting (resting quote included) while its
+        request budget is nearly used up, instead of piling up deltas whose hedges wait for the budget."""
+        lim = float(self.scfg.min_taker_budget)
+        if lim <= 0:
+            return None
+        try:
+            h = float(self.taker.budget_health())
+        except Exception:
+            return None
+        if self._taker_budget_low:
+            if h >= min(1.0, 1.5 * lim):
+                self._taker_budget_low = False
+                log.info("%s: %s rate budget recovered (%.0f%%) -> quoting resumes", self.symbol, self.taker.name,
+                         100 * h)
+        elif h < lim:
+            self._taker_budget_low = True
+            log.warning("%s: %s rate budget low (%.0f%%) -> pausing quotes so hedges are not delayed", self.symbol,
+                        self.taker.name, 100 * h)
+        return f"{self.taker.name} rate budget low" if self._taker_budget_low else None
 
     def _budget_ok(self, now: float) -> bool:
         while self._actions and now - self._actions[0] >= 60.0:
@@ -583,10 +702,21 @@ class PairTrader:
             if now < self._backoff_until or o.price is None:
                 return
             remaining = self._remaining(o)
-            if remaining <= 0:
-                return  # fully filled; terminal update pending
+            if remaining <= 0:  # fully filled; terminal update pending
+                fs = self._full_since
+                if fs is None or fs[0] != o.client_id:
+                    self._full_since = (o.client_id, now)
+                elif now - fs[1] >= max(self.cancel_confirm_s, self.amend_ack_timeout_s):
+                    # the terminal frame was missed (stream gap): don't freeze the pair on a dead quote
+                    log.warning("%s quote %s fully filled but no terminal update after %.1fs -> dropping",
+                                self.symbol, o.client_id, now - fs[1])
+                    self._full_since = None
+                    self._drop(o)
+                return
             protective = quote_violates_edge(o.side, o.price, q.limit_price)
-            oversize = remaining > q.size
+            # size-only amends only when the quote overshoots what is still NEEDED (goal / reduce-only position),
+            # not whenever the mid-dependent clip size shrinks by a step
+            oversize = remaining > self._size_cap(q)
             ref = mid if mid is not None else o.price
             moved = price_moved_bps(o.price, q.price, ref)
             if protective or oversize:
@@ -594,15 +724,18 @@ class PairTrader:
                     if protective:
                         await self._cancel(o, "protective (requote budget exhausted)", now)
                     return
-                price = q.price if (protective or moved >= self.scfg.reprice_threshold_bps) else o.price
-                await self._amend(o, price, q.size, remaining, now, "protective")
+                if protective:
+                    await self._amend(o, q.price, q.size, remaining, now, "protective")
+                elif now - self._order_ts >= self._lifetime():
+                    price = q.price if moved >= self.scfg.reprice_threshold_bps else o.price
+                    await self._amend(o, price, q.size, remaining, now, "resize")
                 return
             if (moved >= self.scfg.reprice_threshold_bps and now - self._order_ts >= self._lifetime()
                     and self._budget_ok(now)):
                 await self._amend(o, q.price, q.size, remaining, now, "improve")
 
     async def _place(self, q: Quote, reduce_only: bool, now: float) -> None:
-        cid = new_client_id("fq")
+        cid = new_client_id(QUOTE_TAG)
         self._placing_cid = cid
         self._actions.append(now)
         self.stats["places"] += 1
@@ -667,6 +800,8 @@ class PairTrader:
         except Exception as exc:
             log.warning("%s modify raised %r", self.symbol, exc)
             self._backoff_until = now + 2 * self.loop_s
+            if kind == "protective":
+                await self._cancel(o, f"protective amend raised {exc!r}", now)
             return
         if res.ok:
             new = res.order
@@ -696,8 +831,23 @@ class PairTrader:
         if gone:
             self._drop(o)
             return
-        if "not open" in err.lower() or "not found" in err.lower():
+        code = err.upper().replace(" ", "_")  # match venue codes (ORDER_NOT_FOUND_FOR_MODIFY) and prose alike
+        if "NOT_FOUND" in code or "NOT_OPEN" in code or "SUPERSEDED_BY_CANCEL" in code:
+            if res.retryable and now - self._order_born < 1.0:  # maybe not sequenced yet: retry briefly
+                self._backoff_until = now + self.loop_s
+                return
             await self._cancel(o, f"vanished: {err}", now)
+            return
+        if kind == "protective":
+            # the resting price violates the edge limit NOW: retrying the modify (e.g. order pool exhausted)
+            # leaves it to be picked off -> pull it (cancels use their own, larger budget)
+            log.warning("%s protective amend failed (%s) -> cancel", self.symbol, err)
+            if not res.retryable and self.risk is not None:
+                try:
+                    self.risk.record_error(self.maker.name, err)
+                except Exception:
+                    pass
+            await self._cancel(o, f"protective amend failed: {err}", now)
             return
         if res.retryable:
             self._backoff_until = now + self.loop_s
@@ -742,11 +892,18 @@ class PairTrader:
                 continue
             if now - d.last_ts < self.cancel_confirm_s:
                 continue
-            if d.accepted:  # venue accepted the cancel but no terminal update arrived: assume gone
-                log.info("%s cancel of %s accepted but unconfirmed after %.1fs; assuming gone", self.symbol, cid,
-                         now - d.first_ts)
-                self._dying.pop(cid, None)
-                continue
+            if d.accepted:
+                live = (d.order.status in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
+                        or d.order.updated_ts > d.last_ts)
+                if not live:  # never acknowledged by the venue, cancel accepted, no news since: assume gone
+                    log.info("%s cancel of %s accepted but unconfirmed after %.1fs; assuming gone", self.symbol,
+                             cid, now - d.first_ts)
+                    self._dying.pop(cid, None)
+                    continue
+                # the venue reports the order live (or updated it) although the cancel was accepted: e.g. the
+                # cancel overtook its own not-yet-sequenced place -> cancel again (escalates to cancel_all)
+                log.info("%s cancel of %s accepted but the order is still %s after %.1fs -> cancel again",
+                         self.symbol, cid, d.order.status.value, now - d.first_ts)
             if d.attempts >= 3:
                 log.warning("%s cancel of %s failed %d times -> cancel_all(%s)", self.symbol, cid, d.attempts,
                             self.ms)

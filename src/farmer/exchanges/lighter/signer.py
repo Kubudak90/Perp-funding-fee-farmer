@@ -7,9 +7,10 @@ Rules enforced here (specs/lighter-trading.md §1, §4, §7, §11.1):
   would sign with whichever key was created last);
 - integers are range-checked before they cross the ctypes boundary (``c_int`` silently wraps);
 - one in-flight tx per API key (nonce lock); the tx hash is known at signing time;
-- outcome unknown (timeout / socket died) -> look the hash up, compare ``nextNonce``, re-send the IDENTICAL
-  signed payload when the nonce is still free (it cannot execute twice), otherwise raise ``TxUnknown``.
-  A tx is never re-signed with a new nonce while an earlier copy may still execute.
+- outcome unknown (timeout / socket died / ambiguous 29500-29501 answer / a non-deterministic rejection of a copy
+  sent after the socket died) -> look the hash up, compare ``nextNonce``, re-send the IDENTICAL signed payload when
+  the nonce is still free (it cannot execute twice), otherwise raise ``TxUnknown``. ``TxRejected`` is reserved for
+  answers proving the tx did not run. A tx is never re-signed with a new nonce while an earlier copy may still execute.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from typing import Any, Callable, Protocol
 
 from farmer.exchanges.base import ExchangeError
 from farmer.exchanges.lighter.helpers import (
+    DETERMINISTIC_TX_CODES,
     ERR_INVALID_NONCE,
     MAX_BASE_AMOUNT,
     MAX_CLIENT_ORDER_INDEX,
@@ -31,6 +33,8 @@ from farmer.exchanges.lighter.helpers import (
     TxNotSent,
     TxRejected,
     TxUnknown,
+    is_ambiguous_tx_code,
+    is_retryable,
     parse_ack,
 )
 
@@ -243,6 +247,7 @@ class TxExecutor:
         self.lookup_interval_s = lookup_interval_s
         self.log = logging.getLogger(name)
         self.next_nonce: int | None = None
+        self._resync = False
         self._lock = asyncio.Lock()
         self.stats = {"sent": 0, "accepted": 0, "rejected": 0, "unknown": 0, "resent": 0, "nonce_resync": 0}
 
@@ -253,6 +258,11 @@ class TxExecutor:
     def invalidate_nonce(self) -> None:
         self.next_nonce = None
 
+    def request_resync(self) -> None:
+        """Re-read ``nextNonce`` before the next tx (e.g. one of our txs failed in the sequencer: status 0 does
+        not consume its nonce). A flag, not ``next_nonce = None``: a concurrent ``_accepted`` would overwrite it."""
+        self._resync = True
+
     async def sync_nonce(self) -> int:
         n = int(await self.t.fetch_next_nonce())
         self.stats["nonce_resync"] += 1
@@ -262,10 +272,12 @@ class TxExecutor:
     async def submit(self, build: Callable[[int], SignedTx]) -> TxReceipt:
         """Sign with the next nonce and send. Raises TxRejected (nonce not consumed), TxUnknown or SignError."""
         async with self._lock:
-            if self.next_nonce is None:
+            if self.next_nonce is None or self._resync:
+                self._resync = False
                 try:
                     await self.sync_nonce()
                 except Exception as exc:
+                    self.next_nonce = None
                     raise TxRejected(-1, f"nextNonce unavailable: {exc}", retryable=True) from exc
             resynced = False
             sent_any = False
@@ -283,7 +295,10 @@ class TxExecutor:
                         ok, code, msg = parse_ack(ack)
                         if ok:
                             return self._accepted(tx, via, ack)
-                        if code == ERR_INVALID_NONCE and maybe_dup:
+                        if is_ambiguous_tx_code(code):
+                            # internal error / process timeout: does NOT prove the tx was dropped (spec §12)
+                            self.log.warning("lighter sendTx %s answered %s (%s): outcome unknown", tx.label, code, msg)
+                        elif maybe_dup and code not in DETERMINISTIC_TX_CODES:
                             pass  # an earlier copy may have landed: resolve below, never re-sign
                         elif code == ERR_INVALID_NONCE and not resynced:
                             resynced = True
@@ -297,7 +312,10 @@ class TxExecutor:
                         else:
                             self.stats["rejected"] += 1
                             if code == ERR_INVALID_NONCE:
+                                # still invalid after a resync: nextNonce lags while an earlier tx sits in the
+                                # speed bump (spec §7.4) -> transient; resync again on the next attempt
                                 self.next_nonce = None
+                                raise TxRejected(code, msg, retryable=True)
                             raise TxRejected(code, msg)
                     return await self._resolve_unknown(tx)
             except (TxRejected, TxUnknown):
@@ -397,6 +415,11 @@ class TxExecutor:
             self.next_nonce = None
             self.stats["unknown"] += 1
             raise TxUnknown(tx.tx_hash, "invalid nonce on identical resend")
+        if is_ambiguous_tx_code(code) or is_retryable(code):
+            # a transient / ambiguous answer to the resend says nothing about the first copy (still unresolved)
+            self.next_nonce = None
+            self.stats["unknown"] += 1
+            raise TxUnknown(tx.tx_hash, f"identical resend answered {code} ({msg})")
         self.stats["rejected"] += 1
         raise TxRejected(code, msg)
 

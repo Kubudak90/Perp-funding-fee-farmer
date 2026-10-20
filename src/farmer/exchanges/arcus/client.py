@@ -48,6 +48,7 @@ from farmer.exchanges.arcus.parse import (
     funding_info,
     funding_payment_from_row,
     is_market_open,
+    map_order_status,
     order_from_row,
     parse_market,
     position_from_row,
@@ -65,6 +66,7 @@ from farmer.exchanges.base import AuthRequired, Exchange, ExchangeError
 from farmer.models import (
     ZERO,
     Balance,
+    Fill,
     FundingInfo,
     FundingPayment,
     MarketInfo,
@@ -99,6 +101,12 @@ class _OrderRec:
     last_action_error: str | None = None
     terminal_mono: float | None = None
     foreign: bool = False
+    # a cancel was accepted for this order; if the venue later reports it live anyway (the cancel
+    # overtook its own unsequenced place -> ORDER_NOT_FOUND), it is re-sent (bounded, then cancelAll)
+    cancel_requested_mono: float | None = None
+    cancel_attempts: int = 0
+    cancel_followup: bool = False
+    verifying: bool = False  # a REST /v1/order/{id} check is running
 
 
 class ArcusExchange(Exchange):
@@ -137,6 +145,12 @@ class ArcusExchange(Exchange):
         self.min_modify_gtt_lead_days = float(cfg.min_modify_gtt_lead_days)
         self.private_ready_timeout_s = float(cfg.private_ready_timeout_s)
         self.fills_snapshot_n = int(cfg.fills_snapshot_n)
+        # private stream counts as dead after this long without any frame (JSON pong every <= 10 s)
+        self.private_stale_s = float(cfg.private_stale_s)
+        # RWA: stop reporting market_open this long before the regular-trading-hours close
+        self.rwa_close_buffer_s = float(cfg.rwa_close_buffer_s)
+        self.cancel_recheck_s = 0.5  # a live frame this long after an accepted cancel -> re-send it
+        self.max_cancel_attempts = 3
 
         # goodTilTime must be >= ~1 month ahead, also when echoed on modify -> never below 35 days
         self.good_til_days = max(35, int(cfg.good_til_days))
@@ -149,6 +163,7 @@ class ArcusExchange(Exchange):
         self._md: ArcusWsConnection | None = None
         self._acct: ArcusWsConnection | None = None
         self._tasks: list[asyncio.Task] = []
+        self._bg_tasks: set[asyncio.Future] = set()  # one-shot helpers (order checks, cancel follow-ups)
         self._connected = False
         self._closing = False
         self._session_start_us = 0
@@ -170,6 +185,11 @@ class ArcusExchange(Exchange):
         self._resync_mono: dict[str, float] = {}
         self._resync_deferred: set[str] = set()
         self._bbo_ahead_since: dict[str, float] = {}
+        self._bbo_pending: dict[str, dict] = {}  # sym -> latest bbo frame the book could not use yet
+        self._bbo_keys: dict[str, SubKey] = {}
+        self._bbo_repolled: set[str] = set()  # unconfirmed top already re-checked with a fresh bbo snapshot
+        self._attrs_synced = False  # marketAttributes snapshot received on the current md socket
+        self._attrs: dict[str, dict] = {}  # sym -> latest marketAttributes entry (complete block)
         self._marks: dict[str, tuple[Decimal | None, Decimal | None, float]] = {}  # sym -> (oracle, mark, ts)
         self.predicted_funding: dict[str, tuple[Decimal, float]] = {}  # sym -> (rate1h, ts_s)
 
@@ -187,6 +207,8 @@ class ArcusExchange(Exchange):
         self._pool_remaining: dict[str, int] = {}
         self._rate_limit: dict | None = None
         self._dms_last_ok: float | None = None
+        self._dms_lock = asyncio.Lock()
+        self._writes_inflight = 0  # order POSTs (place/modify) in flight: keep the DMS armed
 
     # ================================================================== lifecycle
     @property
@@ -212,6 +234,8 @@ class ArcusExchange(Exchange):
         self._md = self._make_ws("md", self._on_md_message, on_disconnect=self._on_md_disconnect,
                                  ping_interval_s=self.ws_ping_interval_s)
         await self._md.subscribe({"channel": "oraclePrices"})
+        # RWA regime (isOutsideRth, bands, off-hours IM): pushed on every exitRth/enterRth crossing
+        await self._md.subscribe({"channel": "marketAttributes"})
         self._md.start()
         if not await self._md.wait_connected(self.private_ready_timeout_s):
             self.log.warning("arcus market-data socket not connected yet (it keeps retrying in the background)")
@@ -258,7 +282,8 @@ class ArcusExchange(Exchange):
         if self._closing and not self._tasks and not self._connected:
             return
         self._closing = True
-        tasks, self._tasks = self._tasks, []
+        tasks, self._tasks = self._tasks + list(self._bg_tasks), []
+        self._bg_tasks.clear()
         for t in tasks:
             t.cancel()
         for t in tasks:
@@ -279,6 +304,10 @@ class ArcusExchange(Exchange):
         # books belong to the closed socket; a later connect() starts clean (call subscribe_books again)
         self._books.clear()
         self._book_keys.clear()
+        self._bbo_keys.clear()
+        self._bbo_pending.clear()
+        self._bbo_repolled.clear()
+        self._attrs_synced = False
         self._book_wait_since.clear()
         self._resync_deferred.clear()
         self._orders_synced.clear()
@@ -417,16 +446,79 @@ class ArcusExchange(Exchange):
                 self._by_id[mid] = sym
                 self._by_ticker[str(row.get("marketDisplayName"))] = sym
                 self._market_rows[sym] = row
+                attrs = self._attrs.get(sym)
+                if attrs is not None and self._attrs_synced and self.markets[sym].market_id == mid \
+                        and attrs.get("marketDisplayName") == row.get("marketDisplayName"):
+                    # the pushed RTH state is never older than a (possibly cached) REST read
+                    self._apply_attrs(self.markets[sym], attrs)
             except Exception as exc:
                 self.log.warning("arcus: skipping bad market row %s: %r", row.get("marketDisplayName"), exc)
         self._markets_ts = time.time()
 
+    @staticmethod
+    def _apply_attrs(m: MarketInfo, e: dict) -> None:
+        """Overlay one ``marketAttributes`` block (RTH flag, bands, off-hours IM) onto ``m.extra`` in place."""
+        ext = m.extra
+        if "isOutsideRth" in e:
+            ext["is_outside_rth"] = e.get("isOutsideRth")
+        if "offHoursInitialMarginFraction" in e:
+            ext["off_hours_imf"] = dec(e.get("offHoursInitialMarginFraction"))
+        bounds = dict(ext.get("trading_bounds") or {})
+        for k in ("upperTradingBound", "lowerTradingBound", "currentSettlementPrice"):
+            if k in e:
+                bounds[k] = e.get(k)
+        ext["trading_bounds"] = bounds
+        if e.get("boundEvent"):
+            ext["bound_event"] = e.get("boundEvent")
+
+    def _on_market_attrs(self, c: dict) -> None:
+        for e in c.get("entries") or []:
+            if not isinstance(e, dict) or e.get("type") == "feeTierConfig":
+                continue
+            sym = self._by_ticker.get(str(e.get("marketDisplayName"))) or self._symbol_of(e)
+            m = self.markets.get(sym) if sym else None
+            if m is None or m.venue_symbol != e.get("marketDisplayName"):
+                continue  # unknown, or the other (e.g. OFFLINE) market sharing this base asset
+            prev = m.extra.get("is_outside_rth")
+            self._attrs[sym] = e
+            self._apply_attrs(m, e)
+            if e.get("boundEvent") in ("exitRth", "enterRth") or (prev is not None and prev != e.get("isOutsideRth")):
+                self.log.info("arcus %s: %s (isOutsideRth=%s)", sym, e.get("boundEvent") or "RTH change",
+                              e.get("isOutsideRth"))
+        if c.get("isSnapshot"):
+            self._attrs_synced = True
+
     def market_open(self, symbol: str) -> bool:
-        return is_market_open(self.markets.get(symbol))
+        return is_market_open(self.markets.get(symbol), close_buffer_s=self.rwa_close_buffer_s)
+
+    def private_ok(self) -> tuple[bool, str]:
+        """Is the private stream (the only source of acks, fills and rejections) connected and synced?"""
+        acct = self._acct
+        if acct is None:
+            return False, "arcus private stream not started"
+        if not acct.is_healthy(self.private_stale_s):
+            return False, "arcus private stream down/stale"
+        if not (self._orders_synced.is_set() and self._fills_synced.is_set()):
+            return False, "arcus private stream not synced (orders/userFills snapshot pending)"
+        if any(k[0] in ("orders", "userFills") for k in getattr(acct, "degraded", {})):
+            return False, "arcus private stream degraded (server-side snapshot pending)"
+        return True, ""
+
+    def _dms_armed(self) -> bool:
+        dms = float(self.cfg.dead_mans_switch_s or 0)
+        if dms <= 0:
+            return True
+        return self._dms_last_ok is not None and time.monotonic() - self._dms_last_ok <= dms * 2.0 / 3.0
 
     def can_increase_exposure(self) -> tuple[bool, str]:
         if self.access_error:
             return False, self.access_error
+        if self.has_credentials:
+            ok, why = self.private_ok()
+            if not ok:
+                return False, why
+            if not self._dms_armed() and self._live_recs(include_foreign=True):
+                return False, "arcus dead man's switch is not armed while orders rest"
         return True, ""
 
     def symbol_for_ticker(self, ticker: str) -> str | None:
@@ -479,10 +571,10 @@ class ArcusExchange(Exchange):
             self._book_wait_since[sym] = time.monotonic()
             self._book_keys[sym] = await self._md.subscribe(
                 {"channel": "l2OrderbookUpdates", "id": ticker, "nLevels": self.book_seed_levels})
-            await self._md.subscribe({"channel": "bbo", "id": ticker})
+            self._bbo_keys[sym] = await self._md.subscribe({"channel": "bbo", "id": ticker})
             if self.subscribe_predicted_funding:
                 await self._md.subscribe({"channel": "predictedFunding", "id": ticker})
-        n_subs = 1 + len(self._books) * (3 if self.subscribe_predicted_funding else 2)
+        n_subs = 2 + len(self._books) * (3 if self.subscribe_predicted_funding else 2)
         if n_subs > 100:
             self.log.warning("arcus md socket has %d subscriptions (server cap 100/connection)", n_subs)
 
@@ -510,6 +602,8 @@ class ArcusExchange(Exchange):
             self._on_oracle(c)
         elif ch == "predictedFunding":
             self._on_predicted(str(msg.get("id")), c)
+        elif ch == "marketAttributes":
+            self._on_market_attrs(dict(c, isSnapshot=True) if t == "subscribed" else c)
 
     def _on_l2(self, ticker: str, snapshot: bool, c: dict) -> None:
         sym = self._by_ticker.get(ticker)
@@ -525,16 +619,40 @@ class ArcusExchange(Exchange):
             self._book_wait_since.pop(sym, None)
             self._resync_deferred.discard(sym)
             self._bbo_ahead_since.pop(sym, None)
+            self._bbo_repolled.discard(sym)
             if book.is_crossed():
                 self._request_resync(sym, "crossed snapshot")
                 return
+            self._apply_pending_bbo(sym, book)
             self._publish(book, now)
             return
         res = book.apply_delta(c, now=now)
         if res is DeltaResult.APPLIED:
+            if self._apply_pending_bbo(sym, book) is False:
+                self._request_resync(sym, f"bbo disagrees with confirmed levels at seq {book.seq}")
+                return
             self._publish(book, now)
         elif res in (DeltaResult.GAP, DeltaResult.CROSSED):
             self._request_resync(sym, f"{res.value} at seq {c.get('lastSequenceId')} (book seq {book.seq})")
+
+    def _apply_pending_bbo(self, sym: str, book: L2Book) -> bool | None:
+        """Use the latest bbo frame that arrived before the book could check it (book behind it, or no
+        delta applied yet) once the book has caught up with its sequence."""
+        c = self._bbo_pending.get(sym)
+        if c is None or book.seq is None:
+            return None
+        raw = c.get("lastSequenceId")
+        if raw is not None and int(raw) > book.seq:
+            return None  # the book has not reached it yet: keep it
+        self._bbo_pending.pop(sym, None)
+        if raw is None:
+            return None
+        repairs = book.repairs
+        res = book.prune_with_bbo(c)
+        if res and book.repairs != repairs:
+            self.log.debug("arcus %s: repaired %d stale snapshot level(s) from a buffered bbo", sym,
+                           book.repairs - repairs)
+        return res
 
     def _publish(self, book: L2Book, now: float) -> None:
         ob = book.to_order_book(self.book_depth, ts=now)
@@ -564,8 +682,17 @@ class ArcusExchange(Exchange):
         self._resync_mono[sym] = mono
         self._book_wait_since[sym] = mono
         book.resyncs += 1
-        fut = asyncio.ensure_future(self._md.resubscribe(key))
+        keys = [key]
+        bbo_key = self._bbo_keys.get(sym)
+        if bbo_key is not None:  # a fresh bbo snapshot (taken after the new l2 one) checks the loss window
+            keys.append(bbo_key)
+        fut = asyncio.ensure_future(self._resubscribe(keys))
         fut.add_done_callback(_log_future_error(self.log, f"resubscribe {sym}"))
+
+    async def _resubscribe(self, keys: list[SubKey]) -> None:
+        for key in keys:
+            if self._md is not None:
+                await self._md.resubscribe(key)
 
     def _on_bbo(self, ticker: str, c: dict) -> None:
         sym = self._by_ticker.get(ticker)
@@ -573,23 +700,31 @@ class ArcusExchange(Exchange):
         if book is None:
             return
         now = time.time()
+        raw = c.get("lastSequenceId")
         if book.synced:
             repairs = book.repairs
             chk = book.reconcile_bbo(c)  # same-sequence bbo is authoritative for the top of book
+            if chk is None and raw is not None and book.seq is not None:
+                if int(raw) > book.seq:  # book behind: check it once the book got there
+                    self._bbo_pending[sym] = c
+                    if book.applying:
+                        since = self._bbo_ahead_since.setdefault(sym, now)
+                        if now - since > 2.0:
+                            self._request_resync(sym, "book lags bbo for > 2s")
+                    return
+                # an older bbo from past the loss window still exposes stale snapshot levels better than it
+                chk = book.prune_with_bbo(c)
             if chk is False:
-                self._request_resync(sym, f"bbo disagrees with confirmed levels at seq {c.get('lastSequenceId')}")
-            elif chk is None and book.applying and c.get("lastSequenceId") is not None and book.seq is not None \
-                    and int(c["lastSequenceId"]) > book.seq:
-                since = self._bbo_ahead_since.setdefault(sym, now)
-                if now - since > 2.0:
-                    self._request_resync(sym, "book lags bbo for > 2s")
-            else:
-                self._bbo_ahead_since.pop(sym, None)
-                if chk is True and book.repairs != repairs:
-                    self.log.debug("arcus %s: repaired %d stale snapshot level(s) from bbo", sym,
-                                   book.repairs - repairs)
-                    self._publish(book, now)
+                self._request_resync(sym, f"bbo disagrees with confirmed levels at seq {raw}")
+                return
+            self._bbo_ahead_since.pop(sym, None)
+            if book.repairs != repairs:
+                self.log.debug("arcus %s: repaired %d stale snapshot level(s) from bbo", sym,
+                               book.repairs - repairs)
+                self._publish(book, now)
             return
+        if raw is not None:
+            self._bbo_pending[sym] = c  # may be newer than the snapshot that is on its way
         if self.bbo_fallback and c.get("bestBid") and c.get("bestAsk"):
             ob = bbo_to_order_book(sym, c, venue=self.name, ts=now)
             if ob.best_bid is not None and ob.best_ask is not None and ob.best_bid < ob.best_ask:
@@ -619,6 +754,9 @@ class ArcusExchange(Exchange):
             book.reset()
             self._book_wait_since[sym] = time.monotonic()
         self._bbo_ahead_since.clear()
+        self._bbo_pending.clear()
+        self._bbo_repolled.clear()
+        self._attrs_synced = False  # REST is the RTH source again until the next snapshot
 
     async def _book_monitor(self) -> None:
         """Heartbeat quiet-but-healthy books (fresh ts) and resubscribe books stuck without a snapshot."""
@@ -628,6 +766,14 @@ class ArcusExchange(Exchange):
         hb = self.book_heartbeat_s
         for sym, book in self._books.items():
             if book.synced:
+                if (book.applying and sym not in self._bbo_repolled and book.top_unconfirmed()
+                        and book.snapshot_ts is not None and now - book.snapshot_ts > 2.0
+                        and self._bbo_keys.get(sym) is not None and self._md.connected):
+                    # quiet market: the top is still a snapshot-only level that may have changed inside the
+                    # loss window -> one fresh bbo snapshot (now past the window) confirms or prunes it
+                    self._bbo_repolled.add(sym)
+                    fut = asyncio.ensure_future(self._resubscribe([self._bbo_keys[sym]]))
+                    fut.add_done_callback(_log_future_error(self.log, f"bbo re-poll {sym}"))
                 last = self._book_emit_mono.get(sym, 0.0)
                 if hb > 0 and mono - last >= hb and self._md.is_healthy(max(2.0, 2 * hb + 1)):
                     ob = self._book_out.get(sym)
@@ -779,9 +925,101 @@ class ArcusExchange(Exchange):
     def _on_orders_snapshot(self, c: dict) -> None:
         rows = list(c.get("openOrders") or []) + list(c.get("recentClosedOrders") or [])
         rows.sort(key=lambda r: int(r.get("sequenceNumber") or 0))
+        oids: set[str] = set()
+        cids: set[str] = set()
         for r in rows:
+            if r.get("orderId"):
+                oids.add(str(r["orderId"]))
+            if r.get("clientId"):
+                cids.add(str(r["clientId"]))
             self._on_order_frame(r, from_snapshot=True)
         self._orders_synced.set()
+        # Local live orders absent from the snapshot (openOrders + only the last nRecentClosed closed ones)
+        # may have closed while the stream was down: verify them over REST instead of trusting them forever.
+        raw = c.get("lastSequenceId")
+        snap_seq = int(raw) if raw is not None else None
+        with_id: list[_OrderRec] = []
+        without_id: list[_OrderRec] = []
+        for rec in self._live_recs(include_foreign=True):
+            o = rec.order
+            if (o.order_id and o.order_id in oids) or (o.client_id and o.client_id in cids):
+                continue
+            if o.order_id:
+                if rec.last_seq is not None and snap_seq is not None and rec.last_seq >= snap_seq:
+                    continue  # we already know a state at least as new as the snapshot
+                with_id.append(rec)
+            elif o.status is OrderStatus.UNKNOWN:
+                without_id.append(rec)
+        if (with_id or without_id) and self.address:
+            self.log.info("arcus: %d local live order(s) missing from the orders snapshot -> verifying",
+                          len(with_id) + len(without_id))
+            self._background(self._resolve_missing(with_id, without_id), "resolve missing orders")
+
+    def _background(self, coro: Awaitable, what: str) -> None:
+        fut = asyncio.ensure_future(coro)
+        self._bg_tasks.add(fut)
+        fut.add_done_callback(self._bg_tasks.discard)
+        fut.add_done_callback(_log_future_error(self.log, what))
+
+    def _mark_gone(self, rec: _OrderRec, reason: str) -> None:
+        o = rec.order
+        o.status = OrderStatus.CANCELED
+        o.error = reason
+        o.updated_ts = time.time()
+        rec.terminal_mono = time.monotonic()
+        rec.cancel_requested_mono = None
+        rec.acked.set()
+        if rec.modify_fut is not None and not rec.modify_fut.done():
+            rec.modify_fut.set_result(("update", o.status))
+        self._emit_order(o)
+
+    async def _verify_rec(self, rec: _OrderRec, why: str) -> None:
+        """Ask ``GET /v1/order/{id}`` for the truth about one order and apply it (404 + once sequenced = gone)."""
+        oid = rec.order.order_id
+        if rec.verifying or not oid or not self.address or rec.order.status.is_terminal:
+            return
+        rec.verifying = True
+        try:
+            row = await self.rest.order(self.address, self.account_index, oid)
+        except ArcusHTTPError as exc:
+            if exc.status == 404 and rec.last_seq is not None and not rec.order.status.is_terminal:
+                self.log.warning("arcus order %s (%s) unknown to the venue -> marking it gone", oid, why)
+                self._mark_gone(rec, f"missing after resync ({why})")
+            else:
+                self.log.warning("arcus order %s check (%s) failed: %s", oid, why, exc)
+            return
+        except Exception as exc:
+            self.log.warning("arcus order %s check (%s) failed: %r", oid, why, exc)
+            return
+        finally:
+            rec.verifying = False
+        if not isinstance(row, dict) or not row.get("orderId"):
+            return
+        # a terminal REST state is final even if its sequenceNumber is not newer than what we saw
+        force = map_order_status(row, rec.tif)[0].is_terminal and classify_order_frame(row) == "update"
+        self._on_order_frame(row, from_snapshot=True, force=force)
+        if rec.order.status.is_terminal:
+            self.log.info("arcus order %s (%s): venue says %s", oid, why, rec.order.status.value)
+
+    async def _resolve_missing(self, with_id: list[_OrderRec], without_id: list[_OrderRec]) -> None:
+        for rec in with_id:
+            await self._verify_rec(rec, "missing from the orders snapshot")
+        if not without_id:
+            return
+        try:  # unknown-outcome places (no orderId): resting ones are listed by clientId
+            rows = await self.rest.open_orders(self.address or "", self.account_index)
+        except Exception as exc:
+            self.log.warning("arcus openOrders check after resync failed: %r", exc)
+            return
+        listed = {str(r["clientId"]): r for r in rows if r.get("clientId")}
+        for rec in without_id:
+            if rec.order.status.is_terminal or rec.order.order_id:
+                continue
+            row = listed.get(rec.order.client_id)
+            if row is not None:
+                self._on_order_frame(row)
+            else:
+                self._mark_gone(rec, "unknown-outcome order not resting after resync")
 
     def _find_rec(self, oid: Any, cid: Any) -> _OrderRec | None:
         rec = self._recs_by_oid.get(str(oid)) if oid else None
@@ -815,7 +1053,7 @@ class ArcusExchange(Exchange):
         self._index(rec)
         return rec
 
-    def _on_order_frame(self, c: dict, *, from_snapshot: bool = False) -> None:
+    def _on_order_frame(self, c: dict, *, from_snapshot: bool = False, force: bool = False) -> None:
         oid, cid = c.get("orderId"), c.get("clientId")
         rec = self._find_rec(oid, cid)
         kind = classify_order_frame(c, in_modify=bool(rec and rec.in_modify))
@@ -842,7 +1080,7 @@ class ArcusExchange(Exchange):
             elif not from_snapshot:
                 self._emit_order(rec.order)
             return
-        if seq is not None and rec.last_seq is not None and seq <= rec.last_seq:
+        if seq is not None and rec.last_seq is not None and seq <= rec.last_seq and not force:
             return  # stale / replayed
         if kind == "modify_leg":
             rec.in_modify = True
@@ -863,12 +1101,20 @@ class ArcusExchange(Exchange):
                 pass
         if "reduceOnly" in c:
             rec.reduce_only = bool(c["reduceOnly"])
-        rec.last_seq = seq if seq is not None else rec.last_seq
+        if seq is not None and (rec.last_seq is None or seq > rec.last_seq):
+            rec.last_seq = seq
         self._index(rec)
         if not rec.order.status.is_terminal:
             rec.terminal_mono = None
-        elif rec.terminal_mono is None:
-            rec.terminal_mono = time.monotonic()
+            if rec.cancel_requested_mono is not None and rec.order.order_id and not rec.cancel_followup:
+                # live after an accepted cancel: the cancel may have overtaken its own unsequenced place
+                # (ORDER_NOT_FOUND) -> make sure it really goes
+                rec.cancel_followup = True
+                self._background(self._cancel_followup(rec), "cancel follow-up")
+        else:
+            rec.cancel_requested_mono = None
+            if rec.terminal_mono is None:
+                rec.terminal_mono = time.monotonic()
         fut = rec.modify_fut
         if fut is not None and not fut.done():
             tgt = rec.modify_target
@@ -896,8 +1142,11 @@ class ArcusExchange(Exchange):
         if fill.size <= 0:
             return
         if snapshot:
+            # Missed while the private socket was down. Positions may already have been re-read from REST
+            # (hedger reconcile) and include it, so it is flagged: consumers must not apply it blindly.
             self.log.warning("arcus: recovered fill missed during reconnect: %s %s %s @ %s", sym, fill.side.value,
                              fill.size, fill.price)
+            fill = _mark_recovered(fill)
         self._emit_fill(fill)
 
     def _live_recs(self, *, include_foreign: bool = False) -> list[_OrderRec]:
@@ -916,6 +1165,12 @@ class ArcusExchange(Exchange):
         for d in (self._recs_by_cid, self._recs_by_oid):
             for k in [k for k, r in d.items() if r.terminal_mono is not None and r.terminal_mono < cutoff]:
                 del d[k]
+        # unknown-outcome places that never showed up: resolve them (they would keep the DMS armed forever)
+        old = time.time() - 60.0
+        stuck = [r for r in self._live_recs(include_foreign=True)
+                 if r.order.status is OrderStatus.UNKNOWN and not r.order.order_id and r.order.created_ts < old]
+        if stuck and self.address and self.private_ok()[0]:
+            await self._resolve_missing([], stuck)
 
     # ================================================================== trading helpers
     def _require_trading(self) -> ArcusSigner:
@@ -1074,6 +1329,9 @@ class ArcusExchange(Exchange):
         err = self._validate(m, size, price, reduce_only=reduce_only)
         if err:
             return OrderResult(ok=False, error=err)
+        ok, why = self.private_ok()
+        if not ok:  # a resting quote whose acks/fills we cannot see: refuse (IOC hedges stay allowed)
+            return OrderResult(ok=False, retryable=True, error=why)
         return await self._submit(m, side, size, price, tif="ALO" if post_only else "GTT", order_type="LIMIT",
                                   reduce_only=reduce_only, client_id=client_id, wait_for_budget=False)
 
@@ -1123,6 +1381,9 @@ class ArcusExchange(Exchange):
         order = Order(venue=self.name, symbol=m.symbol, side=side, price=price, size=size, client_id=cid,
                       status=OrderStatus.PENDING, post_only=tif == "ALO", reduce_only=reduce_only,
                       ioc=tif in ("IOC", "FOK"))
+        resting = tif not in ("IOC", "FOK")
+        if resting:
+            await self._ensure_dms_armed()  # a resting order must never sit without the dead man's switch
         rec = _OrderRec(order=order, market_id=m.market_id, tif=tif, reduce_only=reduce_only, gtt_us=gtt_us)
         self._recs_by_cid[cid] = rec
         deadline = time.monotonic() + float(self.cfg.ack_timeout_s)
@@ -1132,19 +1393,22 @@ class ArcusExchange(Exchange):
                                 price=price, size=size, tif=tif, gtt_us=gtt_us, order_type=order_type,
                                 reduce_only=reduce_only, client_id=cid)
 
+        self._writes_inflight += 1
         try:
             status, data = await self._post_signed("/v1/placeOrder", build, pool="order")
         except ValueError as exc:  # local encoding validation
             self._forget(rec)
             return OrderResult(ok=False, error=f"arcus: {exc}")
         except ArcusHTTPError as exc:
-            if exc.status == 500 or exc.status == 504:  # outcome unknown
+            if _outcome_unknown(exc):  # 500/504, or a 5xx without the gateway's "not submitted" marker
                 return await self._place_unknown(rec, exc, deadline)
             self._forget(rec)
             self.log.warning("arcus place %s %s %s@%s failed: %s", cid, side.value, size, price, exc)
             return self._http_failure(rec, exc)
         except TRANSPORT_ERRORS as exc:
             return await self._place_unknown(rec, exc, deadline)
+        finally:
+            self._writes_inflight -= 1
         self._apply_write_response(rec, data, status)
         await self._await_ack(rec, deadline)
         return self._result(rec)
@@ -1181,7 +1445,7 @@ class ArcusExchange(Exchange):
                 pool="cancel")
         except ArcusHTTPError as exc:
             if exc.rejection_reason == "ORDER_NOT_FOUND" or "not found" in (exc.error or "").lower():
-                return True
+                return self._cancel_not_found(rec, exc.rejection_reason or "ORDER_NOT_FOUND")
             self.log.warning("arcus cancel %s failed: %s", oid or cid, exc)
             return False
         except ValueError as exc:
@@ -1193,7 +1457,47 @@ class ArcusExchange(Exchange):
         if isinstance(data, dict) and data.get("orderId") and rec is not None and not rec.order.order_id:
             rec.order.order_id = str(data["orderId"])
             self._index(rec)
+        if isinstance(data, dict) and str(data.get("status") or "").upper() == "REJECTED":
+            return self._cancel_not_found(rec, str(data.get("rejectionReason") or data.get("error") or "REJECTED"))
+        if rec is not None:
+            rec.cancel_requested_mono = time.monotonic()
+            rec.cancel_attempts += 1
         return True
+
+    def _cancel_not_found(self, rec: _OrderRec | None, reason: str) -> bool:
+        """The venue rejected a cancel (normally ORDER_NOT_FOUND). Fine if the order is gone; if we still
+        believe it is live, report failure: the cancel may have overtaken its own unsequenced place."""
+        if rec is None or rec.order.status.is_terminal:
+            return True
+        rec.cancel_requested_mono = time.monotonic()  # a later live frame triggers a follow-up cancel
+        rec.cancel_attempts += 1
+        self.log.info("arcus cancel of %s rejected (%s) while it is %s locally", rec.order.order_id or
+                      rec.order.client_id, reason, rec.order.status.value)
+        if rec.order.order_id and rec.last_seq is not None:
+            self._background(self._verify_rec(rec, f"cancel {reason}"), "order check")
+        return False
+
+    async def _cancel_followup(self, rec: _OrderRec) -> None:
+        try:
+            t0 = rec.cancel_requested_mono
+            if t0 is None:
+                return
+            wait = t0 + self.cancel_recheck_s - time.monotonic()
+            if wait > 0:  # frames right after the cancel may predate it (e.g. a partial fill)
+                await asyncio.sleep(wait)
+            if rec.order.status.is_terminal or rec.cancel_requested_mono is None or self._closing:
+                return
+            sym, oid = rec.order.symbol, rec.order.order_id
+            if rec.cancel_attempts >= self.max_cancel_attempts:
+                self.log.warning("arcus order %s still live after %d cancels -> cancelAllOrders(%s)", oid,
+                                 rec.cancel_attempts, sym)
+                rec.cancel_requested_mono = None
+                await self.cancel_all(sym)
+                return
+            self.log.warning("arcus order %s is live after an accepted cancel -> re-sending the cancel", oid)
+            await self.cancel_order(sym, order_id=oid)
+        finally:
+            rec.cancel_followup = False
 
     async def cancel_all(self, symbol: str | None = None) -> None:
         signer = self._require_trading()
@@ -1256,9 +1560,11 @@ class ArcusExchange(Exchange):
         rec.modify_fut = fut
         rec.modify_target = (price, total)
         oid = rec.order.order_id
+        in_modify = rec.in_modify
+        self._writes_inflight += 1
         try:
             try:
-                status, data = await self._post_signed(
+                _, data = await self._post_signed(
                     "/v1/modifyOrder",
                     lambda: signer.modify(market_id=m.market_id, tick_size=m.tick_size, step_size=m.step_size,
                                           side=rec.order.side, price=price, size=total, tif=rec.tif,
@@ -1266,16 +1572,23 @@ class ArcusExchange(Exchange):
                                           order_id=oid),
                     query_address=False, pool="order")
             except ArcusHTTPError as exc:
-                r = self._http_failure(None, exc)
-                return dataclasses.replace(r, order=rec.order)
+                if not _outcome_unknown(exc):
+                    r = self._http_failure(None, exc)
+                    return dataclasses.replace(r, order=rec.order)
+                # the modify may have been applied: wait for the stream like after a 202
+                self.log.warning("arcus modify %s outcome unknown: %s", oid, exc)
+                data = None
             except ValueError as exc:
                 return OrderResult(ok=False, order=rec.order, error=f"arcus: {exc}")
             except TRANSPORT_ERRORS as exc:
                 return OrderResult(ok=False, order=rec.order, retryable=True, error=f"transport error: {exc!r}")
+            finally:
+                self._writes_inflight -= 1
             if isinstance(data, dict) and str(data.get("status") or "").upper() == "REJECTED" and not fut.done():
                 reason = data.get("rejectionReason") or data.get("error") or "REJECTED"
-                return OrderResult(ok=False, order=rec.order, error=str(reason), would_cross=reason == WOULD_CROSS,
-                                   retryable=reason == "ORDER_NOT_FOUND_FOR_MODIFY")
+                if reason == "ORDER_NOT_FOUND_FOR_MODIFY":
+                    return self._modify_not_found(rec, in_modify)
+                return OrderResult(ok=False, order=rec.order, error=str(reason), would_cross=reason == WOULD_CROSS)
             remaining_s = deadline - time.monotonic()
             if self._acct is None or not self._acct.connected or remaining_s <= 0:
                 return OrderResult(ok=True, order=dataclasses.replace(rec.order, status=OrderStatus.PENDING))
@@ -1284,14 +1597,24 @@ class ArcusExchange(Exchange):
             except asyncio.TimeoutError:
                 return OrderResult(ok=True, order=dataclasses.replace(rec.order, status=OrderStatus.PENDING))
             if kind == "action_reject":
-                return OrderResult(ok=False, order=rec.order, error=str(val),
-                                   retryable=val == "ORDER_NOT_FOUND_FOR_MODIFY")
+                if val == "ORDER_NOT_FOUND_FOR_MODIFY":
+                    return self._modify_not_found(rec, in_modify)
+                return OrderResult(ok=False, order=rec.order, error=str(val))
             return self._result(rec) if rec.order.status is not OrderStatus.CANCELED else OrderResult(
                 ok=False, order=rec.order, error=rec.order.error or "order canceled")
         finally:
             if rec.modify_fut is fut:
                 rec.modify_fut = None
                 rec.modify_target = None
+
+    def _modify_not_found(self, rec: _OrderRec, in_modify: bool) -> OrderResult:
+        """ORDER_NOT_FOUND_FOR_MODIFY: transient only while the order (or a modify replacement) is not
+        sequenced yet; for an order the stream already confirmed it means the order is gone."""
+        if in_modify or rec.last_seq is None or rec.order.status.is_terminal:
+            return OrderResult(ok=False, order=rec.order, error="ORDER_NOT_FOUND_FOR_MODIFY", retryable=True)
+        self._background(self._verify_rec(rec, "ORDER_NOT_FOUND_FOR_MODIFY"), "order check")
+        return OrderResult(ok=False, order=rec.order, retryable=False,
+                           error="order not found (ORDER_NOT_FOUND_FOR_MODIFY)")
 
     async def set_leverage(self, symbol: str, leverage: int) -> None:
         signer = self._require_trading()
@@ -1323,25 +1646,59 @@ class ArcusExchange(Exchange):
         try:
             await self._post_signed("/v1/scheduleCancel", lambda: signer.legacy("scheduleCancel", body),
                                     pool="cancel")
+        except ArcusHTTPError as exc:
+            if exc.status == 503:  # spec: "treat the switch as not armed and retry"
+                self._dms_last_ok = None
+            raise
         except TRANSPORT_ERRORS as exc:
             raise ExchangeError(f"arcus scheduleCancel transport error: {exc!r}", retryable=True) from exc
         self._dms_last_ok = time.monotonic() if "time" in body else None
 
     async def _refresh_dms(self) -> None:
-        healthy = self._acct is not None and self._acct.is_healthy(25.0) and self._orders_synced.is_set()
+        """Keep the switch armed only while something of ours may rest: every arm/refresh is charged to the
+        lifetime cancel pool, and a switch that fires with nothing resting still burns a daily auto-fire."""
+        healthy = self._acct is not None and self._acct.is_healthy(self.private_stale_s) \
+            and self._orders_synced.is_set()
         if not healthy:
             self.log.warning("arcus private stream unhealthy: NOT refreshing the dead man's switch")
             return
-        await self.arm_dead_mans_switch(float(self.cfg.dead_mans_switch_s))
+        async with self._dms_lock:
+            if self._live_recs(include_foreign=True) or self._writes_inflight:
+                await self.arm_dead_mans_switch(float(self.cfg.dead_mans_switch_s))
+            elif self._dms_last_ok is not None:
+                self.log.info("arcus: nothing resting -> disarming the dead man's switch")
+                await self.arm_dead_mans_switch(0)
+
+    async def _ensure_dms_armed(self) -> None:
+        """Arm the switch before a resting order goes out if it is not (freshly) armed. Best effort: a
+        failure is logged and ``can_increase_exposure`` refuses new exposure while orders rest unprotected."""
+        dms = float(self.cfg.dead_mans_switch_s or 0)
+        if dms <= 0 or not self.has_credentials:
+            return
+        if self._dms_last_ok is not None and time.monotonic() - self._dms_last_ok < dms / 3.0:
+            return
+        if self._pool_blocked("cancel") > 0:  # the arm would only be rejected again (cancel pool 429)
+            return
+
+        async def arm_if_stale() -> None:
+            async with self._dms_lock:  # a concurrent refresh may just have armed it
+                if self._dms_last_ok is None or time.monotonic() - self._dms_last_ok >= dms / 3.0:
+                    await self.arm_dead_mans_switch(dms)
+
+        try:
+            await asyncio.wait_for(arm_if_stale(), 3.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.log.warning("arcus: arming the dead man's switch before placing failed: %r", exc)
 
     # ================================================================== health
-    def budget_health(self) -> float:
-        if not self.has_credentials:
-            return 1.0
-        if self._pool_blocked("order") > 0:
+    def _pool_health(self, pool: str) -> float:
+        """Remaining fraction of a lifetime per-subaccount pool (order / cancel); 0 while it is 429-blocked."""
+        if self._pool_blocked(pool) > 0:
             return 0.0
         h = 1.0
-        rl = (self._rate_limit or {}).get("order") if isinstance(self._rate_limit, dict) else None
+        rl = (self._rate_limit or {}).get(pool) if isinstance(self._rate_limit, dict) else None
         cap = 0
         if isinstance(rl, dict):
             try:
@@ -1350,9 +1707,19 @@ class ArcusExchange(Exchange):
                 cap, used = 0, 0
             if cap > 0:
                 h = min(h, max(0.0, (cap - used) / cap))
-        rem = self._pool_remaining.get("order")
+        rem = self._pool_remaining.get(pool)
         if rem is not None and rem >= 0 and cap > 0:
             h = min(h, max(0.0, rem / cap))
+        return h
+
+    def budget_health(self) -> float:
+        if not self.has_credentials:
+            return 1.0
+        # cancels (and DMS refreshes) draw on their own lifetime pool: running it dry means stale quotes
+        # can no longer be pulled, so it limits the requote pace just like the order pool
+        h = min(self._pool_health("order"), self._pool_health("cancel"))
+        if h <= 0:
+            return 0.0
         if self._order_bucket is not None:
             b = self._order_bucket
             b._refill()  # noqa: SLF001 - local helper class
@@ -1370,11 +1737,24 @@ class ArcusExchange(Exchange):
                                                       "connects": self._acct.connects,
                                                       "frame_age": self._acct.frame_age()},
             "live_orders": len(self._live_recs()),
+            "private": (self.private_ok()[1] or "ok") if self.has_credentials else None,
+            "dms_armed": self._dms_armed() if self.has_credentials else None,
             "rate_limit": self._rate_limit,
             "budget_health": self.budget_health(),
             "clock_offset_ms": self.clock.offset_ns / 1e6,
             "access_error": self.access_error,
         }
+
+
+def _outcome_unknown(exc: ArcusHTTPError) -> bool:
+    """A failed write whose effect is unknown: any 5xx except a gateway JSON error saying it was not
+    submitted (``errorType`` Transmission / Unavailable). CDN/LB 502/52x pages can follow a forwarded request."""
+    return exc.status >= 500 and not exc.is_definitive_5xx
+
+
+def _mark_recovered(fill: Fill) -> Fill:
+    """Flag a fill replayed from the ``userFills`` snapshot after a reconnect (``Fill.recovered``)."""
+    return dataclasses.replace(fill, recovered=True)
 
 
 def _log_future_error(logger, what: str) -> Callable[[asyncio.Future], None]:

@@ -13,6 +13,7 @@ from farmer.exchanges.arcus.parse import (
     order_from_row,
     parse_market,
     position_from_row,
+    rth_seconds_left,
     update_market,
 )
 from farmer.models import MarketCategory, OrderStatus, Side
@@ -153,3 +154,32 @@ def test_positions_and_funding_rows_real():
         # sign: long pays positive rate, short receives it
         if D(r["fundingRate"]) > 0:
             assert (fp.amount < 0) == (D(r["size"]) > 0)
+
+
+def test_rwa_close_buffer_before_scheduled_rth_end():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    ny = ZoneInfo("America/New_York")
+
+    def t(h: int, mi: int) -> float:
+        return datetime(2026, 10, 20, h, mi, tzinfo=ny).timestamp()
+
+    raw = dict(rows()["SPY-USD"], isOutsideRth=False)
+    spy = parse_market(raw)
+    rth = spy.extra["regular_trading_hours"]  # 04:00-20:00 ET
+    assert rth_seconds_left(rth, t(19, 50)) == 600
+    assert is_market_open(spy, close_buffer_s=600, now=t(19, 49))
+    assert not is_market_open(spy, close_buffer_s=600, now=t(19, 51))  # no new opens into off-hours
+    assert is_market_open(spy, close_buffer_s=0, now=t(19, 51))
+    assert rth_seconds_left(rth, t(21, 0)) is None  # outside the schedule: isOutsideRth alone decides
+    assert is_market_open(spy, close_buffer_s=600, now=t(21, 0))
+    assert not is_market_open(parse_market(dict(raw, isOutsideRth=True)), close_buffer_s=600, now=t(12, 0))
+    btc = parse_market(rows()["BTC-USD"])
+    assert is_market_open(btc, close_buffer_s=600, now=t(19, 55))  # crypto never closes
+    overnight = {"startSecondsOfDay": 72000, "endSecondsOfDay": 14400, "timezone": "America/New_York",
+                 "isOvernight": True}
+    assert rth_seconds_left(overnight, t(23, 0)) == 5 * 3600
+    assert rth_seconds_left(overnight, t(3, 0)) == 3600
+    assert rth_seconds_left(overnight, t(12, 0)) is None
+    assert rth_seconds_left({"timezone": "Nope/Nowhere", "startSecondsOfDay": 0, "endSecondsOfDay": 1}) is None

@@ -20,6 +20,9 @@ Order model
 - If the outcome of a sent tx cannot be established (``TxUnknown``) the result is ``ok=True`` with
   ``order.status == UNKNOWN`` and ``order.error`` set: treat it as IN FLIGHT and reconcile from positions; never
   blindly re-send (that could double the hedge).
+- Account caches are venue truth only while the socket keeps delivering frames (``account_fresh_s``). Otherwise
+  ``fetch_positions`` reads REST, unless a recently tracked order may still have fills that the reconnect snapshot
+  will replay: then it raises a retryable error (REST would already contain those fills -> double count).
 """
 
 from __future__ import annotations
@@ -27,7 +30,6 @@ from __future__ import annotations
 import asyncio
 import collections
 import json
-import logging
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -111,6 +113,15 @@ from farmer.utils.ratelimit import SlidingWindowLimiter
 
 BOOK_DEPTH = 20
 _UNKNOWN_AFTER_S = 30.0  # a PENDING order nobody can confirm becomes UNKNOWN after this long
+# The account cache is only venue truth while the socket keeps delivering frames (market_stats/all streams
+# continuously); a "connected" socket that went silent may be stalled, and its cache frozen
+# (``LighterConfig.account_fresh_s``). While the account stream is down, REST positions are refused if a tracked
+# order sent within ``LighterConfig.replay_guard_s`` may still have fills that the next account_all snapshot will
+# replay (they would be counted twice by the caller); bounded so a long WS-only outage cannot block reads forever.
+_OUR_TXS_MAX = 2048
+_FUNDING_REST_EVERY_S = 900.0  # positionFunding backfill cadence (weight 300; the WS stream is the primary source)
+_FUNDING_REST_RETRY_S = 60.0  # ...after a failed / budget-truncated backfill
+_FUNDING_REST_MAX_PAGES = 5
 
 
 @dataclass
@@ -119,6 +130,7 @@ class _OrderMeta:
     market_id: int
     sent_at: float = field(default_factory=time.monotonic)
     tx_hash: str | None = None
+    tx_hashes: list[str] = field(default_factory=list)  # every hash signed for this order (a resync re-signs)
     fills_base: Decimal = ZERO
     fills_quote: Decimal = ZERO
     venue_filled: Decimal = ZERO
@@ -236,6 +248,8 @@ class LighterExchange(Exchange):
         self.cfg = cfg
         self._signer_factory = signer_factory
         self._ws_watchdog_s = float(cfg.ws_watchdog_s)
+        self._account_fresh_s = float(cfg.account_fresh_s)
+        self._replay_guard_s = float(cfg.replay_guard_s)
         self._tx_ack_timeout_s = float(cfg.tx_ack_timeout_s)
         self._tx_rest_timeout_s = float(cfg.tx_rest_timeout_s)
         self._tx_budget_wait_s = float(cfg.tx_budget_wait_s)
@@ -265,6 +279,7 @@ class LighterExchange(Exchange):
             readonly_fallback_url=readonly_url(cfg.ws_url) if creds else None,
             ping_interval_s=float(cfg.ws_ping_interval_s),
             watchdog_s=self._ws_watchdog_s,
+            tx_rx_fresh_s=float(cfg.tx_rx_fresh_s),
             max_msgs_per_min=int(cfg.ws_max_msgs_per_min),
         )
         self._ws.subscribe("market_stats/all")
@@ -294,6 +309,7 @@ class LighterExchange(Exchange):
         self._cid_to_coi: dict[str, int] = {}
         self._oidx_to_coi: dict[int, int] = {}
         self._tx_to_coi: dict[str, int] = {}
+        self._our_txs: collections.OrderedDict[str, None] = collections.OrderedDict()  # every hash we signed
         self._seen_trades: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._leverage_sent: dict[int, int] = {}
         # trading
@@ -301,6 +317,7 @@ class LighterExchange(Exchange):
         self._executor: TxExecutor | None = None
         self._transport = _Transport(self)
         self._auth: tuple[str, float, float] | None = None  # token, expiry, created
+        self._auth_sub_token: str | None = None  # token last handed to the WS auth subscriptions
         self._auth_error_at = 0.0
         # venue-level flags
         self._restricted: str | None = None
@@ -334,8 +351,8 @@ class LighterExchange(Exchange):
             acct = int(self.cfg.account_index)  # type: ignore[arg-type]
             self._ws.subscribe(f"account_all/{acct}")
             self._ws.subscribe(f"user_stats/{acct}")
-            self._ws.subscribe(f"account_all_orders/{acct}", auth=self._auth_token)
-            self._ws.subscribe(f"account_tx/{acct}", auth=self._auth_token)
+            self._ws.subscribe(f"account_all_orders/{acct}", auth=self._ws_auth)
+            self._ws.subscribe(f"account_tx/{acct}", auth=self._ws_auth)
         await self._ws.start()
         await self._ws.wait_first_attempt(timeout=15.0)
         if self.has_credentials and self._ws.restricted:
@@ -679,6 +696,10 @@ class LighterExchange(Exchange):
         self._remember_trade(tid)
         if tracked and fill.client_id != self._orders[coi].client_id:
             fill.client_id = self._orders[coi].client_id
+        if historical:
+            # replayed by the account_all snapshot after a reconnect: the caller may already have adopted it
+            # from a REST position read during the outage (Fill.recovered -> reconcile, never add blindly)
+            fill.recovered = True
         self.stats["fills"] += 1
         self._emit_fill(fill)
         if tracked:
@@ -846,6 +867,10 @@ class LighterExchange(Exchange):
             ae = str(ev.get("ae") or "")
             if ae and (str(ERR_STANDARD_LIMIT) in ae or "Standard trading" in ae or "limit of Standard" in ae):
                 self._set_standard_limit(ae)
+            if status == 0 and h in self._our_txs and self._executor is not None:
+                # failed in the sequencer BEFORE being applied: its nonce was not consumed (spec §7.2)
+                self.log.warning("lighter tx %s (type %s) failed in the sequencer; resyncing nextNonce", h[:16], tx.get("type"))
+                self._executor.request_resync()
             coi = self._tx_to_coi.get(h)
             if coi is None:
                 if ae:
@@ -876,6 +901,20 @@ class LighterExchange(Exchange):
             self._fatal = f"lighter fatal error {code}: {message}"
             self.log.critical("%s - trading disabled", self._fatal)
 
+    def private_ok(self) -> tuple[bool, str]:
+        """Is the account stream (the source of fills and order updates) connected, synced and delivering frames?
+        The strategy blocks opening quotes while it is not (hedge outcomes would only be visible via REST)."""
+        if not self.has_credentials:
+            return False, "lighter: no account stream (credentials missing)"
+        if not self._ws.connected:
+            return False, "lighter account stream down"
+        if not (self._account_ready and self._orders_ready):
+            return False, "lighter account stream not synced (snapshot pending)"
+        age = self._ws.last_rx_age()
+        if age >= self._ws_watchdog_s:
+            return False, f"lighter account stream silent for {age:.0f}s"
+        return True, ""
+
     def can_increase_exposure(self) -> tuple[bool, str]:
         if self._restricted:
             return False, self._restricted
@@ -886,39 +925,57 @@ class LighterExchange(Exchange):
         return True, ""
 
     def budget_health(self) -> float:
+        """Free share of the shared request bucket and of the tx cap, whichever is lower (0 during a 429 cooldown)."""
         if time.monotonic() < self._cooldown_until:
             return 0.0
-        return max(0.0, min(1.0, self._limiter.available() / self._limiter.max_calls))
+        return max(0.0, min(1.0, self._limiter.available() / self._limiter.max_calls,
+                            self._tx_limiter.available() / self._tx_limiter.max_calls))
 
     # ================================================================== auth
+    def _auth_due(self, now: float) -> bool:
+        """Single refresh threshold (used by every caller, so REST and the WS refresh cannot disagree)."""
+        if self._auth is None:
+            return True
+        _, exp, created = self._auth
+        return now >= exp - max(60.0, 0.2 * max(60.0, exp - created))
+
     def _auth_token(self) -> str:
         if self._signer is None:
             raise AuthRequired("lighter: no signer (credentials missing)")
         now = time.time()
-        ttl = float(self.cfg.auth_token_ttl_s)
-        if self._auth is None or now >= self._auth[1] - max(60.0, 0.2 * ttl):
-            tok, exp = self._signer.auth_token(ttl)
+        if self._auth_due(now):
+            tok, exp = self._signer.auth_token(float(self.cfg.auth_token_ttl_s))
             self._auth = (tok, exp, now)
+        assert self._auth is not None
         return self._auth[0]
+
+    def _ws_auth(self) -> str:
+        """Auth provider for the WS subscriptions: remembers which token the channels were subscribed with."""
+        tok = self._auth_token()
+        self._auth_sub_token = tok
+        return tok
 
     def _auth_channels(self) -> list[str]:
         acct = self.cfg.account_index
         return [f"account_all_orders/{acct}", f"account_tx/{acct}"]
 
     def _resubscribe_auth(self) -> None:
+        if self._auth is not None:
+            self._auth_sub_token = self._auth[0]  # the resubscribe (or the next reconnect) uses the current token
         for ch in self._auth_channels():
             self._ws.resubscribe(ch)
 
     def _maybe_refresh_auth(self) -> None:
         if self._signer is None or self._auth is None:
             return
-        tok, exp, created = self._auth
-        ttl = max(60.0, exp - created)
-        if time.time() - created >= 0.8 * ttl:
+        if self._auth_due(time.time()):
             self._auth = None
             self._auth_token()
-            self.log.info("lighter auth token refreshed; resubscribing auth channels")
-            self._resubscribe_auth()
+        elif self._auth_sub_token is None or self._auth[0] == self._auth_sub_token:
+            return  # nothing subscribed yet, or the channels already run on the current token
+        # refreshed here OR by any other caller (REST auth reads, ...): the channels must follow the new token
+        self.log.info("lighter auth token refreshed; resubscribing auth channels")
+        self._resubscribe_auth()
 
     # ================================================================== maintenance
     async def _maintenance_loop(self) -> None:
@@ -987,6 +1044,8 @@ class LighterExchange(Exchange):
                 if tx is not None:
                     ev = parse_event_info(tx)
                     ae = str(ev.get("ae") or "")
+                    if tx.get("status") == 0 and self._executor is not None:
+                        self._executor.request_resync()  # nonce not consumed (spec §7.2)
                     if tx.get("status") == 0 or ae:
                         if str(ERR_STANDARD_LIMIT) in ae or "Standard trading" in ae:
                             self._set_standard_limit(ae)
@@ -1010,8 +1069,9 @@ class LighterExchange(Exchange):
                     self._cid_to_coi.pop(order.client_id, None)
                     if order.order_id and order.order_id.isdigit():
                         self._oidx_to_coi.pop(int(order.order_id), None)
-                if meta.tx_hash:
-                    self._tx_to_coi.pop(meta.tx_hash, None)
+                for h in {meta.tx_hash, *meta.tx_hashes}:
+                    if h:
+                        self._tx_to_coi.pop(h, None)
 
     # ================================================================== market data API
     async def subscribe_books(self, symbols: list[str]) -> None:
@@ -1101,7 +1161,20 @@ class LighterExchange(Exchange):
             raise AuthRequired("lighter: credentials required (LIGHTER_API_PRIVATE_KEY/ACCOUNT_INDEX/API_KEY_INDEX)")
 
     def _account_fresh(self) -> bool:
-        return self._ws.connected and self._account_ready
+        return self._ws.connected and self._account_ready and self._ws.last_rx_age() < self._account_fresh_s
+
+    def _replay_pending(self) -> list[str]:
+        """Tracked orders whose fills may still be unseen (the next account_all snapshot would replay them)."""
+        now = time.monotonic()
+        out = []
+        for coi, meta in self._meta.items():
+            order = self._orders.get(coi)
+            if order is None or now - meta.sent_at > self._replay_guard_s:
+                continue
+            if (not order.status.is_terminal or meta.pending_terminal is not None
+                    or meta.fills_base < meta.venue_filled):
+                out.append(order.client_id)
+        return out
 
     async def _rest_account(self) -> dict:
         j = await self._rest_get("/api/v1/account", {"by": "index", "value": self.cfg.account_index})
@@ -1139,6 +1212,13 @@ class LighterExchange(Exchange):
         self._require_creds()
         if self._account_fresh():
             return self._positions_from_raw(dict(self._positions_raw), time.time())
+        pending = self._replay_pending()
+        if pending:
+            # REST positions already contain those fills, and the snapshot after the reconnect re-emits them:
+            # a caller adopting this read would count them twice. Wait for the stream instead.
+            self.stats["positions_deferred"] += 1
+            raise ExchangeError(f"lighter positions unavailable: account stream down with fills pending replay "
+                                f"({', '.join(pending[:5])})", retryable=True)
         acct = await self._rest_account()
         raw = {}
         for p in acct.get("positions") or []:
@@ -1217,17 +1297,27 @@ class LighterExchange(Exchange):
     async def fetch_funding_payments(self, since_ts: float | None = None) -> list[FundingPayment]:
         if not self.has_credentials:
             return []
-        if time.monotonic() - self._funding_rest_at > 900 and self._signer is not None and self._read_budget_ok():
-            self._funding_rest_at = time.monotonic()
+        if time.monotonic() >= self._funding_rest_at and self._signer is not None and self._read_budget_ok():
+            # REST backfill of what the account stream missed (reconnect gaps); every 15 min, 60 s after a failure
+            self._funding_rest_at = time.monotonic() + _FUNDING_REST_EVERY_S
             params: dict[str, Any] = {"account_index": self.cfg.account_index, "limit": 100}
             if since_ts:
                 params["start_timestamp"] = int(since_ts)
             try:
-                j = await self._rest_get("/api/v1/positionFunding", params, auth=True)
-                for f in j.get("position_fundings") or []:
-                    if isinstance(f, dict):
+                for _ in range(_FUNDING_REST_MAX_PAGES):
+                    j = await self._rest_get("/api/v1/positionFunding", params, auth=True)
+                    rows = [f for f in j.get("position_fundings") or [] if isinstance(f, dict)]
+                    for f in rows:
                         self._on_funding_row(f)
+                    cursor = j.get("next_cursor")
+                    if not cursor or len(rows) < params["limit"] or cursor == params.get("cursor"):
+                        break
+                    if not self._read_budget_ok():  # the rest on the next call (dedupe by funding id)
+                        self._funding_rest_at = time.monotonic() + _FUNDING_REST_RETRY_S
+                        break
+                    params["cursor"] = cursor
             except ExchangeError as exc:
+                self._funding_rest_at = time.monotonic() + _FUNDING_REST_RETRY_S
                 self.log.debug("lighter positionFunding fetch failed: %s", exc)
         rows = sorted(self._funding.values(), key=lambda f: f.ts)
         return [f for f in rows if since_ts is None or f.ts >= since_ts]
@@ -1242,11 +1332,22 @@ class LighterExchange(Exchange):
         if self._executor is None or self._signer is None:
             raise ExchangeError("lighter: trading not initialised (connect first)", retryable=True)
 
+    def _remember_tx(self, tx_hash: str) -> None:
+        self._our_txs[tx_hash] = None
+        while len(self._our_txs) > _OUR_TXS_MAX:
+            self._our_txs.popitem(last=False)
+
     async def _send_tx(self, build: Callable[[int], SignedTx]) -> TxReceipt:
         self._require_trading()
         assert self._executor is not None
+
+        def build_recorded(nonce: int) -> SignedTx:
+            tx = build(nonce)
+            self._remember_tx(tx.tx_hash)  # known at signing time: account_tx frames may beat the receipt
+            return tx
+
         try:
-            return await self._executor.submit(build)
+            return await self._executor.submit(build_recorded)
         except TxRejected as exc:
             self._on_tx_code(exc.tx_code, exc.tx_message)
             raise
@@ -1274,24 +1375,48 @@ class LighterExchange(Exchange):
         assert m.size_decimals is not None and m.price_decimals is not None
         base = size_to_int(size, m.size_decimals, exact=True)
         px = worst_price_to_int(price, side, m.price_decimals) if taker else price_to_int(price, m.price_decimals)
-        if not reduce_only and not m.is_tradeable_size(size, price):
-            raise ValueError(f"order below Lighter minimum (size {size} >= {m.min_size}, notional >= {m.min_notional})")
+        # taker: the minimum is checked at the market reference (mid), like the hedger does, not at the worst price
+        # (a SELL's worst price sits below the mid and would refuse valid minimum-size hedges)
+        ref = self._taker_ref_price(m, price) if taker else price
+        if not reduce_only and not m.is_tradeable_size(size, ref):
+            msg = f"order below Lighter minimum (size {size} >= {m.min_size}, notional >= {m.min_notional})"
+            if taker:  # sizing race against a moving mid: retry, do not feed the error breaker
+                raise ExchangeError(msg, retryable=True)
+            raise ValueError(msg)
         limit = m.extra.get("order_quote_limit")
         if isinstance(limit, Decimal) and limit > 0 and size * price > limit:
             raise ValueError(f"order notional {size * price} above the market limit {limit}")
         return base, px
 
+    def _taker_ref_price(self, m: MarketInfo, fallback: Decimal) -> Decimal:
+        book = self._last_books.get(m.market_id)
+        mid = book.mid if book is not None else None
+        if mid is not None and mid > 0:
+            return mid  # the same reference the hedger sizes with (get_book().mid)
+        ms = self._ms.get(m.market_id)
+        mark = dec(ms.get("mark_price")) if ms else None
+        return mark if mark is not None and mark > 0 else fallback
+
     async def _submit_order(self, order: Order, meta: _OrderMeta, build: Callable[[int], SignedTx], *,
                             wait_s: float) -> OrderResult:
+        def build_tracked(nonce: int) -> SignedTx:
+            tx = build(nonce)
+            # register before sending: an account_tx failure frame can arrive before submit() returns
+            meta.tx_hashes.append(tx.tx_hash)
+            self._tx_to_coi[tx.tx_hash] = meta.coi
+            return tx
+
         try:
-            rcpt = await self._send_tx(build)
+            rcpt = await self._send_tx(build_tracked)
         except TxUnknown as exc:
-            order.status = OrderStatus.UNKNOWN
-            order.error = str(exc)
-            order.updated_ts = time.time()
             if exc.tx_hash and exc.tx_hash != "?":
                 meta.tx_hash = exc.tx_hash
                 self._tx_to_coi[exc.tx_hash] = meta.coi
+            if order.status.is_terminal:  # an account_tx frame already reported the tx as failed
+                return OrderResult(ok=order.status is not OrderStatus.REJECTED, order=order, error=order.error)
+            order.status = OrderStatus.UNKNOWN
+            order.error = str(exc)
+            order.updated_ts = time.time()
             self.stats["tx_unknown"] += 1
             self.log.error("lighter %s %s %s: %s -> treat as IN FLIGHT and reconcile", order.symbol, order.side.value,
                            order.size, exc)
@@ -1307,6 +1432,12 @@ class LighterExchange(Exchange):
         meta.tx_hash = rcpt.tx_hash
         meta.sent_at = time.monotonic()
         self._tx_to_coi[rcpt.tx_hash] = meta.coi
+        if rcpt.via == "lookup":  # resolved by hash: the tx may have been applied as a no-op (e.g. reduce-only)
+            ae = str(parse_event_info(rcpt.ack).get("ae") or "")
+            if ae:
+                if str(ERR_STANDARD_LIMIT) in ae or "Standard trading" in ae or "limit of Standard" in ae:
+                    self._set_standard_limit(ae)
+                self._reject_order(meta.coi, f"sequencer: {ae}")
         if wait_s > 0 and order.status is OrderStatus.PENDING:
             try:
                 await asyncio.wait_for(meta.event.wait(), wait_s)

@@ -6,6 +6,7 @@ Load with ``load_config(path)``. Secrets are NEVER read from YAML; they come fro
 
 from __future__ import annotations
 
+import logging
 import os
 from decimal import Decimal
 from pathlib import Path
@@ -52,6 +53,8 @@ class ArcusConfig(_Base):
     min_modify_gtt_lead_days: float = 32.0  # below this goodTilTime lead, modify = cancel + new order
     private_ready_timeout_s: float = 10.0  # wait for the private stream snapshot (orders/fills) on connect
     fills_snapshot_n: int = 500  # fills requested in the userFills snapshot after (re)connect
+    private_stale_s: float = 25.0  # private stream counts as dead after this long without a frame (pong <= 10 s)
+    rwa_close_buffer_s: float = 600.0  # RWA markets report closed this long before the scheduled RTH close
 
     @property
     def has_credentials(self) -> bool:
@@ -74,7 +77,7 @@ class LighterConfig(_Base):
     auth_token_ttl_s: float = 6 * 3600  # WS/REST auth token lifetime (server max 8 h)
     ws_ping_interval_s: float = 30.0  # server drops clients idle > ~120 s
     # --- adapter tunables
-    ws_watchdog_s: float = 20.0  # reconnect after this long without any frame
+    ws_watchdog_s: float = 6.0  # reconnect after this long without any frame (market_stats ~1/s); < hedge_timeout_s
     ws_max_msgs_per_min: int = 180  # subscribe/ping budget per connection (server cap 200)
     tx_ack_timeout_s: float = 1.5  # websocket sendtx ack wait before outcome resolution
     tx_rest_timeout_s: float = 3.0  # REST sendTx timeout
@@ -87,6 +90,9 @@ class LighterConfig(_Base):
     standard_limit_cooldown_s: float = 3600.0  # code 52002 blocks NEW exposure this long before probing again
     book_quiet_grace_s: float = 10.0  # get_book extends a quiet book's timestamp while the stream is healthy
     verify_api_key: bool = True  # SDK check_client() at startup (runs in a thread)
+    account_fresh_s: float = 3.0  # WS account caches are venue truth only while a frame arrived this recently
+    tx_rx_fresh_s: float = 3.0  # send txs over the socket only while it delivered a frame this recently
+    replay_guard_s: float = 120.0  # REST positions refused while an order sent this recently may replay fills
 
     @property
     def has_credentials(self) -> bool:
@@ -130,6 +136,9 @@ class StrategyConfig(_Base):
     min_quote_lifetime_s: float = 0.5  # don't amend (improvement reprices) faster than this
     max_requotes_per_min: int = 120  # per market, protective + improvement amends
     max_improve_ticks: int = 1_000_000  # how far inside the maker book we may go (capped by post-only)
+    # every maker fill needs a hedge tx: no quotes while the hedge venue's request budget health (0..1) is below
+    # this (resume at 1.5x); Lighter Standard: 60 requests + 40 txs per rolling minute. 0 = off
+    min_taker_budget: float = 0.25
 
     # --- basis (structural price gap between venues, e.g. USD vs USDT index ~10 bps on crypto)
     use_basis: bool = True  # price the edge vs taker_price*(1+basis) instead of the raw taker price
@@ -151,6 +160,8 @@ class StrategyConfig(_Base):
     hold_seconds: float = 0.0  # minimum time at target before closing
     hold_through_funding: bool = False  # wait for the next funding settlement before closing
     protect_funding_window_s: float = 120.0  # don't close below floor / flip this close to a settlement
+    # ...nor this long AFTER it (venues snapshot positions up to ~0.5 s late); None = min(3, window), 0 = off
+    protect_funding_post_s: float | None = None
 
     # --- funding direction
     direction_mode: Literal["auto", "long_maker", "short_maker"] = "auto"
@@ -172,6 +183,8 @@ class StrategyConfig(_Base):
 
     # --- startup / shutdown
     shutdown_flush_s: float = 30.0  # let hedgers flatten the delta this long on shutdown
+    shutdown_settle_s: float = 2.0  # shutdown: hedgers keep running until no maker fill arrived for this long
+    orphan_sweep_s: float = 60.0  # cancel untracked open quotes found by a periodic open-order sweep (0 = off)
     close_on_exit_timeout_s: float = 120.0  # risk.close_on_exit: max time for close_all("taker")
     check_prices: bool = True  # verify maker/taker price ratio when mapping markets (catches different assets)
     startup_position_retries: int = 3
@@ -223,13 +236,18 @@ class RiskConfig(_Base):
     max_divergence_bps: Decimal = Decimal("60")  # pause if |maker_mid/taker_mid - 1| exceeds this (absolute)
     max_basis_dev_bps: Decimal = Decimal("5")  # pause if the instant basis deviates from its EMA by more
     stale_book_s: float = 5.0  # cancel quotes if a book is older than this
-    max_margin_ratio: Decimal = Decimal("0.6")  # maintenance/equity per venue: stop opening above this
-    reduce_margin_ratio: Decimal = Decimal("0.8")  # actively reduce positions above this
+    # maintenance/equity per venue (liquidation at 1.0; ~0.06-0.08 at 5x fully used with BTC margin fractions)
+    max_margin_ratio: Decimal = Decimal("0.25")  # stop opening at/above this (equity < 4 x maintenance)
+    reduce_margin_ratio: Decimal = Decimal("0.4")  # halt + flatten every pair with reduce-only taker orders
+    min_free_collateral_mult: Decimal = Decimal("1.5")  # opening needs free collateral >= clip/leverage x this
+    max_equity_divergence_frac: Decimal = Decimal("0.3")  # warn when venue equities differ by more (0 = off)
     max_daily_loss: Decimal = Decimal("100")  # USD realized+fees+funding; stop the bot if breached
     max_consecutive_errors: int = 20
     close_on_exit: bool = False  # flatten both legs on shutdown
     skip_rwa_off_hours: bool = True  # RWA pairs only while Arcus isOutsideRth == false
     emergency_flatten: bool = True  # flatten the maker leg with a taker order if hedging keeps failing
+    emergency_cooldown_s: float = 300.0  # no quoting for this long after an emergency flatten of the maker leg
+    max_emergencies_per_hour: int = 3  # halt the bot after this many emergency flattens within an hour
     unhedged_grace_s: float = 1.0  # max_unhedged_notional only pauses quoting after the delta persisted this long
     check_interval_s: float = 10.0  # balance / margin / daily-loss poll interval
     balance_timeout_s: float = 10.0  # per-venue fetch_balance timeout
@@ -245,12 +263,15 @@ class PaperConfig(_Base):
     maker_fee: dict[str, Decimal] = Field(default_factory=dict)
     taker_fee: dict[str, Decimal] = Field(default_factory=dict)
     default_leverage: int = 5  # paper leverage until set_leverage is called
+    # emulate the inner venue's request budget (Lighter Standard: shared 60/min bucket, 40 tx/min, tx_budget_wait_s)
+    emulate_rate_limits: bool = True
 
 
 class MonitoringConfig(_Base):
     report_interval_s: float = 60.0  # stats report (log) cadence
     notify_every: int = 60  # send every N-th report to Telegram (60 x 60 s = hourly)
     funding_collect_s: float = 300.0  # pull realized funding payments into the DB this often
+    funding_lookback_s: float = 21600.0  # each collection re-requests this much history (backfills missed hours)
     # Secrets (from env): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
     telegram_bot_token: str | None = Field(default=None, repr=False)
     telegram_chat_id: str | None = None
@@ -266,6 +287,14 @@ class AppConfig(_Base):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     paper: PaperConfig = Field(default_factory=PaperConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
+
+    def warnings(self) -> list[str]:
+        """Settings that are valid but probably wrong (logged by ``load_config``)."""
+        out = []
+        if self.strategy.taker_venue == "lighter" and self.lighter.ws_watchdog_s >= self.strategy.hedge_timeout_s:
+            out.append(f"lighter.ws_watchdog_s ({self.lighter.ws_watchdog_s}) should be below strategy.hedge_timeout_s "
+                       f"({self.strategy.hedge_timeout_s}): a stalled socket should reconnect before hedges expire")
+        return out
 
     def enabled_markets(self) -> list[ResolvedMarket]:
         return [self.strategy.for_market(m) for m in self.strategy.markets if m.enabled]
@@ -312,4 +341,7 @@ def load_config(path: str | os.PathLike | None = None, *, env_file: str | os.Pat
     if os.environ.get("FARMER_MODE"):
         raw["mode"] = os.environ["FARMER_MODE"].strip()
 
-    return AppConfig.model_validate(raw)
+    cfg = AppConfig.model_validate(raw)
+    for w in cfg.warnings():
+        logging.getLogger("farmer.config").warning("config: %s", w)
+    return cfg

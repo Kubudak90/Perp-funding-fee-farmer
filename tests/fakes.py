@@ -11,7 +11,8 @@ Tests drive it explicitly:
 Optional knobs (all default to the original behaviour): ``ack_pending`` (place_limit returns PENDING until
 ``ack(client_id)``), ``modify_cross_kills`` (a crossing post-only modify kills the order, like Arcus ALO),
 ``taker_fill_ratio`` (auto-filled IOC fraction), ``closed`` (symbols whose ``market_open`` is False),
-``health`` (``budget_health``), ``positions_error`` (``fetch_positions`` raises it).
+``health`` (``budget_health``), ``positions_error`` (``fetch_positions`` raises it), ``stream_ok`` (``private_ok``:
+health of the private orders/fills stream).
 ``FakeRisk`` / ``FakeNotifier`` are small stand-ins for the RiskManager / Notifier interfaces.
 """
 
@@ -69,6 +70,7 @@ class FakeExchange(Exchange):
         self.closed: set[str] = set()
         self.health = 1.0
         self.positions_error: Exception | None = None
+        self.stream_ok = True
         self._fail_next = 0
         self._fail_retryable = True
         self._fail_kinds: set[str] | None = None
@@ -109,6 +111,9 @@ class FakeExchange(Exchange):
 
     def budget_health(self):
         return self.health
+
+    def private_ok(self):
+        return (True, "") if self.stream_ok else (False, f"{self.name} private stream down (test)")
 
     # account
     async def fetch_positions(self):
@@ -389,7 +394,7 @@ FAST_STRATEGY = dict(
     loop_interval_s=0.005, reconcile_interval_s=3600, reconcile_confirm_s=0.03, reconcile_quiet_s=0.0,
     use_basis=False, basis_warmup_s=0, min_quote_lifetime_s=0.0, protect_funding_window_s=0,
     cancel_confirm_timeout_s=0.2, order_ack_timeout_s=0.5, hold_seconds=0.0, funding_refresh_s=0.05,
-    shutdown_flush_s=1.0, hedge_fill_wait_s=0.1, reconcile_retry_s=0.05,
+    shutdown_flush_s=1.0, hedge_fill_wait_s=0.1, reconcile_retry_s=0.05, shutdown_settle_s=0.05,
 )
 FAST_RISK = dict(unhedged_timeout_s=0.3, unhedged_grace_s=0.05, stale_book_s=30.0)
 

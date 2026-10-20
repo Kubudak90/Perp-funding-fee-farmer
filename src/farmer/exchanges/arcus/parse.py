@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from farmer.models import (
     ZERO,
@@ -164,13 +166,46 @@ def update_market(m: MarketInfo, raw: dict, fee_level: int | None = None, discou
     return m
 
 
-def is_market_open(m: MarketInfo | None) -> bool:
-    """Active, and either 24/7 crypto or an RWA market inside regular trading hours."""
+def is_market_open(m: MarketInfo | None, *, close_buffer_s: float = 0.0, now: float | None = None) -> bool:
+    """Active, and either 24/7 crypto or an RWA market inside regular trading hours.
+
+    ``isOutsideRth`` stays authoritative (holidays, early closes); ``close_buffer_s`` additionally reports
+    an RWA market closed that long before the scheduled ``regularTradingHours`` end (no new opens into
+    the off-hours regime: higher IM, price bands, SOFR funding).
+    """
     if m is None or not m.active:
         return False
     if m.category is MarketCategory.CRYPTO:
         return True
-    return m.extra.get("is_outside_rth") is False
+    if m.extra.get("is_outside_rth") is not False:
+        return False
+    if close_buffer_s > 0:
+        left = rth_seconds_left(m.extra.get("regular_trading_hours"), now)
+        if left is not None and left <= close_buffer_s:
+            return False
+    return True
+
+
+def rth_seconds_left(rth: Any, now: float | None = None) -> float | None:
+    """Seconds until the scheduled end of the regular-trading-hours window that contains ``now``.
+
+    ``rth`` = ``{"startSecondsOfDay", "endSecondsOfDay", "timezone", "isOvernight"}`` (half-open window,
+    local time). None when unknown / not inside the window by schedule.
+    """
+    if not isinstance(rth, dict):
+        return None
+    try:
+        start, end = int(rth["startSecondsOfDay"]), int(rth["endSecondsOfDay"])
+        tz = ZoneInfo(str(rth.get("timezone") or "America/New_York"))
+    except (KeyError, TypeError, ValueError, ZoneInfoNotFoundError):
+        return None
+    local = datetime.fromtimestamp(time.time() if now is None else now, tz)
+    sod = local.hour * 3600 + local.minute * 60 + local.second + local.microsecond / 1e6
+    if start < end:
+        return end - sod if start <= sod < end else None
+    if sod >= start:  # window wraps midnight (isOvernight)
+        return end + 86400 - sod
+    return end - sod if sod < end else None
 
 
 def funding_info(raw: dict, *, mark: Decimal | None = None, oracle: Decimal | None = None) -> FundingInfo:
@@ -365,6 +400,7 @@ __all__ = [
     "order_from_row",
     "parse_market",
     "position_from_row",
+    "rth_seconds_left",
     "tick_tiers",
     "update_market",
     "us_to_s",

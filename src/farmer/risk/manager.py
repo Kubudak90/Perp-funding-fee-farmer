@@ -3,6 +3,13 @@
 The strategy asks ``check_quote`` before (re)quoting and ``check_open`` before increasing a
 position; hedging is never gated here (risk-reducing). ``run`` polls balances on every venue
 with credentials and enforces the daily loss limit. ``halt`` is sticky until ``resume``.
+
+Margin: ``check_open`` refuses new exposure when a venue's maintenance/equity ratio reaches
+``max_margin_ratio`` or its free collateral cannot post the clip's initial margin with a buffer
+(``min_free_collateral_mult``). At ``reduce_margin_ratio`` the manager halts (no quoting, no opening)
+and runs the ``reducer`` the engine owner installed (``set_reducer``: reduce-only taker flatten of every
+pair), retrying while the ratio stays high. Diverging venue equities are reported so the operator can
+rebalance collateral (the bot never moves funds between venues).
 """
 
 from __future__ import annotations
@@ -11,7 +18,7 @@ import asyncio
 import logging
 import time
 from decimal import Decimal
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable, Mapping
 
 from farmer.config import RiskConfig
 from farmer.exchanges.base import Exchange
@@ -25,6 +32,7 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger("farmer.risk")
 
 SECONDS_PER_DAY = 86400
+REDUCE_RETRY_S = 60.0  # re-run the reducer this long after the previous run ended while margin stays high
 
 
 def utc_midnight(ts: float) -> float:
@@ -51,7 +59,11 @@ class RiskManager:
         *,
         interval_s: float = 10.0,
         clock: Callable[[], float] = time.time,
+        leverage: Mapping[str, int] | None = None,
+        default_leverage: int = 1,
     ) -> None:
+        """``leverage``: {pair symbol: leverage} used for the free-collateral check (``default_leverage``
+        otherwise; 1 = the most conservative)."""
         self.cfg = cfg
         self.venues = venues
         self.store = store
@@ -77,6 +89,14 @@ class RiskManager:
         self._daily: IncrementalSummary | None = None
         self._stop = asyncio.Event()
         self._tasks: set[asyncio.Task] = set()
+        self._leverage = {str(k).upper(): max(1, int(v)) for k, v in (leverage or {}).items()}
+        self.default_leverage = max(1, int(default_leverage))
+        self._reducer: Callable[[], Awaitable] | None = None
+        self._reduce_task: asyncio.Task | None = None
+        self._reduce_end = float("-inf")
+        self.reduce_retry_s = REDUCE_RETRY_S
+        self._equity_diverged = False
+        self._no_reducer_warned = False
 
     # ================================================================== state
     @property
@@ -95,7 +115,7 @@ class RiskManager:
 
     # ================================================================== loop
     async def run(self) -> None:
-        """Poll balances + daily loss every ``interval_s`` until ``stop()``."""
+        """Poll balances, margin and daily loss every ``interval_s`` until ``stop()``."""
         while not self._stop.is_set():
             try:
                 await self.refresh_balances()
@@ -104,7 +124,13 @@ class RiskManager:
             except Exception:
                 log.exception("balance refresh failed")
             try:
-                self.check_daily_loss()
+                self.check_margin()
+            except Exception:
+                log.exception("margin check failed")
+            try:
+                await self.check_daily_loss_async()
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 log.exception("daily loss check failed")
             try:
@@ -114,6 +140,14 @@ class RiskManager:
 
     def stop(self) -> None:
         self._stop.set()
+        task, self._reduce_task = self._reduce_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def set_reducer(self, fn: Callable[[], Awaitable] | None) -> None:
+        """Coroutine factory run when a venue's margin ratio reaches ``reduce_margin_ratio`` (normally
+        ``lambda: engine.close_all("taker")``: reduce-only IOCs on both legs, regardless of halt or edge)."""
+        self._reducer = fn
 
     async def refresh_balances(self) -> None:
         """Fetch ``Balance`` on every venue with credentials; failures keep the previous value."""
@@ -138,6 +172,30 @@ class RiskManager:
             self._balances[name] = res
             self._balance_ts[name] = self._clock()
             self._log_margin(name, res)
+        self._check_equity_divergence()
+
+    def _check_equity_divergence(self) -> None:
+        """Warn (log + notify, on transitions) when venue equities drift apart: a trend drains the losing
+        venue's collateral while the bot never moves funds, so the operator has to rebalance."""
+        frac = Decimal(str(self.cfg.max_equity_divergence_frac or 0))
+        eqs = {v: b.equity for v, b in self._balances.items()}
+        if frac <= 0 or len(eqs) < 2:
+            return
+        hi_v = max(eqs, key=lambda v: eqs[v])
+        lo_v = min(eqs, key=lambda v: eqs[v])
+        hi, lo = eqs[hi_v], eqs[lo_v]
+        diverged = hi > 0 and (hi - lo) / hi > frac
+        if diverged == self._equity_diverged:
+            return
+        self._equity_diverged = diverged
+        if diverged:
+            msg = (f"venue equities diverge: {lo_v} {lo:.2f} vs {hi_v} {hi:.2f} (> {frac * 100:.0f}% apart); "
+                   f"rebalance collateral before {lo_v} runs out of margin")
+            log.warning(msg)
+            self._record("equity_divergence", {"low": lo_v, "low_equity": lo, "high": hi_v, "high_equity": hi})
+            self._notify(f"WARNING: {msg}")
+        else:
+            log.info("venue equities back within %.0f%% of each other", frac * 100)
 
     def _log_margin(self, venue: str, bal: Balance) -> None:
         mr = bal.margin_ratio
@@ -149,7 +207,63 @@ class RiskManager:
                     bal.equity, bal.maintenance_margin)
             self._margin_state[venue] = state
 
+    # ================================================================== margin reduction
+    def check_margin(self) -> bool:
+        """At ``reduce_margin_ratio``: halt (stops quoting and opening) and start the reducer unless it runs
+        already or ended less than ``reduce_retry_s`` ago. Returns ``must_reduce()``."""
+        if not self.must_reduce():
+            return False
+        high = ", ".join(f"{v} {b.margin_ratio:.3f}" for v, b in self._balances.items()
+                         if b.margin_ratio >= self.cfg.reduce_margin_ratio)
+        self.halt(f"margin ratio >= reduce_margin_ratio {self.cfg.reduce_margin_ratio} ({high}): reducing positions")
+        if self._reducer is None:
+            if not self._no_reducer_warned:
+                self._no_reducer_warned = True
+                log.critical("margin ratio %s >= %s and no reducer installed: positions are NOT being reduced",
+                             high, self.cfg.reduce_margin_ratio)
+            return True
+        if self._reduce_task is not None and not self._reduce_task.done():
+            return True
+        if time.monotonic() - self._reduce_end < self.reduce_retry_s:
+            return True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - only ever called from run()
+            log.critical("margin ratio %s too high but no running event loop to reduce from", high)
+            return True
+        log.critical("margin ratio %s >= %s: flattening with reduce-only taker orders", high,
+                     self.cfg.reduce_margin_ratio)
+        self._record("margin_reduce", {"venues": high})
+        self._reduce_task = loop.create_task(self._run_reducer(), name="risk:reduce")
+        return True
+
+    async def _run_reducer(self) -> None:
+        assert self._reducer is not None
+        try:
+            await self._reducer()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("margin reduction failed")
+        finally:
+            self._reduce_end = time.monotonic()
+
     # ================================================================== daily loss
+    def _venue_marks(self, symbols: set[str]) -> dict[tuple[str, str], Decimal]:
+        """{(venue name, symbol): that venue's book mid} (each leg valued at its own venue's price)."""
+        out: dict[tuple[str, str], Decimal] = {}
+        for key, v in self.venues.items():
+            name = getattr(v, "name", None) or key
+            for sym in symbols:
+                try:
+                    book = v.get_book(sym)
+                except Exception:
+                    book = None
+                mid = book.mid if book is not None else None
+                if mid is not None and mid > 0:
+                    out[(name, sym)] = mid
+        return out
+
     def _marks(self, symbols: set[str]) -> dict[str, Decimal]:
         marks: dict[str, Decimal] = {}
         for sym in symbols:
@@ -166,8 +280,17 @@ class RiskManager:
                 marks[sym] = sum(mids, ZERO) / len(mids)
         return marks
 
+    def _daily_summary_source(self) -> IncrementalSummary:
+        if self._daily is None or self._daily.store is not self.store:
+            self._daily = IncrementalSummary(self.store, clock=self._clock)  # type: ignore[arg-type]
+        return self._daily
+
     def check_daily_loss(self) -> Decimal | None:
-        """PnL since UTC midnight (``Store.pnl`` semantics, marks = mean venue mid); halts beyond ``max_daily_loss``.
+        """PnL since UTC midnight; halts beyond ``max_daily_loss``.
+
+        Cash flow + fees + funding of today's fills plus today's net base of each venue valued at that venue's
+        mid (a hedged pair entered across the structural basis is ~0, not a phantom loss); a leg without a venue
+        mark falls back to the mean venue mid of the net base (``Store.pnl`` semantics).
 
         Returns the PnL, or None when it cannot be valued (no store, or a symbol with net open base
         traded today has no mark - skipping beats halting on a fake loss).
@@ -175,10 +298,18 @@ class RiskManager:
         if self.store is None:
             return None
         now = self._clock()
-        since = utc_midnight(now)
-        if self._daily is None or self._daily.store is not self.store:
-            self._daily = IncrementalSummary(self.store, clock=self._clock)
-        summary = self._daily.get(since)  # incremental: no full-day rescan every 10 s on the event loop
+        summary = self._daily_summary_source().get(utc_midnight(now))
+        return self._evaluate_daily(summary, now)
+
+    async def check_daily_loss_async(self) -> Decimal | None:
+        """``check_daily_loss`` with the store read in a worker thread (when the store supports it)."""
+        if self.store is None:
+            return None
+        now = self._clock()
+        summary = await self._daily_summary_source().aget(utc_midnight(now))
+        return self._evaluate_daily(summary, now)
+
+    def _evaluate_daily(self, summary: dict, now: float) -> Decimal | None:
         net = net_base(summary)
         held = {sym for sym, q in net.items() if q != 0}
         for per in self._exposure.values():
@@ -188,7 +319,8 @@ class RiskManager:
         if missing:
             log.debug("daily loss check skipped: no mark for %s", ", ".join(missing))
             return None
-        pnl = pnl_from_summary(summary, marks)  # == store.pnl(since, marks)
+        legs = {sym for s in summary.values() for sym, q in (s.net_base or {}).items() if q != 0}
+        pnl = pnl_from_summary(summary, marks, self._venue_marks(legs))
         self._daily_pnl = pnl
         self._daily_pnl_ts = now
         limit = Decimal(self.cfg.max_daily_loss)
@@ -248,6 +380,12 @@ class RiskManager:
             await asyncio.wait_for(self.notifier.send(text), 30.0)
         except Exception as exc:
             log.warning("notification failed: %r", exc)
+
+    async def drain_notifications(self, timeout_s: float = 10.0) -> None:
+        """Wait (bounded) for queued alerts, e.g. before the caller closes the notifier."""
+        pending = {t for t in self._tasks if not t.done()}
+        if pending:
+            await asyncio.wait(pending, timeout=timeout_s)
 
     # ================================================================== circuit breaker
     def record_error(self, venue: str, err: str) -> None:
@@ -312,12 +450,21 @@ class RiskManager:
                 return False, f"{venue}: {self._errors.get(venue)} consecutive errors"
         return True, ""
 
-    def check_open(self, symbol: str, add_notional: Decimal) -> tuple[bool, str]:
-        """May positions in ``symbol`` grow by ``add_notional`` (USD, per leg)? Returns (ok, reason)."""
+    def leverage_for(self, symbol: str) -> int:
+        return self._leverage.get(str(symbol).upper(), self.default_leverage)
+
+    def check_open(self, symbol: str, add_notional: Decimal, leverage: int | None = None) -> tuple[bool, str]:
+        """May positions in ``symbol`` grow by ``add_notional`` (USD, per leg)? Returns (ok, reason).
+
+        Per venue with a known balance: fresh, margin ratio below ``max_margin_ratio`` and free collateral of at
+        least ``add / leverage * min_free_collateral_mult`` (the hedge leg must be able to post its initial margin,
+        or a filled maker clip stays unhedged until the emergency flatten)."""
         if self._halted:
             return False, f"halted: {self._halt_reason}"
         now = self._clock()
         add = abs(Decimal(add_notional))
+        lev = max(1, int(leverage)) if leverage else self.leverage_for(symbol)
+        mult = Decimal(str(self.cfg.min_free_collateral_mult or 0))
         for name, ex in self.venues.items():
             bal = self._balances.get(name)
             if bal is not None:
@@ -327,6 +474,10 @@ class RiskManager:
                 mr = bal.margin_ratio
                 if mr >= self.cfg.max_margin_ratio:
                     return False, f"{name}: margin ratio {mr:.3f} >= {self.cfg.max_margin_ratio}"
+                need = add / lev * mult
+                if mult > 0 and bal.available < need:
+                    return False, (f"{name}: free collateral {bal.available:.2f} < {need:.2f} needed for "
+                                   f"{add:.0f} USD at {lev}x (x{mult} buffer)")
             total = self.exposure(name) + add
             if total > self.cfg.max_total_notional:
                 return False, f"{name}: exposure {total:.0f} would exceed max_total_notional {self.cfg.max_total_notional}"
@@ -350,6 +501,8 @@ class RiskManager:
             "halt_reason": self._halt_reason,
             "halt_ts": self._halt_ts,
             "must_reduce": self.must_reduce(),
+            "reducing": self._reduce_task is not None and not self._reduce_task.done(),
+            "equity_diverged": self._equity_diverged,
             "daily_pnl": self._daily_pnl,
             "daily_pnl_ts": self._daily_pnl_ts,
             "max_daily_loss": self.cfg.max_daily_loss,

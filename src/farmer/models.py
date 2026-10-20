@@ -277,6 +277,9 @@ class Fill:
     client_id: str | None = None
     trade_id: str | None = None
     ts: float = field(default_factory=time.time)
+    # replayed by the adapter from a snapshot after a private-stream reconnect (it may already be part of a
+    # position the strategy adopted from REST meanwhile -> reconcile instead of adding it blindly)
+    recovered: bool = False
 
     @property
     def signed_size(self) -> Decimal:

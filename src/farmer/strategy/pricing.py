@@ -70,6 +70,28 @@ class BasisTracker:
         return abs(self.last - self.value) / BPS
 
 
+def mid_excluding_own(book: OrderBook, side: Side | None, price: Decimal | None, size: Decimal) -> Decimal | None:
+    """Book mid without our own resting order (``size`` at ``price`` on ``side``).
+
+    Our post-only quote usually sits at the touch; counting it would pull the mid (and a basis estimate built
+    from it) toward our own price. Only the best level on our side can be affected: its size is reduced by ours
+    and, if nothing else rests there, the next level is the real touch.
+    """
+    if side is None or price is None or size <= 0 or not book.bids or not book.asks:
+        return book.mid
+    levels = book.bids if side is Side.BUY else book.asks
+    best = None
+    for lv in levels:
+        if lv.price == price and lv.size <= size:
+            continue  # only us at this level
+        best = lv.price
+        break
+    if best is None:
+        return book.mid
+    bid, ask = (best, book.asks[0].price) if side is Side.BUY else (book.bids[0].price, best)
+    return (bid + ask) / 2
+
+
 def pair_step(maker: MarketInfo, taker: MarketInfo) -> Decimal:
     """Size increment valid on both venues."""
     return common_step(maker.step_size, taker.step_size)

@@ -126,3 +126,21 @@ def test_basis_tracker():
     assert abs(bt.value - D("-0.0005")) < D("0.000001")
     assert bt.warmed_up(5)
     assert bt.deviation_bps() > 0
+
+
+def test_mid_excluding_own_quote():
+    from farmer.models import BookLevel, OrderBook
+    from farmer.strategy.pricing import mid_excluding_own
+
+    def book(bids, asks):
+        return OrderBook("arcus", "BTC", bids=[BookLevel(D(p), D(s)) for p, s in bids],
+                         asks=[BookLevel(D(p), D(s)) for p, s in asks])
+
+    b = book([("100.5", "1"), ("100", "2")], [("101", "1")])
+    assert mid_excluding_own(b, Side.BUY, D("100.5"), D("1")) == D("100.5")  # only us at the touch -> (100+101)/2
+    assert mid_excluding_own(b, Side.BUY, D("100.5"), D("0.4")) == b.mid  # others rest there too
+    assert mid_excluding_own(b, Side.BUY, D("100"), D("2")) == b.mid  # we are behind the touch
+    s = book([("100", "1")], [("100.5", "0.3"), ("101", "1")])
+    assert mid_excluding_own(s, Side.SELL, D("100.5"), D("0.3")) == D("100.5")
+    assert mid_excluding_own(s, None, None, D("0")) == s.mid
+    assert mid_excluding_own(book([("100", "1")], [("101", "1")]), Side.BUY, D("100"), D("1")) == D("100.5")

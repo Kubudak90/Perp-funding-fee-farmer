@@ -66,7 +66,7 @@ tam döngü Arcus'ta yaklaşık $4.000, Lighter'da da yaklaşık $4.000 hacim ü
   - defter eskidi (`stale_book_s`),
   - fiyatlar iki borsa arasında ayrıştı (`max_divergence_bps`, `max_basis_dev_bps`),
   - hedgelenmemiş delta var (`max_unhedged_notional`),
-  - marj oranı yüksek (`max_margin_ratio`),
+  - marj oranı yüksek (`max_margin_ratio`) ya da serbest teminat yetersiz (`min_free_collateral_mult`),
   - RWA piyasası işlem saatleri dışında,
   - günlük zarar limiti aşıldı (`max_daily_loss`),
   - art arda çok hata oldu (devre kesici).
@@ -86,7 +86,10 @@ maliyet ≈ Lighter_etki(alış) + Lighter_etki(satış) - Arcus_spread + ters s
 
 - Büyük piyasalarda (BTC, ETH, SOL, SPY, QQQ, NVDA) gerçekçi maliyet **≈ 0,2 – 1,5 bps / döngü** olur, ters seçim
   dahil.
-- Bu, Arcus'taki her **$1M hacim için yaklaşık $20 – $60** demektir. Lighter'da da aynı hacim ücretsiz oluşur.
+- Bu, Arcus'taki her **$1M hacim için yaklaşık $10 – $75** demektir. Bir döngü tek bacak notional'ının 2 katı kadar
+  Arcus hacmi üretir; yani $1M Arcus hacmi ≈ $500k'lık döngü × 0,2–1,5 bps. Lighter'da da aynı hacim ücretsiz oluşur.
+- `farmer stats` bu değeri iki şekilde basar: Arcus (maker borsası) hacmi başına ve iki borsanın toplam hacmi başına.
+  İkincisi yaklaşık yarısıdır. Yukarıdaki bantla **Arcus hacmi başına** olanı karşılaştırın.
 - Lighter Standard taker gecikmesi ~300 ms'dir. Arcus dolumu ile hedge arasında fiyat kayabilir (ters seçim). Bu
   maliyet gerçek işlemde tahminin 1–3 katı olabilir.
 - Lighter'da en iyi fiyat seviyesindeki derinlik küçüktür (BTC'de bazen < $100). Büyük clip'ler defterin içine yürür ve
@@ -116,7 +119,10 @@ maliyet ≈ Lighter_etki(alış) + Lighter_etki(satış) - Arcus_spread + ters s
 **Yapısal baz (kripto).** Arcus fiyatları USD, Lighter'ın kripto endeksi ise fiilen USDT bazlıdır. Bu yüzden Arcus orta
 fiyatı Lighter'ın **~9–14 bps altındadır**.
 
-- Pozisyon açıkken paper ve live PnL tahmininde bu fark geçici bir "zarar" gibi görünür. Kapanışta geri gelir.
+- Çalışan botun PnL tahmini (periyodik rapor ve günlük zarar limiti) her bacağı kendi borsasının orta fiyatıyla
+  değerler. Bu yüzden hedgelenmiş girişteki baz farkı zarar (ya da kâr) gibi görünmez.
+- `farmer stats` ise açık net pozisyonu tek bir ortak (Arcus) fiyatla değerler. Orada fark, pozisyon kapanana kadar
+  geçici bir "zarar" gibi görünebilir.
 - Asıl risk USDT/USD kurunun oynamasıdır. 30 günlük aralık yaklaşık 12 bps'tir.
 
 ## ÖNEMLİ UYARILAR
@@ -142,9 +148,15 @@ fiyatı Lighter'ın **~9–14 bps altındadır**.
    fiyat hareketinde bir bacak kâr ederken diğeri zarar eder ve o borsadaki teminat yetmezse **likide olabilir**.
    - Her iki borsada da yeterli teminat tutun.
    - **Düşük kaldıraç** kullanın (2–5x).
-   - Marj oranını izleyin: `farmer status`, Telegram raporları. Risk yöneticisi `max_margin_ratio` üstünde yeni
-     pozisyon açmaz, `reduce_margin_ratio` üstünde pozisyonu kapatır.
-   - Teminatı düzenli olarak dengeleyin. Bot borsalar arasında para transferi yapmaz.
+   - Marj oranını (bakım marjı / özsermaye; 1,0 = likidasyon) izleyin: `farmer status`, Telegram raporları.
+   - Risk yöneticisi `max_margin_ratio` (0,25) üstünde yeni pozisyon açmaz. Serbest teminat bir clip'in başlangıç
+     marjını (`clip / kaldıraç × min_free_collateral_mult`) karşılamıyorsa da açmaz. Bu kontrol iki borsada da
+     yapılır, böylece hedge bacağı marj yetersizliğinden reddedilmez.
+   - `reduce_margin_ratio` (0,4; özsermaye < 2,5 × bakım marjı) üstünde bot durur (halt) ve tüm çiftlerin iki
+     bacağını reduce-only taker (IOC) emirleriyle kapatır. Oran yüksek kaldıkça kapatma yeniden denenir. Tekrar işlem
+     için botu yeniden başlatın.
+   - Teminatı düzenli olarak dengeleyin. Bot borsalar arasında para transferi yapmaz. İki borsadaki özsermaye
+     `max_equity_divergence_frac` (%30) oranından fazla ayrışırsa uyarı (log + Telegram) gelir.
 6. **USDT/USD bazı (kripto).** Lighter'ın kripto endeksi USDT bazlıdır. USDT'nin USD'den sapması iki bacak arasında PnL
    farkı yaratır.
 7. **RWA (hisse/ETF) piyasaları.**
@@ -191,6 +203,9 @@ Komut, `.env` dosyasına yapıştırılacak satırları basar (`ARCUS_ADDRESS=..
 `LIGHTER_ACCOUNT_INDEX=...` gibi).
 
 - **Üretilen API özel anahtarı yalnızca bir kez gösterilir.** Hemen `.env` dosyasına kaydedin.
+- Kayıt gönderildi ama onayı beklenirken zaman aşımı olduysa anahtar yine de `NOT confirmed` uyarısıyla basılır
+  (kayıt sonradan geçerli olabilir). `farmer status` ile doğrulayın; kayıt olmadıysa anahtarı atın.
+- Çalışan botun kullandığı Lighter anahtar yuvası (`LIGHTER_API_KEY_INDEX`) `--force` olmadan değiştirilmez.
 - `--generate-only` yalnızca yerelde anahtar çifti üretir, ağa bağlanmaz.
 - Arcus'ta aynı isimle yeniden anahtar oluşturmak eski anahtarı iptal eder. Varsayılan isim her anahtar için
   benzersizdir (`farmer-<pub8>`).
@@ -229,6 +244,16 @@ Komut, `.env` dosyasına yapıştırılacak satırları basar (`ARCUS_ADDRESS=..
    - OPENING → HOLDING → CLOSING geçişleri.
 
    Sakin piyasada dolum az olabilir.
+
+   Paper dolum modeli muhafazakârdır:
+   - Görünen bir defter seviyesi bir kez tüketilir. Aynı seviye yeniden yayınlansa da (heartbeat, başka seviyede
+     değişiklik) tekrar dolum olmaz; seviye büyürse yalnızca artan kısım yeni likiditedir. Bir seviye kaybolup
+     1 saniye içinde aynı büyüklükle geri gelirse (ya da aynı büyüklük yan fiyata taşınırsa) aynı emir sayılır.
+   - Dolumlar defter bazlıdır: kotasyonumuz gerçek defterde görünmediği için spread içinde (negatif
+     `min_edge_bps`) verilen kotasyonlar canlıya göre daha kolay dolar.
+   - Hedge borsasının istek bütçesi azalınca (`strategy.min_taker_budget`) kotasyonlar geçici olarak çekilir.
+   - Lighter Standard bütçesi (ortak 60 istek/dk, 40 tx/dk, `tx_budget_wait_s`) taklit edilir
+     (`paper.emulate_rate_limits`). Bütçe dolunca hedge'ler bekler ya da reddedilir, canlıdaki gibi.
 3. **Küçük canlı deneme.** `config.yaml` içinde `target_notional: 200` ve `order_notional: 100` gibi küçük değerler
    kullanın. İki borsada da biraz teminat olsun.
    ```bash
@@ -237,8 +262,9 @@ Komut, `.env` dosyasına yapıştırılacak satırları basar (`ARCUS_ADDRESS=..
    ```
 4. Birkaç gün izleyin (`farmer stats`, Telegram), sonra boyutları **kademeli** artırın.
 
-Botu durdurmak için **Ctrl+C** veya `kill -TERM <pid>` kullanın. Bot kotasyonları iptal eder, açık deltayı hedge eder
-ve kapanır.
+Botu durdurmak için **Ctrl+C** veya `kill -TERM <pid>` kullanın (SIGHUP da aynı şekilde işlenir; `nohup` ile yok
+sayılmışsa dokunulmaz). Bot kotasyonları iptal eder, açık deltayı hedge eder ve kapanır. `farmer close-all` sinyalle
+yarıda kesilirse de aynı güvenli kapanışı yapar ve hata koduyla çıkar.
 
 - İkinci sinyal yalnızca uyarı verir.
 - Üçüncü sinyal hemen çıkar. Arcus'taki emirler bu durumda dead man's switch ile iptal olur.
@@ -250,8 +276,8 @@ ve kapanır.
 | `farmer scan [--top N] [--skipped]` | Halka açık tarama. Tüm örtüşen piyasalar listelenir, config'tekiler önce örneklenir. Lighter defterleri readonly websocket'ten alınır, 60 req/dk bütçesi harcanmaz. |
 | `farmer run [--paper\|--live] [--yes] [--duration SN]` | Motoru çalıştırır. `--live` için iki borsada anahtar ve `--yes` ya da `mode: live` gerekir. Paper verisi `data/farmer-paper.db`, canlı veri `data/farmer.db` dosyasına yazılır. |
 | `farmer status` | Bakiye, marj oranı, pozisyonlar, açık emirler ve çift başına delta. `UNHEDGED` işareti hedgelenmemiş delta demektir. Canlı anahtar gerekir. |
-| `farmer close-all [--taker] [--yes] [--timeout SN]` | Tüm çiftleri düzler. Varsayılan maker modudur (hedge'li post-only kapanış, ucuz ama yavaş). `--taker` iki bacakta da IOC ile hemen kapatır. Çalışan bir bot varken çalışmaz (kilit dosyası). |
-| `farmer stats [--since SAAT] [--paper\|--live] [--no-marks]` | Veritabanından rapor: borsa başına hacim (maker/taker), ücret, funding, rol bazında dolumlar, PnL tahmini ve $1M hacim başına PnL. `--since 0` tüm zamanlar demektir. |
+| `farmer close-all [--taker] [--yes] [--timeout SN]` | Tüm çiftleri düzler. Varsayılan maker modudur (hedge'li post-only kapanış, ucuz ama yavaş). `--taker` iki bacakta da IOC ile hemen kapatır. Günlük zarar limiti close-all'ı durdurmaz; risk yöneticisi başka bir sebeple durursa maker kapanış kendiliğinden taker moduna geçer. Eşlenemeyen bir çiftteki pozisyon (ör. Lighter `force_reduce_only` piyasası, fiyat kontrolü başarısız) `UNMANAGED` olarak listelenir ve komut hata koduyla çıkar: bu pozisyonu borsada elle kapatın. Çalışan bir bot varken çalışmaz (kilit dosyası). |
+| `farmer stats [--since SAAT] [--paper\|--live] [--no-marks]` | Veritabanından rapor: borsa başına hacim (maker/taker), ücret, funding, rol bazında dolumlar, PnL tahmini ve $1M hacim başına PnL (Arcus hacmi başına ve iki borsanın toplam hacmi başına). `--since 0` tüm zamanlar demektir. |
 | `farmer keygen arcus\|lighter` | API anahtarı üretir ve kaydeder (yukarıya bakın). |
 
 Ortak seçenekler:
@@ -281,7 +307,9 @@ Tüm alanlar Türkçe açıklamalarıyla `config.example.yaml` içindedir. En ö
 | `strategy.direction_mode` | auto | `long_maker` / `short_maker` yönü sabitler. |
 | `risk.max_unhedged_notional` | 150 | Bu USD deltanın üstünde kotasyon durur. |
 | `risk.max_daily_loss` | 100 | Aşılırsa bot durur (halt). Yeniden başlatana kadar kotasyon vermez. |
-| `risk.max_margin_ratio` / `reduce_margin_ratio` | 0.6 / 0.8 | Sırasıyla yeni pozisyon açmayı durdurur / pozisyonu kapatır. |
+| `risk.max_margin_ratio` / `reduce_margin_ratio` | 0.25 / 0.4 | Bakım marjı / özsermaye. Sırasıyla yeni pozisyon açmayı durdurur / botu durdurup tüm pozisyonları taker ile kapatır. |
+| `risk.min_free_collateral_mult` | 1.5 | Yeni pozisyon için her borsada serbest teminat >= clip / kaldıraç × bu değer. |
+| `risk.max_equity_divergence_frac` | 0.3 | İki borsanın özsermayesi bu oranda ayrışırsa uyarı (teminatı dengeleyin). |
 | `risk.close_on_exit` | false | `true`: kapanışta iki bacak da taker ile kapatılır. |
 | `arcus.dead_mans_switch_s` | 60 | Bot ölürse Arcus emirleri bu kadar saniye sonra iptal edilir. |
 | `lighter.max_requests_per_minute` / `read_reserve` | 55 / 25 | Standard 60/dk limitini korur. |
@@ -303,6 +331,10 @@ yazılmaz.
   - her `notify_every` raporda bir özet (varsayılan saatlik).
 - `farmer stats` geçmişi, `farmer status` anlık hesap durumunu gösterir.
 - Tüm dolumlar, funding ödemeleri ve olaylar (faz geçişleri, yön değişimleri) SQLite veritabanına yazılır.
+  Saatlik özet satırları sayesinde rapor sorguları veritabanı büyüdükçe yavaşlamaz ve ayrı bir iş parçacığında
+  çalışır (event loop'u bloklamaz).
+- Funding ödemeleri her `funding_collect_s` saniyede son `funding_lookback_s` (6 sa) için yeniden istenir.
+  Websocket'in kaçırdığı bir saat sonradan tamamlanır; tekrar gelen satırlar veritabanında elenir.
 
 Uzun süreli çalıştırma için bir süreç yöneticisi kullanın. systemd örneği:
 

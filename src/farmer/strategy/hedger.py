@@ -6,11 +6,16 @@ re-anchored to venue truth by reconciles. In-flight hedges are keyed by our clie
 execute) - the venue positions are read instead.
 
 Hedging is risk-reducing and therefore ALWAYS runs, also while quoting is paused or the risk manager halted.
+
+Fills replayed by an adapter after a private-stream reconnect (``Fill.recovered``) are never added blindly: a
+reconcile during the outage may already have adopted them into the position. They trigger a two-read reconcile
+instead (unless they belong to one of our in-flight orders), and so does every private-stream resync.
 """
 
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import random
 import time
@@ -20,7 +25,7 @@ from typing import Any, Callable
 
 from farmer.config import RiskConfig, StrategyConfig
 from farmer.exchanges.base import Exchange
-from farmer.models import ZERO, Fill, MarketInfo, Order, OrderBook, OrderStatus, Side
+from farmer.models import ZERO, Fill, MarketInfo, Order, OrderBook, OrderResult, OrderStatus, Side
 from farmer.strategy.mapping import PairSpec
 from farmer.strategy.pricing import worst_taker_price
 from farmer.utils.ids import new_client_id
@@ -29,6 +34,8 @@ log = logging.getLogger("farmer.hedger")
 
 TAKER = "taker"
 MAKER = "maker"
+# venue cancel reasons of an unfilled IOC that a plain retry cannot fix (Lighter: canceled-margin-not-allowed, ...)
+_PERMANENT_CANCEL_HINTS = ("margin-not-allowed", "invalid-balance", "position-not-allowed")
 
 
 def _sign(x: Decimal) -> int:
@@ -42,6 +49,28 @@ def min_trade_size(m: MarketInfo, price: Decimal | None) -> Decimal:
         need = max(need, m.min_notional / price)
     n = (need / m.step_size).to_integral_value(rounding="ROUND_CEILING")
     return n * m.step_size
+
+
+def private_stream_ok(ex: Exchange) -> tuple[bool, str]:
+    """Health of ``ex``'s private (orders / fills) stream; True when the adapter offers no such hint.
+
+    Adapters may expose ``private_ok() -> (bool, reason)`` or ``private_stream_ok()`` /
+    ``fill_stream_healthy() -> bool``. A failing check counts as unhealthy.
+    """
+    for name in ("private_ok", "private_stream_ok", "fill_stream_healthy"):
+        fn = getattr(ex, name, None)
+        if not callable(fn):
+            continue
+        try:
+            r = fn()
+        except Exception as exc:
+            return False, f"{ex.name} private stream check failed: {exc!r}"
+        if isinstance(r, tuple):
+            ok, why = bool(r[0]), str(r[1] or "") if len(r) > 1 else ""
+        else:
+            ok, why = bool(r), ""
+        return ok, ("" if ok else (why or f"{ex.name} private stream down"))
+    return True, ""
 
 
 @dataclass
@@ -58,6 +87,9 @@ class _Inflight:
     sent_ts: float = field(default_factory=time.time)
     unknown: bool = False  # outcome of the send is unknown (transport error / UNKNOWN status)
     terminal: bool = False  # venue reported the order finished; only its unseen fills remain in flight
+    terminal_ts: float = 0.0
+    sending: bool = False  # place_market has not returned yet (never expired / dropped meanwhile)
+    finish_err: tuple[bool, str, str] | None = None  # failure seen by the order listener while sending
 
 
 class Hedger:
@@ -91,11 +123,20 @@ class Hedger:
         self.io_timeout_s = float(scfg.hedge_io_timeout_s)
         self.fill_wait_s = float(scfg.hedge_fill_wait_s)  # wait for fills a terminal update announced
         self.reconcile_retry_s = float(scfg.reconcile_retry_s)
+        # an in-flight entry whose send is still pending is never expired; give up on that after this long
+        self.send_stuck_s = 4 * self.io_timeout_s
+        # a venue-reported fill the position reads do not show yet is waited for at most this long
+        self.terminal_max_s = max(3 * self.timeout_s, self.fill_wait_s)
+        # after a maker-leg emergency flatten: no quoting for this long; halt after N emergencies per hour
+        self.emergency_cooldown_s = float(rcfg.emergency_cooldown_s)
+        self.max_emergencies_per_hour = int(rcfg.max_emergencies_per_hour)
 
         self.maker_pos = ZERO
         self.taker_pos = ZERO
         self._last_px: Decimal | None = None
         self._inflight: dict[str, _Inflight] = {}  # both legs, keyed by client id
+        # orders whose venue-reported fills were adopted from a position read before their fill frames arrived
+        self._settled_cids: collections.OrderedDict[str, None] = collections.OrderedDict()
         self._wake = asyncio.Event()
         self._fill_evt = asyncio.Event()
         self._stop = asyncio.Event()
@@ -118,6 +159,9 @@ class Hedger:
         self.escalated = False
         self._escalated_reason: str | None = None
         self._last_emergency = 0.0
+        self._emergency_ts: collections.deque[float] = collections.deque()
+        self._emergency_block_until = 0.0
+        self._stream_ok: dict[str, bool] = {}
         self._halt_requested = False
         self.close_mode = False  # only reduce-only hedges (close_all taker mode)
         self._running = False
@@ -186,10 +230,16 @@ class Hedger:
     def hedge_min(self, price: Decimal | None = None) -> Decimal:
         return min_trade_size(self.pair.taker_market, price if price is not None else self.ref_price())
 
-    def is_flat(self) -> bool:
-        """Both legs below their venue minimums and nothing in flight."""
+    def is_flat(self, maker_min: Decimal | None = None) -> bool:
+        """Both legs below their venue minimums and nothing in flight.
+
+        ``maker_min`` raises the maker-leg dust threshold (e.g. to the pair minimum, below which a forced-close
+        trader stops quoting)."""
         px = self.ref_price()
-        return (not self._inflight and abs(self.maker_pos) < min_trade_size(self.pair.maker_market, px)
+        mmin = min_trade_size(self.pair.maker_market, px)
+        if maker_min is not None:
+            mmin = max(mmin, maker_min)
+        return (not self._inflight and abs(self.maker_pos) < mmin
                 and abs(self.taker_pos) < min_trade_size(self.pair.taker_market, px))
 
     def is_hedged(self) -> bool:
@@ -200,11 +250,42 @@ class Hedger:
         """Reason the trader must not quote (None = ok)."""
         if self.escalated:
             return f"hedger escalated: {self._escalated_reason}"
+        left = self._emergency_block_until - self.clock()
+        if left > 0:
+            return f"hedger: cooling down after an emergency flatten ({left:.0f}s left)"
         return None
 
     # ------------------------------------------------------------------ listeners
+    def _on_recovered_fill(self, f: Fill, leg: str) -> bool:
+        """A fill replayed after a private-stream reconnect (``Fill.recovered``). A reconcile during the outage
+        may already have adopted it into the position (venue reads include it): never add it blindly, let a
+        two-read reconcile set the position. An in-flight order of ours cannot have been adopted (reconcile
+        needs an empty in-flight set or drops expired entries first), so its fills are applied as usual.
+        Late fills of an order whose venue-reported fills were adopted on expiry are treated the same way.
+        Returns True when handled here."""
+        settled = bool(f.client_id) and f.client_id in self._settled_cids
+        if not settled and not f.recovered:
+            return False
+        e = self._inflight.get(f.client_id or "")
+        if e is not None and e.leg == leg:
+            return False
+        if leg == MAKER:
+            self.stats["maker_fills"] += 1
+            self.stats["maker_volume"] += f.notional
+            self._record(f, "maker" if f.is_maker is not False else "manual")
+        else:
+            self.stats["hedge_fills"] += 1
+            self.stats["hedge_volume"] += f.notional
+            self._record(f, "hedge")
+        log.warning("%s: %s %s fill %s %s @ %s (already in an adopted position?) -> reconcile with the venue",
+                    self.symbol, "late" if settled else "recovered", leg, f.side.value, f.size, f.price)
+        self.request_reconcile("recovered fills after reconnect")
+        return True
+
     def _on_maker_fill(self, f: Fill) -> None:
         if f.symbol != self.ms:
+            return
+        if self._on_recovered_fill(f, MAKER):
             return
         self.maker_pos += f.signed_size
         self._last_px = f.price
@@ -226,6 +307,8 @@ class Hedger:
 
     def _on_taker_fill(self, f: Fill) -> None:
         if f.symbol != self.ts:
+            return
+        if self._on_recovered_fill(f, TAKER):
             return
         self.taker_pos += f.signed_size
         self._last_px = self._last_px or f.price
@@ -286,16 +369,23 @@ class Hedger:
                 log.info("%s %s order %s ended %s: %s filled, %s not yet seen as fills -> waiting", self.symbol,
                          e.leg, e.client_id, o.status.value, o.filled, missing)
                 e.terminal = True
+                e.terminal_ts = self.clock()
                 e.remaining = missing * e.side.sign
-                e.deadline = max(e.deadline, self.clock() + self.fill_wait_s)
+                e.deadline = max(e.deadline, e.terminal_ts + self.fill_wait_s)
                 return
         self._inflight.pop(e.client_id, None)
         if o is None:
             return
         if o.filled <= 0 and e.filled <= 0:
             reason = o.error or o.status.value
-            self._note_failure(retryable=o.status is not OrderStatus.REJECTED, err=f"{e.leg} {e.client_id}: {reason}",
-                               venue=self.taker.name if e.leg == TAKER else self.maker.name)
+            # a cancel for lack of margin / balance repeats on every retry: count it toward the circuit breaker
+            permanent = o.status is OrderStatus.REJECTED or any(h in reason for h in _PERMANENT_CANCEL_HINTS)
+            failure = (not permanent, f"{e.leg} {e.client_id}: {reason}",
+                       self.taker.name if e.leg == TAKER else self.maker.name)
+            if e.sending:  # the send call is still pending: it accounts the failure once (with its retryable flag)
+                e.finish_err = failure
+                return
+            self._note_failure(retryable=failure[0], err=failure[1], venue=failure[2])
 
     # ------------------------------------------------------------------ loop
     async def run(self) -> None:
@@ -343,12 +433,29 @@ class Hedger:
                 pass
         self._wake.clear()
 
+    def _poll_streams(self) -> None:
+        """Re-confirm positions after a private stream comes back (fills during the gap are replayed or lost)."""
+        for leg, ex in ((MAKER, self.maker), (TAKER, self.taker)):
+            ok, why = private_stream_ok(ex)
+            prev = self._stream_ok.get(leg)
+            self._stream_ok[leg] = ok
+            if prev is True and not ok:
+                log.warning("%s: %s private stream unhealthy (%s)", self.symbol, ex.name, why)
+            elif prev is False and ok:
+                log.info("%s: %s private stream back -> reconcile positions", self.symbol, ex.name)
+                self.request_reconcile(f"{ex.name} private stream resynced")
+
+    def _send_pending(self, e: _Inflight, now: float) -> bool:
+        """True while the place call of ``e`` has not returned (it may still be queued for the venue)."""
+        return e.sending and now - e.sent_ts < self.send_stuck_s
+
     async def step(self) -> None:
         """One evaluation: expiry/reconcile, escalation, hedge, emergency, periodic reconcile."""
+        self._poll_streams()
         now = self.clock()
         hold = False
         if self._inflight:
-            expired = [e for e in self._inflight.values() if e.deadline <= now]
+            expired = [e for e in self._inflight.values() if e.deadline <= now and not self._send_pending(e, now)]
             if expired and len(expired) == len(self._inflight) and now >= self._reconcile_retry_at:
                 log.warning("%s: %d in-flight order(s) expired without terminal update/fills -> reconcile",
                             self.symbol, len(expired))
@@ -478,44 +585,105 @@ class Hedger:
                 self._note_failure(retryable=True, err="no taker book")
                 return
             mult = Decimal(2) if self.escalated else Decimal(1)
-            worst = worst_taker_price(side, book, size, self.pair.cfg.max_slippage_bps * mult, tm)
+            slip = self.pair.cfg.max_slippage_bps * mult
+            worst = worst_taker_price(side, book, size, slip, tm)
             if worst is None:
                 self._note_failure(retryable=True, err="taker book has no touch")
                 return
+            if not reduce_only and not tm.is_tradeable_size(size, worst):
+                # the venue/adapter checks min notional at the protective (worst) price: a SELL just above the
+                # minimum at mid fails there on every retry -> over-hedge by the few steps needed (dust) instead
+                bumped = self._cap(min_trade_size(tm, worst), tm, px)
+                if bumped > size and bumped - abs(q) < self.hedge_min(px):
+                    size = bumped
+                    worst = worst_taker_price(side, book, size, slip, tm)
+                if worst is None or not tm.is_tradeable_size(size, worst):
+                    self._warn("min-worst", f"{self.symbol}: hedge {side.value} {size} below the taker minimum at "
+                                            f"its worst price {worst}; treating delta {delta} as dust")
+                    return
             await self._send(TAKER, side, size, worst, reduce_only=reduce_only, role="hedge")
 
     async def _send(self, leg: str, side: Side, size: Decimal, worst: Decimal, *, reduce_only: bool,
                     role: str) -> bool:
-        """Register in-flight BEFORE sending (fills may arrive before the call returns), then place."""
+        """Register in-flight BEFORE sending (fills may arrive before the call returns), then place.
+
+        The expiry deadline counts from the RETURN of the place call (venue acceptance), not from registration:
+        a send can queue behind the venue's rate budget for longer than ``hedge_timeout_s``. The call is bounded
+        by ``hedge_io_timeout_s`` but never cancelled (shielded): on timeout the entry stays in flight (outcome
+        unknown) and the late result is applied when it arrives; until then the entry is never expired.
+        """
         ex, sym = (self.taker, self.ts) if leg == TAKER else (self.maker, self.ms)
         cid = new_client_id("fh" if leg == TAKER else "fe")
         now = self.clock()
         e = _Inflight(client_id=cid, leg=leg, side=side, size=size, remaining=size * side.sign,
-                      deadline=now + self.timeout_s, role=role, reduce_only=reduce_only, sent_ts=now)
+                      deadline=now + self.timeout_s, role=role, reduce_only=reduce_only, sent_ts=now, sending=True)
         self._inflight[cid] = e
         self.stats["hedges_sent"] += 1
         log.info("%s %s %s %s %s worst=%s reduce_only=%s (delta before %s)", self.symbol, role, ex.name, side.value,
                  size, worst, reduce_only, self.delta - e.remaining)
+        task = asyncio.ensure_future(ex.place_market(sym, side, size, worst_price=worst, reduce_only=reduce_only,
+                                                     client_id=cid))
         try:
-            res = await ex.place_market(sym, side, size, worst_price=worst, reduce_only=reduce_only, client_id=cid)
-        except asyncio.CancelledError:
+            res = await asyncio.wait_for(asyncio.shield(task), self.io_timeout_s if self.io_timeout_s > 0 else None)
+        except asyncio.CancelledError:  # e.g. shutdown: the venue call itself is not interrupted
             e.unknown = True
+            task.add_done_callback(lambda t, e=e, ex=ex: self._late_send_result(e, ex, t))
             raise
+        except asyncio.TimeoutError:
+            e.unknown = True  # still sending: may execute any time -> stays in flight, never re-sent blindly
+            task.add_done_callback(lambda t, e=e, ex=ex: self._late_send_result(e, ex, t))
+            self._note_failure(retryable=True, venue=ex.name,
+                               err=f"{ex.name} place_market still pending after {self.io_timeout_s:.0f}s")
+            return False
         except Exception as exc:  # outcome unknown: keep in flight until it expires, then reconcile
+            e.sending = False
             e.unknown = True
+            self._restart_deadline(e)
             self._note_failure(retryable=True, err=f"{ex.name} place_market raised {exc!r}", venue=ex.name)
             return False
+        return self._on_send_result(e, ex, res)
+
+    def _restart_deadline(self, e: _Inflight) -> None:
+        if not e.terminal and self._inflight.get(e.client_id) is e:
+            e.deadline = max(e.deadline, self.clock() + self.timeout_s)
+
+    def _late_send_result(self, e: _Inflight, ex: Exchange, task: asyncio.Future) -> None:
+        """Done-callback of a place call that outlived ``_send`` (timeout / cancellation)."""
+        e.sending = False
+        try:
+            if task.cancelled():
+                raise asyncio.CancelledError()
+            res = task.result()
+        except BaseException as exc:
+            e.unknown = True
+            self._restart_deadline(e)
+            log.warning("%s late %s place_market %s ended with %r (outcome unknown)", self.symbol, ex.name,
+                        e.client_id, exc)
+            self._wake.set()
+            return
+        log.info("%s late %s place_market result for %s: ok=%s %s", self.symbol, ex.name, e.client_id, res.ok,
+                 res.error or "")
+        try:
+            self._on_send_result(e, ex, res)
+        finally:
+            self._wake.set()
+
+    def _on_send_result(self, e: _Inflight, ex: Exchange, res: OrderResult) -> bool:
+        e.sending = False
         order = res.order
-        if order is not None and order.client_id != cid and cid in self._inflight:
-            self._inflight.pop(cid)
+        if order is not None and order.client_id != e.client_id and self._inflight.get(e.client_id) is e:
+            self._inflight.pop(e.client_id)
             e.client_id = order.client_id
             self._inflight[order.client_id] = e
         if not res.ok:
             if order is not None and order.status is OrderStatus.UNKNOWN:
                 e.unknown = True  # e.g. transport error after send: may still execute
+                self._restart_deadline(e)
                 self._note_failure(retryable=True, err=res.error or "unknown outcome", venue=ex.name)
                 return False
-            self._inflight.pop(e.client_id, None)
+            if self._inflight.get(e.client_id) is e:
+                self._inflight.pop(e.client_id)
+            e.finish_err = None  # counted once below (the adapter's retryable flag wins)
             self._note_failure(retryable=res.retryable, err=f"{ex.name}: {res.error}", venue=ex.name)
             return False
         if self.risk is not None:
@@ -523,15 +691,22 @@ class Hedger:
                 self.risk.record_success(ex.name)
             except Exception:  # pragma: no cover
                 pass
+        if e.finish_err is not None:  # the order listener finished it without any fill while we were sending
+            retryable, err, venue = e.finish_err
+            e.finish_err = None
+            self._note_failure(retryable=retryable, err=err, venue=venue)
+            return True
+        self._restart_deadline(e)  # the timeout counts from venue acceptance
         if order is not None:
             if order.status is OrderStatus.UNKNOWN:
                 e.unknown = True
-            elif order.status.is_terminal and e.client_id in self._inflight and not e.terminal:
+            elif order.status.is_terminal and self._inflight.get(e.client_id) is e and not e.terminal:
                 self._finish(e, order)
         return True
 
     # ------------------------------------------------------------------ emergency
     async def _maybe_emergency(self, now: float) -> None:
+        self._update_escalation(now)  # fills may have resolved the delta while a hedge was being sent
         since = self._unhedged_since
         timeout = float(self.rcfg.unhedged_timeout_s)
         if since is None or now - since <= 3 * timeout or now - self._last_emergency < timeout:
@@ -567,6 +742,7 @@ class Hedger:
                 self._notify(msg)
                 self._event("emergency_flatten", unhedged=unhedged, size=size, side=side.value)
                 await self._send(MAKER, side, size, worst, reduce_only=True, role="emergency")
+                self._after_emergency()
             return
         msg = (f"EMERGENCY {self.symbol}: unhedged {unhedged} for {now - since:.0f}s cannot be flattened on "
                f"{self.maker.name} (excess is on the {self.taker.name} leg or emergency_flatten is off); "
@@ -579,6 +755,29 @@ class Hedger:
             if self.risk is not None:
                 try:
                     self.risk.halt(f"{self.symbol}: unhedged delta {unhedged} persists")
+                except Exception:  # pragma: no cover
+                    log.exception("risk.halt failed")
+
+    def _after_emergency(self) -> None:
+        """Latch quoting off after a maker-leg flatten (the hedge venue is failing: re-opening would just repeat
+        fill -> naked -> paid flatten); halt after ``max_emergencies_per_hour``."""
+        now = self.clock()
+        self._emergency_block_until = now + self.emergency_cooldown_s
+        self._emergency_ts.append(now)
+        while self._emergency_ts and now - self._emergency_ts[0] > 3600.0:
+            self._emergency_ts.popleft()
+        n = len(self._emergency_ts)
+        log.warning("%s: quoting paused for %.0fs after emergency flatten (%d in the last hour)", self.symbol,
+                    self.emergency_cooldown_s, n)
+        if 0 < self.max_emergencies_per_hour <= n and not self._halt_requested:
+            self._halt_requested = True
+            msg = (f"{self.symbol}: {n} emergency flattens within an hour (hedge venue keeps failing: "
+                   f"{self._last_error}); halting")
+            log.critical(msg)
+            self._notify(msg)
+            if self.risk is not None:
+                try:
+                    self.risk.halt(msg)
                 except Exception:  # pragma: no cover
                     log.exception("risk.halt failed")
 
@@ -615,13 +814,22 @@ class Hedger:
                     log.error("%s flatten send failed: %r", self.symbol, r)
             return True
 
-    async def flush(self, timeout_s: float) -> bool:
-        """Wait until hedged (no in-flight, residual below minimum) or timeout. Returns True if hedged."""
-        deadline = time.monotonic() + max(0.0, timeout_s)
+    async def flush(self, timeout_s: float, settle_s: float = 0.0) -> bool:
+        """Wait until hedged (no in-flight, residual below minimum) or timeout. Returns True if hedged.
+
+        ``settle_s`` > 0 additionally requires that long without a maker fill (and since the call), so fills
+        still in transit (e.g. racing a quote cancel) are hedged before the caller stops the hedger."""
+        start = time.monotonic()
+        deadline = start + max(0.0, timeout_s)
+        t0 = self.clock()
         while True:
-            if self.is_hedged():
+            if self.is_hedged() and (settle_s <= 0 or (time.monotonic() - start >= settle_s
+                                                        and self.clock() - max(t0, self._last_maker_fill)
+                                                        >= settle_s)):
                 return True
             if time.monotonic() >= deadline:
+                if self.is_hedged():  # hedged, only the settle period was cut short
+                    return True
                 log.warning("%s hedger flush timed out: delta %s inflight %s", self.symbol, self.delta, self.inflight)
                 return False
             if not self._running:  # nobody drives the loop: do it here
@@ -672,6 +880,7 @@ class Hedger:
             r1 = await self._read_positions()
             if r1 is None:
                 return False
+            adopted: set[str] = set()
             if r1 != (self.maker_pos, self.taker_pos):
                 self._fill_evt.clear()
                 try:  # give in-transit fills time to arrive; abort on a new fill
@@ -691,15 +900,16 @@ class Hedger:
                         log.info("%s reconcile (%s): %s position unstable (%s -> %s); retry later", self.symbol,
                                  reason, name, v1, v2)
                         return False
-                for i, (name, v2, loc) in enumerate(((self.maker.name, r2[0], local[0]),
-                                                     (self.taker.name, r2[1], local[1]))):
+                for leg, name, v2, loc in ((MAKER, self.maker.name, r2[0], local[0]),
+                                           (TAKER, self.taker.name, r2[1], local[1])):
                     if v2 == loc:
                         continue
                     log.warning("%s reconcile (%s): %s position local %s != venue %s -> adopting venue", self.symbol,
                                 reason, name, loc, v2)
                     self.stats["adoptions"] += 1
                     self._event("position_adopted", venue=name, local=loc, venue_pos=v2, reason=reason)
-                    if i == 0:
+                    adopted.add(leg)
+                    if leg == MAKER:
                         self.maker_pos = v2
                     else:
                         self.taker_pos = v2
@@ -707,10 +917,22 @@ class Hedger:
             if drop_inflight:
                 now = self.clock()
                 for cid, e in list(self._inflight.items()):
-                    if e.deadline <= now:
-                        log.warning("%s: dropping expired in-flight %s %s %s (venue positions adopted)", self.symbol,
-                                    e.leg, e.side.value, e.size)
-                        self._inflight.pop(cid, None)
+                    if e.deadline > now or self._send_pending(e, now):
+                        continue
+                    if e.terminal and e.leg not in adopted and now - e.terminal_ts < self.terminal_max_s:
+                        # the venue reported fills that neither arrived nor show in the position read (lagging
+                        # account stream): dropping would hedge them a second time -> keep waiting (bounded)
+                        e.deadline = min(now + self.timeout_s, e.terminal_ts + self.terminal_max_s)
+                        log.info("%s: %s order %s reported %s filled but the venue position does not show it "
+                                 "yet; waiting", self.symbol, e.leg, e.client_id, e.remaining)
+                        continue
+                    log.warning("%s: dropping expired in-flight %s %s %s (venue positions adopted)", self.symbol,
+                                e.leg, e.side.value, e.size)
+                    self._inflight.pop(cid, None)
+                    if e.terminal and e.leg in adopted:  # its reported fills are in the adopted position
+                        self._settled_cids[e.client_id] = None
+                        while len(self._settled_cids) > 200:
+                            self._settled_cids.popitem(last=False)
             self._reconcile_requested = None
             self._wake.set()
             return True

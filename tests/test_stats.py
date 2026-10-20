@@ -162,11 +162,38 @@ async def test_collect_funding_since_last_and_dedupe():
     assert a.since_calls == [rep.start_ts]
     assert no_creds.since_calls == []
     assert store.summary(0)["arcus"].funding == D("0.15")
-    # next round starts at the last stored ts; re-delivered rows are deduped by the store
+    # next round re-requests the lookback window (clamped to the first run's start); re-delivered rows are
+    # deduped by the store and not counted
     a.payments.append(FundingPayment("arcus", "BTC", D("0.3"), ts=now))
-    await rep.collect_funding()
-    assert a.since_calls[-1] == now - 3600
+    assert await rep.collect_funding() == 1
+    assert a.since_calls[-1] == rep.start_ts
     assert store.summary(0)["arcus"].funding == D("0.45")
+
+
+async def test_collect_funding_backfills_an_hour_missed_after_a_newer_row_was_stored():
+    """A payment the venue only delivers late (WS missed it, REST backfill skipped) is still stored once a newer
+    payment advanced the newest stored timestamp; payments before the bot's first run stay excluded."""
+    now = [1_800_000_000.0]
+    a = FundingVenue("arcus")
+    rep, store, _, _ = make_reporter(venues={"arcus": a}, clock=lambda: now[0])
+    rep.start_ts = now[0] - 3 * 3600
+    a.payments = [FundingPayment("arcus", "BTC", D("0.2"), ts=now[0] - 3600)]
+    assert await rep.collect_funding() == 1
+    now[0] += 3600
+    a.payments.append(FundingPayment("arcus", "BTC", D("0.3"), ts=now[0] - 3600))  # newest hour arrives first
+    assert await rep.collect_funding() == 1
+    # the venue now also reports the missed ETH payment of the earlier hour and an old pre-start one
+    a.payments += [FundingPayment("arcus", "ETH", D("-0.05"), ts=now[0] - 7200),
+                   FundingPayment("arcus", "ETH", D("9"), ts=rep.start_ts - 3600)]
+    now[0] += 300
+    assert await rep.collect_funding() == 1
+    assert a.since_calls[-1] < now[0] - 7200  # older than the newest stored row
+    assert store.summary(0, now[0] + 1)["arcus"].funding == D("0.45")
+    # a restart keeps the persisted floor of the first run (its downtime is backfilled, pre-start rows are not)
+    rep2 = StatsReporter(store, FakeNotifier(), dict, {"arcus": a}, clock=lambda: now[0])
+    rep2.start_ts = now[0]
+    assert await rep2.collect_funding() == 0
+    assert store.summary(0, now[0] + 1)["arcus"].funding == D("0.45")
 
 
 async def test_collect_funding_survives_venue_errors():
@@ -303,3 +330,46 @@ def test_marks_cover_venue_symbols_of_mapped_pairs():
     assert "no mark" not in text
     # -29.00 + 0.02921*1000 + 29.30 - 0.02925*1000 = 0.26
     assert "PnL est 24h +$0.26" in text
+
+
+def test_pnl_values_each_venue_leg_at_its_own_mid():
+    """maker SHORT on Arcus ~10 bps below Lighter: both legs at their own venue mid -> no phantom basis loss."""
+    status = {"maker_venue": "arcus", "taker_venue": "lighter",
+              "markets": {"BTC": {"symbol": "BTC", "maker_symbol": "BTC", "taker_symbol": "BTC",
+                                  "books": {"maker_mid": D("81918"), "taker_mid": D("82000")}}}}
+    now = time.time()
+    rep, store, _, _ = make_reporter(status=status)
+    store.record_fill(Fill("arcus", "BTC", Side.SELL, D("81918"), D("1"), is_maker=True, trade_id="a", ts=now), "maker")
+    store.record_fill(Fill("lighter", "BTC", Side.BUY, D("82000"), D("1"), is_maker=False, trade_id="l", ts=now),
+                      "hedge")
+    text = rep.render_report()
+    assert "PnL est 24h +$0.00 all +$0.00" in text  # common mark: -$82.00 of basis shown as a loss
+    summ = store.summary(0)
+    assert pnl_from_summary(summ, {"BTC": D("81959")}) == D("-82")
+    vm = {("arcus", "BTC"): D("81918"), ("lighter", "BTC"): D("82000")}
+    assert pnl_from_summary(summ, {"BTC": D("81959")}, vm) == 0
+    # a leg without its venue mark falls back to the common mark of the net base
+    assert pnl_from_summary(summ, {"BTC": D("81959")}, {("arcus", "BTC"): D("81918")}) == D("-82")
+
+
+async def test_report_reads_the_store_off_the_event_loop(tmp_path):
+    import threading
+
+    store = Store(tmp_path / "s.db")
+    rep = StatsReporter(store, FakeNotifier(), lambda: STATUS, {"arcus": FundingVenue("arcus")})
+    _populate(store, time.time())
+    seen = []
+    orig = store.summary
+
+    def spy(*a, **k):
+        seen.append(threading.current_thread() is threading.main_thread())
+        return orig(*a, **k)
+
+    store.summary = spy  # type: ignore[method-assign]
+    text = await rep.report_once()
+    assert "vol 1h $820" in text and "PnL est 24h +$0.30" in text
+    assert len(seen) >= 3 and not any(seen)
+    inc = IncrementalSummary(store)
+    seen.clear()
+    assert (await inc.aget(0.0))["arcus"].fills == 2 and seen and not any(seen)
+    store.close()

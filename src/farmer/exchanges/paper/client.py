@@ -12,7 +12,19 @@ Fill model (deliberately conservative, queue-agnostic):
   SELL symmetric. Fills are rounded down to the market step.
 - ``place_market`` sleeps ``taker_latency_ms`` and then sweeps the CURRENT inner book level by
   level up to ``worst_price`` (IOC: the remainder is canceled), one Fill per level.
-- Liquidity consumed by simulated fills is remembered until the next inner book update.
+- Liquidity consumed by simulated fills is remembered per (side, price) level across book updates
+  (our simulated trades never reach the real book, so an unchanged level - e.g. a heartbeat re-emission or a
+  change at another level - is NOT fresh liquidity). A level that grows offers only the increase; a level that
+  shrinks keeps our consumption (capped at its size); a level that disappears is forgotten after
+  ``CONSUMED_GONE_GRACE_S`` unless it comes back with the identical size, or the identical size appears at another
+  price on that side, first (a market maker's cancel/re-post or moved order: the same liquidity).
+- Fills are book-based: a resting quote fills when the real book trades through its price. Our quote is invisible
+  to other participants, so quotes inside the spread (negative ``min_edge_bps``) still fill optimistically.
+
+Rate budget: with ``paper.emulate_rate_limits`` and an inner adapter whose config has ``max_tx_per_minute``
+(Lighter), order actions take a slot of the inner adapter's shared request bucket (``max_requests_per_minute``,
+also used by its public REST reads) and of a local tx limiter, waiting up to ``tx_budget_wait_s`` and then failing
+retryably unsent (live semantics). ``budget_health`` reports the shared bucket.
 
 Funding: a background task settles at every top of the UTC hour:
 ``payment = -signed_size * price * rate_hourly`` (price = index/oracle, else mark, else book
@@ -57,6 +69,11 @@ from farmer.models import (
     Side,
 )
 from farmer.utils.ids import new_client_id
+from farmer.utils.ratelimit import SlidingWindowLimiter
+
+# a consumed book level that vanishes and returns with the identical size (or reappears at another price with the
+# identical size) within this window is the same market-maker order: not fresh liquidity
+CONSUMED_GONE_GRACE_S = 1.0
 
 DEFAULT_LEVERAGE = 5  # used until set_leverage() is called for a symbol
 FUNDING_REFRESH_S = 60.0  # how often the funding-rate cache is refreshed from the inner adapter
@@ -111,8 +128,13 @@ class PaperExchange(Exchange):
         self._fills: deque[Fill] = deque(maxlen=MAX_FILL_HISTORY)
         self._funding_payments: list[FundingPayment] = []
 
-        # liquidity consumed by simulated fills since the last inner book update: symbol -> {(side, px): qty}
-        self._consumed: dict[str, dict[tuple[str, Decimal], Decimal]] = {}
+        # liquidity our simulated fills took from inner book levels:
+        # symbol -> {(level side, px): [seen size, used, vanished-at clock ts or None]}
+        self._consumed: dict[str, dict[tuple[str, Decimal], list]] = {}
+        self._req_limiter: SlidingWindowLimiter | None = None
+        self._tx_limiter: SlidingWindowLimiter | None = None
+        self._tx_wait_s = 0.0
+        self._setup_rate_limits()
 
         self._funding_cache: dict[str, tuple[float, FundingInfo]] = {}  # symbol -> (clock ts, info)
         self._funding_attempt_ts: float = float("-inf")
@@ -204,8 +226,42 @@ class PaperExchange(Exchange):
     def market_open(self, symbol: str) -> bool:
         return self.inner.market_open(symbol)
 
+    def _setup_rate_limits(self) -> None:
+        icfg = getattr(self.inner, "cfg", None)
+        max_tx = getattr(icfg, "max_tx_per_minute", None)
+        if not getattr(self.cfg, "emulate_rate_limits", False) or not isinstance(max_tx, int) or max_tx <= 0:
+            return
+        shared = getattr(self.inner, "_limiter", None)  # the inner adapter's bucket also counts its public reads
+        if not isinstance(shared, SlidingWindowLimiter):
+            shared = SlidingWindowLimiter(max(1, int(getattr(icfg, "max_requests_per_minute", 60) or 60)), 60.0)
+        self._req_limiter = shared
+        self._tx_limiter = SlidingWindowLimiter(max_tx, 60.0)
+        self._tx_wait_s = max(0.0, float(getattr(icfg, "tx_budget_wait_s", 10.0) or 0.0))
+
+    async def _tx_budget(self) -> str | None:
+        """Take one tx slot (local tx cap, then the shared request bucket). Returns an error when the budget did
+        not free up within ``tx_budget_wait_s`` (the order is then refused unsent, retryable)."""
+        if self._tx_limiter is None or self._req_limiter is None:
+            return None
+        try:
+            await asyncio.wait_for(self._tx_limiter.acquire(), self._tx_wait_s)
+            await asyncio.wait_for(self._req_limiter.acquire(), self._tx_wait_s)
+        except asyncio.TimeoutError:
+            self.log.warning("paper %s: rate budget exhausted (waited %.1fs); order refused unsent", self.name,
+                             self._tx_wait_s)
+            return f"paper {self.name}: rate budget exhausted (tx not sent)"
+        return None
+
+    def _tx_budget_nowait(self) -> None:
+        """Cancels also spend a slot when one is free (never delayed or refused here)."""
+        if self._tx_limiter is not None and self._req_limiter is not None and self._tx_limiter.try_acquire():
+            self._req_limiter.try_acquire()
+
     def budget_health(self) -> float:
-        return 1.0  # simulated orders never touch the venue's rate budgets
+        lim, tx = self._req_limiter, self._tx_limiter
+        if lim is None or tx is None:
+            return 1.0  # no budget emulation for this venue
+        return max(0.0, min(1.0, lim.available() / lim.max_calls, tx.available() / tx.max_calls))
 
     def can_increase_exposure(self) -> tuple[bool, str]:
         return True, ""
@@ -213,7 +269,7 @@ class PaperExchange(Exchange):
     # ================================================================== book listener / maker sim
     def _on_inner_book(self, book: OrderBook) -> None:
         try:
-            self._consumed.pop(book.symbol, None)  # fresh liquidity
+            self._reconcile_consumed(book)
             self._match_resting(book)
         except Exception:  # never let a simulation bug block book delivery
             self.log.exception("paper fill simulation failed for %s", book.symbol)
@@ -255,7 +311,7 @@ class PaperExchange(Exchange):
                 break
             if (o.side is Side.BUY and lvl.price > o.price) or (o.side is Side.SELL and lvl.price < o.price):
                 break
-            avail = lvl.size - self._used(o.symbol, o.side.opposite, lvl.price)
+            avail = lvl.size - self._used(o.symbol, o.side.opposite, lvl.price, lvl.size)
             if avail <= 0:
                 continue
             q = min(want - taken, avail)
@@ -267,7 +323,7 @@ class PaperExchange(Exchange):
         left = qty
         for lvl, q in plan:  # consume the levels the fill is attributed to
             use = min(q, left)
-            self._consume(o.symbol, o.side.opposite, lvl.price, use)
+            self._consume(o.symbol, o.side.opposite, lvl.price, use, lvl.size)
             left -= use
             if left <= 0:
                 break
@@ -278,13 +334,75 @@ class PaperExchange(Exchange):
             o.status = OrderStatus.PARTIALLY_FILLED
         self._emit_order(o)
 
-    def _used(self, symbol: str, level_side: Side, price: Decimal) -> Decimal:
-        return self._consumed.get(symbol, {}).get((level_side.value, price), ZERO)
+    @staticmethod
+    def _level_update(entry: list, size: Decimal) -> None:
+        """Carry our consumption of one level to its newly displayed ``size``: growth is new liquidity (only the
+        increase), a shrink keeps what we took (capped at the size left)."""
+        if size < entry[0]:
+            entry[1] = min(entry[1], size)
+        entry[0] = size
 
-    def _consume(self, symbol: str, level_side: Side, price: Decimal, qty: Decimal) -> None:
+    def _reconcile_consumed(self, book: OrderBook) -> None:
+        """Carry consumption across book updates. A consumed level that vanishes is remembered for
+        ``CONSUMED_GONE_GRACE_S``: if it comes back with the identical size (a market maker's cancel/re-post, seen
+        live on Arcus ~2x/s with ~25 ms gaps) or the identical size shows up at another price on the same side (the
+        order was moved), it is the same liquidity we already took. Anything else is fresh."""
+        d = self._consumed.get(book.symbol)
+        if not d:
+            return
+        now = self._clock()
+        sizes: dict[tuple[str, Decimal], Decimal] = {(Side.SELL.value, lvl.price): lvl.size for lvl in book.asks}
+        sizes.update({(Side.BUY.value, lvl.price): lvl.size for lvl in book.bids})
+        gone: list[tuple[str, Decimal]] = []
+        for key, entry in list(d.items()):
+            size = sizes.get(key)
+            if size is None or size <= 0:
+                if entry[2] is None:
+                    entry[2] = now
+                if now - entry[2] > CONSUMED_GONE_GRACE_S:
+                    del d[key]
+                else:
+                    gone.append(key)
+                continue
+            if entry[2] is not None:  # vanished and back: the same order only if the size is identical
+                if size != entry[0] or now - entry[2] > CONSUMED_GONE_GRACE_S:
+                    del d[key]
+                    continue
+                entry[2] = None
+            self._level_update(entry, size)
+            if entry[1] <= 0:
+                del d[key]
+        for key in gone:  # moved orders: identical size at a new price on the same side
+            entry = d.get(key)
+            if entry is None:
+                continue
+            for k2, size2 in sizes.items():
+                if k2[0] == key[0] and k2 not in d and size2 == entry[0]:
+                    d[k2] = [size2, min(entry[1], size2), None]
+                    del d[key]
+                    break
+        if not d:
+            del self._consumed[book.symbol]
+
+    def _used(self, symbol: str, level_side: Side, price: Decimal, size: Decimal | None = None) -> Decimal:
+        entry = self._consumed.get(symbol, {}).get((level_side.value, price))
+        if entry is None:
+            return ZERO
+        if entry[2] is not None:  # vanished meanwhile (book read without a listener update)
+            same = size is not None and size == entry[0] and self._clock() - entry[2] <= CONSUMED_GONE_GRACE_S
+            return entry[1] if same else ZERO
+        return entry[1]
+
+    def _consume(self, symbol: str, level_side: Side, price: Decimal, qty: Decimal, level_size: Decimal) -> None:
         d = self._consumed.setdefault(symbol, {})
         key = (level_side.value, price)
-        d[key] = d.get(key, ZERO) + qty
+        entry = d.get(key)
+        if entry is None or (entry[2] is not None and self._used(symbol, level_side, price, level_size) <= 0):
+            d[key] = [level_size, qty, None]
+            return
+        entry[2] = None
+        self._level_update(entry, level_size)  # the book may have changed without a listener update
+        entry[1] += qty
 
     # ================================================================== helpers
     def _maker_latency_s(self) -> float:
@@ -464,11 +582,11 @@ class PaperExchange(Exchange):
                 break
             if (o.side is Side.BUY and lvl.price > limit) or (o.side is Side.SELL and lvl.price < limit):
                 break
-            avail = lvl.size - self._used(o.symbol, level_side, lvl.price)
+            avail = lvl.size - self._used(o.symbol, level_side, lvl.price, lvl.size)
             take = m.round_size(min(left, avail))
             if take <= 0:
                 continue
-            self._consume(o.symbol, level_side, lvl.price, take)
+            self._consume(o.symbol, level_side, lvl.price, take, lvl.size)
             self._fill(o, take, lvl.price, maker=False)
             left -= take
         return qty - left
@@ -490,6 +608,10 @@ class PaperExchange(Exchange):
                   status=OrderStatus.PENDING, post_only=post_only, reduce_only=reduce_only, created_ts=now,
                   updated_ts=now)
         self._register(o)  # blocks duplicates while "in flight"
+        berr = await self._tx_budget()
+        if berr:
+            self._forget(o)
+            return OrderResult(ok=False, retryable=True, error=berr)
         await self._sleep(self._maker_latency_s())
         if o.status.is_terminal:  # canceled while in flight
             return OrderResult(ok=False, order=o, error=o.error or f"order {o.status.value}")
@@ -550,6 +672,10 @@ class PaperExchange(Exchange):
         o = Order(venue=self.name, symbol=symbol, side=side, price=worst_price, size=size, client_id=cid,
                   status=OrderStatus.PENDING, ioc=True, reduce_only=reduce_only, created_ts=now, updated_ts=now)
         self._register(o)
+        berr = await self._tx_budget()
+        if berr:
+            self._forget(o)
+            return OrderResult(ok=False, retryable=True, error=berr)
         await self._sleep(self._taker_latency_s())
         if self._closed:
             self._forget(o)
@@ -600,6 +726,9 @@ class PaperExchange(Exchange):
             err = f"remaining notional {remaining * price} below min notional {m.min_notional}"
         if err:
             return OrderResult(ok=False, order=o, error=err)
+        berr = await self._tx_budget()
+        if berr:
+            return OrderResult(ok=False, order=o, retryable=True, error=berr)
         await self._sleep(self._maker_latency_s())
         if not o.is_open:
             return OrderResult(ok=False, order=o, error=f"order is {o.status.value}")
@@ -628,6 +757,7 @@ class PaperExchange(Exchange):
     async def cancel_order(self, symbol: str, *, order_id: str | None = None, client_id: str | None = None) -> bool:
         if not order_id and not client_id:
             raise ValueError("cancel_order needs order_id or client_id")
+        self._tx_budget_nowait()
         await self._sleep(self._maker_latency_s())
         o = self._find(order_id, client_id)
         if o is None or not o.is_open:
@@ -644,6 +774,7 @@ class PaperExchange(Exchange):
         return True
 
     async def cancel_all(self, symbol: str | None = None) -> None:
+        self._tx_budget_nowait()
         await self._sleep(self._maker_latency_s())
         for o in list(self._open.values()):
             if symbol is None or o.symbol == symbol:

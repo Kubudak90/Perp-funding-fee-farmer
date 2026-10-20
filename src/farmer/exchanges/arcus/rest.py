@@ -67,8 +67,18 @@ class ArcusHTTPError(ExchangeError):
 
     @property
     def is_transmission(self) -> bool:
-        """502 Transmission: the request never reached the engine; safe to resend unchanged."""
-        return self.status == 502 or self.error_type == "Transmission"
+        """``errorType: Transmission``: the request never reached the engine; safe to resend unchanged.
+
+        Only the gateway's explicit marker counts: a bare 502/52x (e.g. an HTML page from the CDN in front
+        of the API) may come back AFTER the request was forwarded, so its outcome is unknown.
+        """
+        return self.error_type == "Transmission"
+
+    @property
+    def is_definitive_5xx(self) -> bool:
+        """A 5xx the Arcus gateway itself answered with a JSON ``errorType`` saying nothing was submitted
+        (``Transmission``, or ``Unavailable`` = path temporarily disabled)."""
+        return self.status >= 500 and self.error_type in ("Transmission", "Unavailable")
 
     @property
     def rejection_reason(self) -> str | None:

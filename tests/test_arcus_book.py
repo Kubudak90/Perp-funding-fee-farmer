@@ -211,3 +211,36 @@ def test_crossed_by_confirmed_levels_still_fails():
     book.apply_snapshot({"bids": [["100", "1"]], "asks": [["105", "1"]], "lastSequenceId": 1})
     assert book.apply_delta({"bids": [], "asks": [["103", "1"]], "lastSequenceId": 2}) is DeltaResult.APPLIED
     assert book.apply_delta({"bids": [["103.5", "1"]], "asks": [], "lastSequenceId": 3}) is DeltaResult.CROSSED
+
+
+def test_prune_with_older_bbo_past_the_loss_window():
+    """Quiet market: the snapshot ask 101 was lifted inside the loss window (11..19) and deltas only touch
+    deep levels afterwards, so no same-sequence bbo ever arrives. An OLDER bbo from past the window
+    still proves 101 stale and fixes the size of the real best ask."""
+    book = _book_after_first_delta()  # snapshot seq 10, first delta seq 20
+    assert book.apply_delta({"bids": [["96", "1"]], "asks": [], "lastSequenceId": 21}) is DeltaResult.APPLIED
+    assert book.apply_delta({"bids": [], "asks": [["103", "1"]], "lastSequenceId": 22}) is DeltaResult.APPLIED
+    assert book.top_unconfirmed() and book.best_ask == (D("101"), D("1"))
+    bbo = {"bestBid": {"price": "99", "size": "1"}, "bestAsk": {"price": "102", "size": "2.5"}, "lastSequenceId": 20}
+    assert book.prune_with_bbo(bbo) is True
+    assert book.best_ask == (D("102"), D("2.5")) and book.best_bid == (D("99"), D("1")) and book.repairs == 2
+    assert not book.top_unconfirmed()
+
+    # a bbo from INSIDE the loss window proves nothing (101 may have come back later in the window)
+    book = _book_after_first_delta()
+    inside = dict(bbo, lastSequenceId=15)
+    assert book.prune_with_bbo(inside) is None and book.best_ask == (D("101"), D("1"))
+    assert book.prune_with_bbo(dict(bbo, lastSequenceId=9)) is None  # older than the snapshot
+    assert book.prune_with_bbo(dict(bbo, lastSequenceId=25)) is None  # newer than the book
+    same = {"bestBid": {"price": "99", "size": "1"}, "bestAsk": {"price": "102", "size": "2"}, "lastSequenceId": 20}
+    assert book.prune_with_bbo(same) is True and book.best_ask == (D("102"), D("2"))  # exact: reconcile_bbo
+
+    # a CONFIRMED level better than an older bbo was added after it and is kept
+    book = _book_after_first_delta()
+    assert book.apply_delta({"bids": [["99.5", "1"]], "asks": [], "lastSequenceId": 21}) is DeltaResult.APPLIED
+    assert book.prune_with_bbo(bbo) is True and book.best_bid == (D("99.5"), D("1"))
+    assert book.best_ask == (D("102"), D("2.5"))
+    # before the first delta nothing is known about the loss window
+    fresh = L2Book("X", "X-USD")
+    fresh.apply_snapshot({"bids": [["99", "1"]], "asks": [["101", "1"]], "lastSequenceId": 10})
+    assert fresh.prune_with_bbo(dict(bbo, lastSequenceId=10)) is None and fresh.best_ask == (D("101"), D("1"))

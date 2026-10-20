@@ -4,7 +4,7 @@ from decimal import Decimal as D
 import pytest
 
 from farmer.config import AppConfig, MarketConfig, MonitoringConfig
-from farmer.models import FundingInfo, OrderStatus, Side
+from farmer.models import Fill, FundingInfo, OrderStatus, Side
 from farmer.persistence.store import Store
 from farmer.strategy.engine import Engine
 from farmer.strategy.trader import Phase
@@ -202,3 +202,113 @@ async def test_funding_monitor_maps_venue_symbols(tmp_path):
     snap = mon.latest("KBONK")
     assert snap is not None and snap.taker.symbol == "1000BONK" and snap.best_direction == -1
     assert not mon.stopped
+
+
+# --------------------------------------------------------------------------- review regressions
+async def test_close_all_maker_residual_between_venue_and_pair_minimum(tmp_path):
+    """money-11: a maker residual below the pair minimum (but above the maker venue minimum) is never quoted by
+    the forced-close trader; close_all('maker') must report flat instead of spinning until the timeout."""
+    import time as _time
+
+    eng, maker, taker, risk, notifier, store = build(tmp_path)
+    maker.positions["BTC"], taker.positions["BTC"] = D("0.011"), D("-0.011")
+    await eng.start()
+
+    async def filler():
+        while True:
+            for o in resting(maker):
+                if o.status is OrderStatus.OPEN:
+                    maker.fill_resting(o.client_id)
+            await asyncio.sleep(0.01)
+
+    f = asyncio.create_task(filler())
+    t0 = _time.monotonic()
+    try:
+        res = await eng.close_all("maker", timeout_s=2.5)
+    finally:
+        f.cancel()
+        await eng.shutdown()
+    assert res["BTC"]["flat"] and res["BTC"]["maker_pos"] == D("0.001") and _time.monotonic() - t0 < 2.0
+
+
+async def test_shutdown_hedges_fill_racing_the_quote_cancel(tmp_path):
+    """money-13: a maker fill that lands just after the cancel (and after a first is_hedged()) is still hedged
+    before the hedgers stop; the maker markets get a final cancel_all."""
+    eng, maker, taker, risk, notifier, store = build(tmp_path, shutdown_settle_s=0.4)
+    task = asyncio.create_task(eng.run())
+    await wait_until(lambda: eng.started and resting(maker) and resting(maker)[0].status is OrderStatus.OPEN)
+    h = eng.hedgers["BTC"]
+    q = resting(maker)[0]
+    real_cancel = maker.cancel_order
+
+    async def racing_cancel(symbol, *, order_id=None, client_id=None):
+        if client_id == q.client_id:  # the fill frame arrives 100 ms after the cancel was accepted
+            def late_fill():
+                maker.positions["BTC"] = maker.positions.get("BTC", D(0)) + q.size
+                maker._emit_fill(Fill("arcus", "BTC", Side.BUY, q.price, q.size, is_maker=True,
+                                      client_id=q.client_id, trade_id="race"))
+            asyncio.get_running_loop().call_later(0.1, late_fill)
+        return await real_cancel(symbol, order_id=order_id, client_id=client_id)
+
+    maker.cancel_order = racing_cancel
+    eng.request_stop()
+    await asyncio.wait_for(task, 5)
+    assert h.maker_pos == q.size and h.taker_pos == -q.size and h.delta == 0
+    assert ("cancel_all", "BTC") in maker.calls
+
+
+async def test_shutdown_alerts_on_unconfirmed_cancel_and_unhedged_delta(tmp_path):
+    """async-shutdown-unverified-final-state: alerts are raised and delivered before shutdown returns."""
+    eng, maker, taker, risk, notifier, store = build(tmp_path, risk_kw={"emergency_flatten": False})
+    eng.cfg.arcus.dead_mans_switch_s = 0
+    task = asyncio.create_task(eng.run())
+    await wait_until(lambda: eng.started and resting(maker) and resting(maker)[0].status is OrderStatus.OPEN)
+
+    async def no_cancel(symbol, *, order_id=None, client_id=None):
+        return False
+
+    async def boom(symbol=None):
+        raise ConnectionError("down")
+
+    async def slow_send(text):
+        await asyncio.sleep(0.05)
+        notifier.messages.append(text)
+
+    maker.cancel_order, maker.cancel_all, notifier.send = no_cancel, boom, slow_send
+    taker.fail_next(10_000, retryable=True, kinds={"market"})
+    eng.hedgers["BTC"].maker_pos += D("0.01")  # an unhedgeable delta at shutdown
+    eng.request_stop()
+    await asyncio.wait_for(task, 10)
+    assert any("quote cancel unconfirmed for BTC" in m for m in notifier.messages)
+    assert any("may still rest" in m for m in notifier.messages)
+    assert any("BTC NOT hedged" in m for m in notifier.messages)
+
+
+async def test_failed_start_with_close_on_exit_does_not_restart(tmp_path):
+    """async-shutdown-reenters-start."""
+    eng, maker, taker, risk, notifier, store = build(tmp_path, risk_kw={"close_on_exit": True})
+    real = maker.subscribe_books
+    n = {"x": 0}
+
+    async def flaky(symbols):
+        n["x"] += 1
+        if n["x"] == 1:
+            raise ConnectionError("md socket closed")
+        await real(symbols)
+
+    maker.subscribe_books = flaky
+    with pytest.raises(ConnectionError):
+        await eng.run()
+    assert n["x"] == 1 and not eng.started and len(maker._fill_listeners) == 1  # one hedger, no second start
+    assert any("close_on_exit skipped" in m for m in notifier.messages)
+
+
+async def test_orphan_sweep_loop_hands_open_orders_to_traders(tmp_path):
+    eng, maker, taker, risk, notifier, store = build(tmp_path, orphan_sweep_s=0.05)
+    task = asyncio.create_task(eng.run())
+    await wait_until(lambda: eng.started and resting(maker) and resting(maker)[0].status is OrderStatus.OPEN)
+    stray = (await maker.place_limit("BTC", Side.BUY, D("0.005"), D("99000"), client_id="fqfeedface1")).order
+    await wait_until(lambda: stray.status is OrderStatus.CANCELED, timeout=2)
+    assert resting(maker)  # the tracked quote stays
+    eng.request_stop()
+    await asyncio.wait_for(task, 5)

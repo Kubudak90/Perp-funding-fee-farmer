@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from farmer import __version__
 from farmer.config import AppConfig, ArcusConfig, LighterConfig, MarketConfig, ResolvedMarket, load_config
@@ -180,6 +180,45 @@ class RunLock:
             with contextlib.suppress(Exception):
                 self._fh.close()
             self._fh = None
+
+
+def _install_stop_signals(loop: asyncio.AbstractEventLoop, on_first: Callable[[], None], what: str) -> list[int]:
+    """SIGINT / SIGTERM / SIGHUP -> ``on_first()`` (graceful); the second only warns, the third exits at once
+    (resting quotes are then left to the venue's dead man's switch). Returns the signals to remove afterwards.
+    SIGHUP is left alone when it is ignored (``nohup``)."""
+    seen = 0
+
+    def on_signal(signame: str) -> None:
+        nonlocal seen
+        seen += 1
+        if seen == 1:
+            log.warning("%s received: %s", signame, what)
+            on_first()
+        elif seen < 3:
+            log.warning("%s again: shutdown in progress; once more forces an immediate exit (resting quotes "
+                        "are then left to the venue's dead man's switch)", signame)
+        else:
+            log.error("forced exit")
+            os._exit(130)
+
+    sigs = [signal.SIGINT, signal.SIGTERM]
+    hup = getattr(signal, "SIGHUP", None)
+    if hup is not None and signal.getsignal(hup) is not signal.SIG_IGN:
+        sigs.append(hup)
+    installed = []
+    for sig in sigs:
+        try:
+            loop.add_signal_handler(sig, on_signal, sig.name)
+            installed.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover - non-POSIX / not main thread
+            pass
+    return installed
+
+
+def _remove_stop_signals(loop: asyncio.AbstractEventLoop, installed: list[int]) -> None:
+    for sig in installed:
+        with contextlib.suppress(Exception):
+            loop.remove_signal_handler(sig)
 
 
 async def _close_quietly(*venues: Any) -> None:
@@ -382,7 +421,6 @@ async def run_engine(cfg: AppConfig, *, paper: bool, duration: float | None = No
     from farmer.monitoring.notifier import make_notifier
     from farmer.monitoring.stats import StatsReporter
     from farmer.persistence.store import Store
-    from farmer.risk.manager import RiskManager
     from farmer.strategy.engine import Engine
 
     cfg = cfg.model_copy(update={"mode": "paper" if paper else "live"})
@@ -395,33 +433,15 @@ async def run_engine(cfg: AppConfig, *, paper: bool, duration: float | None = No
     store = Store(store_path(cfg, paper), paper=paper)
     mon = cfg.monitoring
     notifier = make_notifier(mon.telegram_bot_token, mon.telegram_chat_id)
-    risk = RiskManager(cfg.risk, venues, store, notifier, interval_s=cfg.risk.check_interval_s)
+    risk = make_risk(cfg, venues, store, notifier)
     engine = Engine(cfg, venues, store, notifier, risk)
+    # margin ratio at reduce_margin_ratio: the risk manager halts and flattens every pair with reduce-only IOCs
+    risk.set_reducer(lambda: engine.close_all("taker", timeout_s=cfg.strategy.close_on_exit_timeout_s))
     stats = StatsReporter(store, notifier, engine.status, venues, interval_s=mon.report_interval_s,
-                          notify_every=mon.notify_every, funding_interval_s=mon.funding_collect_s)
+                          notify_every=mon.notify_every, funding_interval_s=mon.funding_collect_s,
+                          funding_lookback_s=mon.funding_lookback_s)
     loop = asyncio.get_running_loop()
-    signals_seen = 0
-
-    def on_signal(signame: str) -> None:
-        nonlocal signals_seen
-        signals_seen += 1
-        if signals_seen == 1:
-            log.warning("%s received: graceful shutdown (cancel quotes, flush hedges)", signame)
-            engine.request_stop()
-        elif signals_seen < 3:
-            log.warning("%s again: shutdown in progress; once more forces an immediate exit (resting quotes "
-                        "are then left to the venue's dead man's switch)", signame)
-        else:
-            log.error("forced exit")
-            os._exit(130)
-
-    installed = []
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, on_signal, sig.name)
-            installed.append(sig)
-        except (NotImplementedError, RuntimeError):  # pragma: no cover - non-POSIX
-            pass
+    installed = _install_stop_signals(loop, engine.request_stop, "graceful shutdown (cancel quotes, flush hedges)")
 
     async def stats_loop() -> None:
         while not engine.started:
@@ -455,14 +475,23 @@ async def run_engine(cfg: AppConfig, *, paper: bool, duration: float | None = No
         if engine.started:
             with contextlib.suppress(Exception):
                 await stats.report_once()
-        for sig in installed:
-            with contextlib.suppress(Exception):
-                loop.remove_signal_handler(sig)
+        _remove_stop_signals(loop, installed)
+        with contextlib.suppress(Exception):
+            await risk.drain_notifications()
         with contextlib.suppress(Exception):
             await notifier.close()
         store.close()
         lock.release()
     return rc
+
+
+def make_risk(cfg: AppConfig, venues: dict[str, Any], store: Any, notifier: Any) -> Any:
+    """RiskManager with the per-pair leverage (free-collateral check)."""
+    from farmer.risk.manager import RiskManager
+
+    return RiskManager(cfg.risk, venues, store, notifier, interval_s=cfg.risk.check_interval_s,
+                       leverage={m.symbol: m.leverage for m in cfg.enabled_markets()},
+                       default_leverage=cfg.strategy.leverage)
 
 
 # =========================================================================== status
@@ -555,10 +584,59 @@ async def status(cfg: AppConfig, out=None) -> int:
 
 
 # =========================================================================== close-all
+async def _close_with_fallback(engine: Any, risk: Any, mode: str, timeout_s: float, out: Any) -> tuple[str, dict]:
+    """``engine.close_all(mode)``; a maker close whose risk manager halts (circuit breaker, margin) can never quote
+    again, so it switches to taker (IOC) mode for the remaining time instead of waiting out the timeout."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    task = asyncio.ensure_future(engine.close_all(mode, timeout_s=timeout_s))
+    try:
+        while mode == "maker" and not task.done():
+            await asyncio.wait({task}, timeout=0.25)
+            if task.done() or not risk.halted:
+                continue
+            print(f"risk halted during the maker close ({risk.halt_reason}); switching to taker (IOC) mode", file=out)
+            task.cancel()
+            await asyncio.wait({task})
+            mode = "taker"
+            task = asyncio.ensure_future(engine.close_all(mode, timeout_s=max(30.0, deadline - time.monotonic())))
+        return mode, await task
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.wait({task})
+
+
+async def _unmanaged_positions(engine: Any, cfg: AppConfig) -> tuple[list[str], list[str], list[str]]:
+    """Positions close-all did not handle: (configured markets without a closed pair, positions outside the
+    configured markets, read errors)."""
+    from farmer.strategy.mapping import candidate_symbols
+
+    maker, taker = engine.maker, engine.taker
+    managed = {(maker.name, p.maker_symbol) for p in engine.pairs if p.symbol in engine.hedgers}
+    managed |= {(taker.name, p.taker_symbol) for p in engine.pairs if p.symbol in engine.hedgers}
+    configured: set[str] = set()
+    for m in cfg.enabled_markets():
+        configured.update(candidate_symbols(m.symbol))
+        configured.update(o.strip().upper() for o in (m.arcus_symbol, m.lighter_symbol) if o)
+    unmanaged: list[str] = []
+    other: list[str] = []
+    errors: list[str] = []
+    for ex in dict.fromkeys([maker, taker]):
+        try:
+            pos = await asyncio.wait_for(ex.fetch_positions(), 20.0)
+        except Exception as exc:
+            errors.append(f"{ex.name}: {exc!r}")
+            continue
+        for sym, p in sorted(pos.items()):
+            if p.size == 0 or (ex.name, sym) in managed:
+                continue
+            (unmanaged if sym.upper() in configured else other).append(f"{ex.name}:{sym} {fmt(p.size)}")
+    return unmanaged, other, errors
+
+
 async def close_all(cfg: AppConfig, *, taker: bool, timeout_s: float, out=None) -> int:
     from farmer.monitoring.notifier import make_notifier
     from farmer.persistence.store import Store
-    from farmer.risk.manager import RiskManager
     from farmer.strategy.engine import Engine
 
     out = out or sys.stdout
@@ -569,7 +647,8 @@ async def close_all(cfg: AppConfig, *, taker: bool, timeout_s: float, out=None) 
     cfg = cfg.model_copy(update={
         "mode": "live",
         "strategy": cfg.strategy.model_copy(update={"set_leverage_on_start": False}),
-        "risk": cfg.risk.model_copy(update={"close_on_exit": False}),
+        # today's loss must not re-halt the closing engine (a halted maker close never quotes)
+        "risk": cfg.risk.model_copy(update={"close_on_exit": False, "max_daily_loss": Decimal(0)}),
     })
     lock = RunLock(store_path(cfg, False).with_suffix(".lock"))
     if not lock.acquire():
@@ -579,26 +658,60 @@ async def close_all(cfg: AppConfig, *, taker: bool, timeout_s: float, out=None) 
     venues = build_venues(cfg, paper=False)
     store = Store(store_path(cfg, False))
     notifier = make_notifier(cfg.monitoring.telegram_bot_token, cfg.monitoring.telegram_chat_id)
-    risk = RiskManager(cfg.risk, venues, store, notifier, interval_s=cfg.risk.check_interval_s)
+    risk = make_risk(cfg, venues, store, notifier)
     engine = Engine(cfg, venues, store, notifier, risk)
     mode = "taker" if taker else "maker"
     rc = EXIT_OK
+    loop = asyncio.get_running_loop()
+    main = asyncio.current_task()
+    closing = True
+
+    def interrupt() -> None:
+        if closing and main is not None:
+            main.cancel()
+
+    # SIGTERM (systemd / docker / timeout) or SIGHUP must not kill the process mid-flatten: cancel the close, then
+    # the finally below cancels quotes, flushes the hedgers and closes the venues (signals stay handled meanwhile)
+    installed = _install_stop_signals(loop, interrupt, "interrupting close-all (cancel quotes, flush hedges)")
     try:
-        result = await engine.close_all(mode, timeout_s=timeout_s)
-        print(f"close-all ({mode}) result:", file=out)
-        for sym, r in result.items():
-            print(f"  {sym:<10} maker {fmt(r['maker_pos']):>14} taker {fmt(r['taker_pos']):>14} "
-                  f"{'FLAT' if r['flat'] else 'NOT FLAT'}", file=out)
-        if not all(r["flat"] for r in result.values()):
+        try:
+            mode, result = await _close_with_fallback(engine, risk, mode, timeout_s, out)
+            print(f"close-all ({mode}) result:", file=out)
+            for sym, r in result.items():
+                print(f"  {sym:<10} maker {fmt(r['maker_pos']):>14} taker {fmt(r['taker_pos']):>14} "
+                      f"{'FLAT' if r['flat'] else 'NOT FLAT'}", file=out)
+            if not all(r["flat"] for r in result.values()):
+                rc = EXIT_ERROR
+                print("Not flat within the timeout." + (" Retry with --taker to close immediately with IOC orders."
+                                                        if mode != "taker" else ""), file=out)
+        except Exception as exc:
+            _print_error("close-all failed", exc)
             rc = EXIT_ERROR
-            print("Not flat within the timeout." + (" Retry with --taker to close immediately with IOC orders."
-                                                    if not taker else ""), file=out)
-    except Exception as exc:
-        _print_error("close-all failed", exc)
+        if engine.pairs or engine.skipped:  # markets were mapped: report positions no pair could close
+            unmanaged, other, errors = await _unmanaged_positions(engine, cfg)
+            for u in unmanaged:
+                print(f"  {u:<24} NOT FLAT (UNMANAGED: no tradeable pair was mapped; close it on the venue)", file=out)
+            if unmanaged:
+                rc = EXIT_ERROR
+                for why in engine.skipped:
+                    print(f"  skipped: {why}", file=out)
+            if other:
+                print("note: positions outside the configured markets were not touched: " + ", ".join(other),
+                      file=out)
+            for e in errors:
+                print(f"WARNING: could not verify the remaining positions on {e}", file=out)
+    except asyncio.CancelledError:
+        if main is not None:
+            main.uncancel()
         rc = EXIT_ERROR
+        print("close-all interrupted: positions may NOT be flat (check `farmer status`).", file=out)
     finally:
+        closing = False
         with contextlib.suppress(Exception):
             await engine.shutdown()
+        _remove_stop_signals(loop, installed)
+        with contextlib.suppress(Exception):
+            await risk.drain_notifications()
         with contextlib.suppress(Exception):
             await notifier.close()
         store.close()
@@ -689,10 +802,21 @@ async def stats_report(cfg: AppConfig, *, paper: bool, since_hours: float, use_m
         vol = sum((s.volume for s in summ.values()), ZERO)
         fees = sum((s.fees for s in summ.values()), ZERO)
         fund = sum((s.funding for s in summ.values()), ZERO)
+        maker_n = cfg.strategy.maker_venue
+        mvol = summ[maker_n].volume if maker_n in summ else ZERO
         per_m = (pnl / vol * Decimal(1_000_000)) if vol > 0 else None
+        per_mm = (pnl / mvol * Decimal(1_000_000)) if mvol > 0 else None
+        per = []
+        if per_mm is not None:
+            per.append(f"${fmt(per_mm, 2)} per $1M {maker_n} volume")
+        if per_m is not None:
+            per.append(f"${fmt(per_m, 2)} per $1M volume of both venues")
         print(f"total volume ${fmt(vol, 2)} | fees ${fmt(fees, 4)} | funding ${fmt(fund, 4)} | PnL est ${fmt(pnl, 4)}"
-              + (f" (${fmt(per_m, 2)} per $1M volume)" if per_m is not None else "")
+              + (f" ({'; '.join(per)})" if per else "")
               + (f" | no mark for {', '.join(missing)} (excluded)" if missing else ""), file=out)
+        if net:
+            print("(open net base is valued at one common public mark; the cross-venue basis of open legs shows "
+                  "until they are closed)", file=out)
         kinds: dict[str, int] = {}
         for ts, kind, _data in store.recent_events(limit=5000):
             if ts >= since:
@@ -705,6 +829,28 @@ async def stats_report(cfg: AppConfig, *, paper: bool, since_hours: float, use_m
 
 
 # =========================================================================== keygen
+UNCONFIRMED_NOTE = ("WARNING: the registration was sent but NOT confirmed; it may still take effect. The API private "
+                    "key below is shown ONCE so it is not lost: verify with `farmer status` (or the venue) before "
+                    "relying on it, and discard it if the registration did not happen.")
+
+
+def _arcus_key_rejected(exc: BaseException) -> bool:
+    """True when ``exc`` proves the Arcus key was NOT registered (local validation or an HTTP 4xx rejection)."""
+    from farmer.exchanges.arcus.rest import ArcusHTTPError
+
+    if isinstance(exc, ArcusHTTPError):
+        return 400 <= int(exc.status) < 500 and int(exc.status) != 429
+    return isinstance(exc, (ValueError, RuntimeError)) and not isinstance(exc, TimeoutError)
+
+
+def _lighter_key_rejected(exc: BaseException, lk: Any) -> bool:
+    """True when ``exc`` proves the ChangePubKey tx was never accepted (signing failed or the venue rejected it)."""
+    msg = str(exc)
+    restricted = getattr(lk, "RESTRICTED_MESSAGE", None)
+    return msg.startswith(("sign ChangePubKey failed", "ChangePubKey rejected")) or (bool(restricted)
+                                                                                     and msg == restricted)
+
+
 async def keygen_arcus(cfg: AppConfig, args: argparse.Namespace, out=None) -> int:
     from farmer.exchanges.arcus import keys as ak
 
@@ -734,11 +880,18 @@ async def keygen_arcus(cfg: AppConfig, args: argparse.Namespace, out=None) -> in
           f"subaccount {account_index} (valid {args.valid_days} days)", file=out)
     if not _confirm("This sends a signed createApiKey request.", args.yes):
         return EXIT_ERROR
+    # generated here (not inside register_api_key) so a key whose registration went out is never lost
+    api_priv = existing or ak.generate_ed25519_keypair()[0]
     try:
         reg = await ak.register_api_key(cfg.arcus.rest_url, cfg.arcus.chain_id, wallet, account_index,
-                                        name=args.name, valid_days=args.valid_days, api_private_key=existing or None)
+                                        name=args.name, valid_days=args.valid_days, api_private_key=api_priv)
     except Exception as exc:
         _print_error("Arcus key registration failed", exc)
+        if not _arcus_key_rejected(exc):
+            print(UNCONFIRMED_NOTE, file=out)
+            print(f"ARCUS_ADDRESS={address}\nARCUS_ACCOUNT_INDEX={account_index}", file=out)
+            if not existing:  # an existing key is already in the environment
+                print(f"ARCUS_API_PRIVATE_KEY={api_priv}", file=out)
         return EXIT_ERROR
     print(f"Registered Arcus API key {reg.api_key} ({reg.name}) status={reg.status}", file=out)
     print("WARNING: the API private key below is shown ONCE. Put these lines in .env and keep it private:", file=out)
@@ -787,6 +940,15 @@ async def keygen_lighter(cfg: AppConfig, args: argparse.Namespace, out=None) -> 
         return EXIT_ERROR
     print(f"Lighter {url} chain {cfg.lighter.chain_id}: register API key index {api_key_index} for account "
           f"{account_index} ({address}). This REPLACES any key at that index.", file=out)
+    if (cfg.lighter.api_key_index is not None and int(api_key_index) == int(cfg.lighter.api_key_index)
+            and not getattr(args, "force", False)):
+        lock = RunLock(store_path(cfg, False).with_suffix(".lock"))
+        if not lock.acquire():
+            print(f"ERROR: a running farmer engine (pid {lock.holder()}) signs with API key index {api_key_index} "
+                  "(LIGHTER_API_KEY_INDEX); replacing it would break every order. Stop the bot first, use another "
+                  "--api-key-index, or pass --force.", file=sys.stderr)
+            return EXIT_ERROR
+        lock.release()
     if not _confirm("This sends a signed ChangePubKey transaction (must run from a permitted jurisdiction).",
                     args.yes):
         return EXIT_ERROR
@@ -796,6 +958,10 @@ async def keygen_lighter(cfg: AppConfig, args: argparse.Namespace, out=None) -> 
                                        chain_id=cfg.lighter.chain_id)
     except Exception as exc:
         _print_error("Lighter key registration failed", exc)
+        if not _lighter_key_rejected(exc, lk):  # e.g. sent and accepted, but not visible within the wait
+            print(UNCONFIRMED_NOTE, file=out)
+            print(f"LIGHTER_ACCOUNT_INDEX={account_index}\nLIGHTER_API_KEY_INDEX={api_key_index}\n"
+                  f"LIGHTER_API_PRIVATE_KEY={priv}", file=out)
         return EXIT_ERROR
     print(f"Registered Lighter API key index {api_key_index} (tx {tx}).", file=out)
     print("WARNING: the API private key below is shown ONCE. Put these lines in .env and keep it private:", file=out)
@@ -853,6 +1019,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Arcus: register an existing key read from this env var instead of generating one")
     k.add_argument("--generate-only", action="store_true", help="only generate a key pair locally (no network)")
     k.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    k.add_argument("--force", action="store_true",
+                   help="Lighter: replace the configured key slot even while a farmer engine holds the run lock")
     return p
 
 

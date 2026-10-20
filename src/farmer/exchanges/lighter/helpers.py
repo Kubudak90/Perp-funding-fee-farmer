@@ -58,6 +58,14 @@ FATAL_CODES = frozenset({20558, 21108, 21109, 21110, 21120, 21136, 52001})
 RETRYABLE_CODES = frozenset({23000, 21506, 21601, 29500, 29501, 30009, 30010, 30011, 20011})
 # Cancel/modify of a non-active order: harmless no-ops (nonce consumed).
 NOOP_CANCEL_CODES = frozenset({21600, 21709, 21715})
+# sendTx answers that do NOT prove the tx was dropped (internal error / process timeout): the outcome is unknown
+# and must be resolved by hash (lighter-trading.md §12). They stay in RETRYABLE_CODES for REST reads.
+AMBIGUOUS_TX_CODES = frozenset({29500, 29501})
+# Rejections that depend only on the signed payload / key / IP: an identical copy is rejected the same way, so a
+# possibly-delivered earlier copy of the same payload cannot have executed either.
+DETERMINISTIC_TX_CODES = FATAL_CODES | frozenset(
+    {21501, 21518, 21700, 21701, 21702, 21703, 21704, 21705, 21706, 21711, 21713, 30007}
+)
 
 RESTRICTED_MESSAGE = (
     "Lighter rejected the request from this IP: restricted jurisdiction (code 20558). Trading (sendTx and the "
@@ -105,6 +113,13 @@ def is_retryable(code: int | None) -> bool:
     if code in RETRYABLE_CODES:
         return True
     return code < 0 or 500 <= code < 600  # synthetic HTTP status codes (-status) / 5xx
+
+
+def is_ambiguous_tx_code(code: int | None) -> bool:
+    """A sendTx answer that leaves the outcome unknown (resolve by hash; never treat as 'nonce not consumed')."""
+    if code is None:
+        return True
+    return code in AMBIGUOUS_TX_CODES or code == -1 or 500 <= code < 600  # -1: malformed / code-less ack
 
 
 _CODE_RE = re.compile(r"code[\"'=:\s]+(\d{3,6})")

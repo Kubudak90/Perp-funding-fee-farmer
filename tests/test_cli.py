@@ -70,6 +70,17 @@ def test_example_config_matches_defaults():
     assert loaded == AppConfig().model_dump()
 
 
+def test_config_warns_when_lighter_watchdog_outlives_hedge_timeout(tmp_path, caplog):
+    from farmer.config import load_config
+
+    assert AppConfig().warnings() == []
+    f = tmp_path / "c.yaml"
+    f.write_text("lighter:\n  ws_watchdog_s: 20\nstrategy:\n  hedge_timeout_s: 8\n")
+    with caplog.at_level("WARNING", logger="farmer.config"):
+        cfg = load_config(f, env_file=None)
+    assert cfg.lighter.ws_watchdog_s == 20 and "ws_watchdog_s" in caplog.text
+
+
 def test_public_configs_strip_credentials(monkeypatch):
     creds_env(monkeypatch)
     cfg = cli._load(cli.build_parser().parse_args(["scan"]))
@@ -272,3 +283,153 @@ async def test_close_all_taker_flattens(monkeypatch, tmp_path):
     assert "FLAT" in out.getvalue()
     assert venues["arcus"].positions.get("BTC", D(0)) == 0 and venues["lighter"].positions.get("BTC", D(0)) == 0
     assert not venues["arcus"].leverage  # close-all never changes leverage
+
+
+async def test_close_all_sigterm_runs_shutdown_and_cancels_quotes(monkeypatch, tmp_path):
+    """SIGTERM (systemd stop, `timeout`) during a maker close-all must not kill the process: the close is
+    interrupted, quotes are canceled and the venues closed by the normal shutdown path."""
+    import asyncio
+    import signal
+
+    creds_env(monkeypatch)
+    cfg = cli._load(cli.build_parser().parse_args(["close-all"]))
+    cfg = cfg.model_copy(update={"data_dir": tmp_path, "strategy": fast_strategy(markets=[MarketConfig(symbol="BTC")]),
+                                 "risk": fast_risk()})
+    venues = fake_venues()
+    venues["arcus"].positions["BTC"] = D("0.01")
+    venues["lighter"].positions["BTC"] = D("-0.01")
+    monkeypatch.setattr(cli, "build_venues", lambda *a, **k: venues)
+    loop = asyncio.get_running_loop()
+    quoted = []
+
+    def term() -> None:
+        quoted.extend(venues["arcus"].resting("BTC"))
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    loop.call_later(0.5, term)
+    out = io.StringIO()
+    rc = await cli.close_all(cfg, taker=False, timeout_s=30, out=out)
+    assert rc == cli.EXIT_ERROR and "interrupted" in out.getvalue()
+    assert quoted and all(o.reduce_only for o in quoted)  # the maker close was quoting when the signal came
+    assert not venues["arcus"].resting("BTC")  # shutdown canceled the quote
+    assert not venues["arcus"].connected and not venues["lighter"].connected
+    lock = cli.RunLock(cli.store_path(cfg, False).with_suffix(".lock"))
+    assert lock.acquire()
+    lock.release()
+
+
+async def test_close_all_reports_positions_no_pair_could_close(monkeypatch, tmp_path):
+    creds_env(monkeypatch)
+    cfg = cli._load(cli.build_parser().parse_args(["close-all"]))
+    cfg = cfg.model_copy(update={"data_dir": tmp_path, "risk": fast_risk(),
+                                 "strategy": fast_strategy(markets=[MarketConfig(symbol="BTC"),
+                                                                    MarketConfig(symbol="SOL")])})
+    venues = fake_venues()
+    venues["arcus"].positions["BTC"] = D("0.01")
+    venues["lighter"].positions["BTC"] = D("-0.01")
+    venues["lighter"].positions["SOL"] = D("10")  # configured, but SOL is not tradeable on arcus -> skipped
+    venues["lighter"].positions["XRP"] = D("5")  # not configured: reported, not failed
+    monkeypatch.setattr(cli, "build_venues", lambda *a, **k: venues)
+    out = io.StringIO()
+    rc = await cli.close_all(cfg, taker=True, timeout_s=10, out=out)
+    text = out.getvalue()
+    assert rc == cli.EXIT_ERROR
+    assert "BTC" in text and "FLAT" in text and venues["arcus"].positions.get("BTC", D(0)) == 0
+    assert "lighter:SOL 10" in text and "UNMANAGED" in text and "skipped: SOL" in text
+    assert "not touched: lighter:XRP 5" in text
+
+
+async def test_close_all_maker_switches_to_taker_when_risk_halts(monkeypatch, tmp_path):
+    """A halted risk manager stops all quoting, so a maker close would only wait out its timeout. Today's daily
+    loss no longer halts close-all at all; other halts (here: margin) switch it to IOC mode."""
+    from farmer.models import Balance
+
+    creds_env(monkeypatch)
+    cfg = cli._load(cli.build_parser().parse_args(["close-all"]))
+    cfg = cfg.model_copy(update={"data_dir": tmp_path, "strategy": fast_strategy(markets=[MarketConfig(symbol="BTC")]),
+                                 "risk": fast_risk(max_daily_loss=D("1"))})
+    store = Store(cli.store_path(cfg, False))  # today's realized loss far beyond max_daily_loss
+    store.record_fill(Fill("arcus", "BTC", Side.BUY, D("100000"), D("0.01"), fee=D("50"), trade_id="x"), "maker")
+    store.record_fill(Fill("arcus", "BTC", Side.SELL, D("90000"), D("0.01"), fee=D("50"), trade_id="y"), "maker")
+    store.close()
+    venues = fake_venues()
+    venues["arcus"].positions["BTC"] = D("0.01")
+    venues["lighter"].positions["BTC"] = D("-0.01")
+    venues["lighter"].balance = Balance("lighter", equity=D("1000"), available=D("100"), maintenance_margin=D("500"))
+    monkeypatch.setattr(cli, "build_venues", lambda *a, **k: venues)
+    out = io.StringIO()
+    rc = await cli.close_all(cfg, taker=False, timeout_s=20, out=out)
+    text = out.getvalue()
+    assert "switching to taker" in text and "margin ratio" in text and "daily loss" not in text
+    assert "close-all (taker) result" in text and rc == cli.EXIT_OK
+    assert venues["arcus"].positions.get("BTC", D(0)) == 0 and venues["lighter"].positions.get("BTC", D(0)) == 0
+
+
+def test_make_risk_uses_pair_leverage():
+    cfg = AppConfig(strategy=fast_strategy(markets=[MarketConfig(symbol="btc", leverage=3), MarketConfig(symbol="ETH")],
+                                           leverage=4))
+    risk = cli.make_risk(cfg, {}, None, None)
+    assert risk.leverage_for("BTC") == 3 and risk.leverage_for("ETH") == 4 and risk.leverage_for("XRP") == 4
+
+
+async def test_keygen_lighter_prints_unconfirmed_key_and_refuses_running_slot(monkeypatch, tmp_path):
+    from farmer.exchanges.lighter import keys as lk
+
+    monkeypatch.setenv("LIGHTER_ETH_PRIVATE_KEY", "0x" + "33" * 32)
+    monkeypatch.setattr(lk, "generate_api_key", lambda: ("PRIV" * 10, "PUB" * 10))
+    sent = []
+
+    async def accepted_but_not_visible(**kw):
+        sent.append(kw)
+        raise lk.KeySetupError("key not visible after 30s; check GET /api/v1/tx?by=hash&value=0xabc")
+
+    monkeypatch.setattr(lk, "register_api_key", accepted_but_not_visible)
+    cfg = AppConfig(data_dir=tmp_path)
+    args = cli.build_parser().parse_args(["keygen", "lighter", "--account-index", "7", "--api-key-index", "6", "--yes"])
+    out = io.StringIO()
+    assert await cli.keygen_lighter(cfg, args, out=out) == cli.EXIT_ERROR
+    text = out.getvalue()
+    assert sent and "NOT confirmed" in text and f"LIGHTER_API_PRIVATE_KEY={'PRIV' * 10}" in text
+    assert "LIGHTER_API_KEY_INDEX=6" in text and "LIGHTER_ACCOUNT_INDEX=7" in text
+
+    async def rejected(**kw):
+        raise lk.KeySetupError("ChangePubKey rejected (21120): invalid signature")
+
+    monkeypatch.setattr(lk, "register_api_key", rejected)
+    out = io.StringIO()
+    assert await cli.keygen_lighter(cfg, args, out=out) == cli.EXIT_ERROR
+    assert "PRIV" not in out.getvalue()  # never registered: nothing to keep
+
+    # the slot a running engine signs with is protected unless --force
+    cfg = cfg.model_copy(update={"lighter": cfg.lighter.model_copy(update={"api_key_index": 6})})
+    held = cli.RunLock(cli.store_path(cfg, False).with_suffix(".lock"))
+    assert held.acquire()
+    try:
+        sent.clear()
+        monkeypatch.setattr(lk, "register_api_key", accepted_but_not_visible)
+        assert await cli.keygen_lighter(cfg, args, out=io.StringIO()) == cli.EXIT_ERROR and not sent
+        forced = cli.build_parser().parse_args(["keygen", "lighter", "--account-index", "7", "--api-key-index", "6",
+                                                "--yes", "--force"])
+        await cli.keygen_lighter(cfg, forced, out=io.StringIO())
+        assert sent
+    finally:
+        held.release()
+
+
+async def test_keygen_arcus_prints_unconfirmed_key_on_timeout(monkeypatch):
+    from farmer.exchanges.arcus import keys as ak
+
+    monkeypatch.setenv("ARCUS_WALLET_PRIVATE_KEY", "0x" + "44" * 32)
+    got = {}
+
+    async def slow(rest_url, chain_id, wallet, account_index, **kw):
+        got.update(kw)
+        raise TimeoutError("API key abcd... not ACTIVE after 60s (status=PENDING)")
+
+    monkeypatch.setattr(ak, "register_api_key", slow)
+    args = cli.build_parser().parse_args(["keygen", "arcus", "--yes"])
+    out = io.StringIO()
+    assert await cli.keygen_arcus(AppConfig(), args, out=out) == cli.EXIT_ERROR
+    text = out.getvalue()
+    assert got["api_private_key"] and f"ARCUS_API_PRIVATE_KEY={got['api_private_key']}" in text
+    assert "NOT confirmed" in text and "ARCUS_ADDRESS=0x" in text

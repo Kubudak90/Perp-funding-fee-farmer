@@ -35,6 +35,9 @@ MessageHandler = Callable[[dict], None]
 
 # id-less error frames that can only belong to the single in-flight sendtx (malformed request / tx info)
 _TX_ERROR_CODES_WITHOUT_ID = frozenset({30007, 21501})
+# market_stats/all streams continuously: a socket silent for longer than this is stalled (downlink dead or
+# lagging), so its acks cannot be relied on -> transactions go over REST instead
+TX_RX_FRESH_S = 3.0
 
 
 class LighterWS:
@@ -56,6 +59,7 @@ class LighterWS:
         backoff_max_s: float = 30.0,
         stable_after_s: float = 5.0,
         protocol_ping_s: float | None = 20.0,
+        tx_rx_fresh_s: float = TX_RX_FRESH_S,
         name: str = "farmer.lighter.ws",
     ) -> None:
         self.url = url
@@ -70,6 +74,7 @@ class LighterWS:
         self.backoff_max_s = backoff_max_s
         self.stable_after_s = stable_after_s
         self.protocol_ping_s = protocol_ping_s
+        self.tx_rx_fresh_s = tx_rx_fresh_s
         self.log = logging.getLogger(name)
         self._msg_limiter = SlidingWindowLimiter(max(1, max_msgs_per_min), 60.0)
         self._subs: dict[str, AuthProvider | None] = {}
@@ -130,7 +135,8 @@ class LighterWS:
 
     @property
     def can_send_tx(self) -> bool:
-        return self.connected and not self._draining and not self.restricted_mode
+        return (self.connected and not self._draining and not self.restricted_mode
+                and self.last_rx_age() < self.tx_rx_fresh_s)
 
     @property
     def restricted_mode(self) -> bool:

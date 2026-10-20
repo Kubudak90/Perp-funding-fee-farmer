@@ -212,7 +212,8 @@ async def test_taker_sweeps_levels_within_worst_price_ioc_remainder_canceled():
 
 
 async def test_taker_full_fill_sell_and_consumed_liquidity():
-    inner, px = make()
+    clock = Clock(1_792_440_000.0)
+    inner, px = make(clock=clock)
     inner.set_book("BTC", [(100, 1), (99, 1)], [(101, 1)])
     r1 = await px.place_market("BTC", Side.SELL, D("1.5"), worst_price=D("98"))
     assert r1.order.status is OrderStatus.FILLED
@@ -220,9 +221,99 @@ async def test_taker_full_fill_sell_and_consumed_liquidity():
     # same book snapshot: 100 x1 and 0.5 of 99 are gone -> only 0.5 left at 99
     r2 = await px.place_market("BTC", Side.SELL, D("1"), worst_price=D("98"))
     assert r2.order.filled == D("0.5") and r2.order.status is OrderStatus.CANCELED
-    inner.set_book("BTC", [(100, 1), (99, 1)], [(101, 1)])  # new book -> liquidity refreshed
+    # re-publishing the identical book (heartbeat / update elsewhere) is NOT fresh liquidity
+    inner.set_book("BTC", [(100, 1), (99, 1)], [(101, 1)])
     r3 = await px.place_market("BTC", Side.SELL, D("1"), worst_price=D("98"))
-    assert r3.order.filled == D("1")
+    assert r3.order.filled == 0 and r3.order.status is OrderStatus.CANCELED
+    # 99 grows to 1.4: only the 0.4 increase is new; the new 98.5 level is fresh
+    inner.set_book("BTC", [(100, 1), (99, "1.4"), (98.5, 1)], [(101, 1)])
+    r4 = await px.place_market("BTC", Side.SELL, D("1"), worst_price=D("98"))
+    assert [(f.price, f.size) for f in px._fills][-2:] == [(D("99"), D("0.4")), (D("98.5"), D("0.6"))]
+    assert r4.order.filled == D("1")
+    # a level that vanishes and returns with the identical size at once is the same order (cancel/re-post)
+    inner.set_book("BTC", [(99, "1.4"), (98.5, 1)], [(101, 1)])
+    inner.set_book("BTC", [(100, 1), (99, "1.4"), (98.5, 1)], [(101, 1)])
+    r5 = await px.place_market("BTC", Side.SELL, D("1"), worst_price=D("99.5"))
+    assert r5.order.filled == 0
+    # ... but after the grace window (or with another size) it is fresh
+    inner.set_book("BTC", [(99, "1.4"), (98.5, 1)], [(101, 1)])
+    clock.t += 1.5
+    inner.set_book("BTC", [(100, 1), (99, "1.4"), (98.5, 1)], [(101, 1)])
+    r6 = await px.place_market("BTC", Side.SELL, D("1"), worst_price=D("99.5"))
+    assert r6.order.filled == D("1") and r6.order.avg_fill_price == D("100")
+
+
+async def test_maker_unchanged_crossing_level_is_not_refilled_by_book_updates():
+    """Live paper run2: one 0.0062 ETH ask at the order price filled a 0.104 BUY in 17 slices because every book
+    update (heartbeat re-emission, changes at other levels) handed the same displayed size back as fresh."""
+    inner, px = make()
+    rec = Rec(px)
+    inner.set_book("BTC", [(100, 1)], [(101, 1)])
+    r = await px.place_limit("BTC", Side.BUY, D("0.104"), D("100.5"))
+    for i in range(20):
+        inner.set_book("BTC", [(99, 1)], [(100.5, "0.006"), (100.9, 1 + i)])
+    assert r.order.filled == D("0.006") and len(rec.fills()) == 1
+    inner.set_book("BTC", [(99, 1)], [(100.5, "0.010"), (100.9, 1)])  # grows: only the increase is new
+    assert r.order.filled == D("0.010")
+    inner.set_book("BTC", [(99, 1)], [(100.5, "0.004")])  # shrinks (traded by others): nothing new
+    inner.set_book("BTC", [(99, 1)], [(100.5, "0.004")])
+    assert r.order.filled == D("0.010")
+    inner.set_book("BTC", [(99, 1)], [(100.6, 1)])  # level gone ...
+    inner.set_book("BTC", [(99, 1)], [(100.5, "0.003")])  # ... a new one at that price is fresh
+    assert r.order.filled == D("0.013") and len(rec.fills()) == 3
+    assert r.order.status is OrderStatus.PARTIALLY_FILLED
+
+
+async def test_maker_flickering_or_moved_level_is_not_refilled():
+    """Live Arcus books: market makers cancel and re-post the identical size (same price ~25 ms later, or at the
+    next price). Paper run2 filled one SOL quote 0.953825 twice at the same price within 260 ms that way."""
+    clock = Clock(1_792_440_000.0)
+    inner, px = make(clock=clock)
+    rec = Rec(px)
+    inner.set_book("BTC", [(99, 1)], [(101, 1)])
+    r = await px.place_limit("BTC", Side.SELL, D("3"), D("100"))
+    inner.set_book("BTC", [(100.2, "0.9"), (99, 1)], [(101, 1)])  # a bid crosses our ask
+    assert r.order.filled == D("0.9")
+    inner.set_book("BTC", [(99, 1)], [(101, 1)])  # cancel ...
+    clock.t += 0.03
+    inner.set_book("BTC", [(100.2, "0.9"), (99, 1)], [(101, 1)])  # ... re-post: same order, not fresh
+    assert r.order.filled == D("0.9")
+    inner.set_book("BTC", [(100.3, "0.9"), (99, 1)], [(101, 1)])  # moved up by a tick: still the same order
+    assert r.order.filled == D("0.9") and len(rec.fills()) == 1
+    inner.set_book("BTC", [(100.3, "0.9"), (100.1, "0.5"), (99, 1)], [(101, 1)])  # another order: fresh
+    assert r.order.filled == D("1.4")
+    clock.t += 2.0  # long gone: a later order of that size at that price is fresh
+    inner.set_book("BTC", [(99, 1)], [(101, 1)])
+    clock.t += 2.0
+    inner.set_book("BTC", [(99, 1)], [(101, 1)])
+    inner.set_book("BTC", [(100.2, "0.9"), (99, 1)], [(101, 1)])
+    assert r.order.filled == D("2.3")
+
+
+async def test_rate_budget_emulation_delays_then_refuses_orders():
+    from types import SimpleNamespace
+
+    inner = FakeExchange("lighter", [make_market("lighter", "BTC", tick="0.1", step="0.001", min_size="0.001",
+                                                 min_notional="1")])
+    inner.cfg = SimpleNamespace(max_requests_per_minute=3, max_tx_per_minute=2, tx_budget_wait_s=0.05)
+    px = PaperExchange(inner, pcfg())
+    inner.set_book("BTC", [(99, 10)], [(100, 10)])
+    assert px.budget_health() == 1.0
+    for _ in range(2):
+        assert (await px.place_market("BTC", Side.BUY, D("0.1"), worst_price=D("101"))).order.filled == D("0.1")
+    assert px.budget_health() == 0.0  # 1/3 of the shared bucket left, but the 2 tx/min cap is used up
+    t0 = time.monotonic()
+    r = await px.place_market("BTC", Side.BUY, D("0.1"), worst_price=D("101"))
+    assert time.monotonic() - t0 >= 0.045
+    assert not r.ok and r.retryable and "budget" in r.error
+    assert px.position("BTC") == D("0.2") and not px._orders.get(r.order.client_id if r.order else "")
+    r = await px.place_limit("BTC", Side.BUY, D("0.1"), D("98"))
+    assert not r.ok and r.retryable
+    # opt-out (and venues without a budget config) never wait
+    px2 = PaperExchange(inner, pcfg(emulate_rate_limits=False))
+    for _ in range(4):
+        assert (await px2.place_market("BTC", Side.BUY, D("0.1"), worst_price=D("101"))).ok
+    assert px2.budget_health() == 1.0
 
 
 async def test_taker_no_liquidity_within_worst_price():

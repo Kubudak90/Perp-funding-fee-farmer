@@ -60,6 +60,8 @@ class L2Book:
         self.seq: int | None = None
         self.synced = False
         self.applying = False  # True once the first post-snapshot delta was applied
+        self.snapshot_seq: int | None = None
+        self.first_delta_seq: int | None = None  # loss window = (snapshot_seq, first_delta_seq)
         self.snapshot_ts: float | None = None
         self.last_update_ts: float | None = None
         self.seeded_low_bid: Decimal | None = None
@@ -80,6 +82,8 @@ class L2Book:
         self.seq = None
         self.synced = False
         self.applying = False
+        self.snapshot_seq = None
+        self.first_delta_seq = None
 
     def apply_snapshot(self, contents: dict, *, now: float | None = None) -> None:
         self.reset()
@@ -89,6 +93,8 @@ class L2Book:
             self._set(self._asks, self._ask_px, D(p), D(s))
         seq = contents.get("lastSequenceId")
         self.seq = int(seq) if seq is not None else None
+        self.snapshot_seq = self.seq
+        self.first_delta_seq = None
         self.synced = self.seq is not None
         self.applying = False
         self.snapshot_ts = self.last_update_ts = time.time() if now is None else now
@@ -120,6 +126,8 @@ class L2Book:
             self._set(self._asks, self._ask_px, px, D(s))
             if unconf:
                 unconf.discard(("a", px))
+        if not self.applying:
+            self.first_delta_seq = seq
         self.seq = seq
         self.applying = True
         self.last_update_ts = time.time() if now is None else now
@@ -265,6 +273,60 @@ class L2Book:
         if self.is_crossed():
             return False
         return True
+
+    def prune_with_bbo(self, contents: dict) -> bool | None:
+        """Repair stale snapshot levels from a ``bbo`` frame OLDER than the book (``b <= seq``).
+
+        Usable only when ``b`` is at/after the end of the loss window (``b >= first_delta_seq - 1``): every
+        change after ``b`` was then delivered as a delta, so an UNCONFIRMED level (snapshot only, never
+        touched by a delta) strictly better than the bbo cannot exist any more, and an unconfirmed level AT
+        the bbo price has the bbo size. A bbo from inside the window proves nothing (the level may have been
+        re-added later in the window). A missing bbo level is only inserted by the exact-sequence path
+        (``reconcile_bbo``), which this delegates to when ``b == seq``.
+
+        Returns None (not usable), True (applied) or False (exact-sequence check: confirmed levels
+        disagree -> resnapshot).
+        """
+        if not self.synced or self.seq is None or self.snapshot_seq is None:
+            return None
+        raw = contents.get("lastSequenceId")
+        if raw is None:
+            return None
+        b = int(raw)
+        if b < self.snapshot_seq or b > self.seq:
+            return None
+        if b == self.seq and self.applying:
+            return self.reconcile_bbo(contents)
+        if self.first_delta_seq is None or b < self.first_delta_seq - 1:
+            return None
+        for side, key in (("b", "bestBid"), ("a", "bestAsk")):
+            book, px = (self._bids, self._bid_px) if side == "b" else (self._asks, self._ask_px)
+            lvl = contents.get(key)
+            ref = D(lvl["price"]) if lvl else None
+            if ref is None:
+                better = list(px)
+            elif side == "b":
+                better = px[bisect.bisect_right(px, ref):]
+            else:
+                better = px[:bisect.bisect_left(px, ref)]
+            for p in better:
+                if (side, p) in self._unconfirmed:
+                    self._drop(side, p)
+                    self.repairs += 1
+            if ref is not None and (side, ref) in self._unconfirmed:
+                size = D(lvl["size"])
+                if book.get(ref) != size:
+                    self._set(book, px, ref, size)
+                    self.repairs += 1
+                self._unconfirmed.discard((side, ref))
+        return True
+
+    def top_unconfirmed(self) -> bool:
+        """True while the best bid or best ask is still a snapshot-only (possibly stale) level."""
+        if not self._unconfirmed:
+            return False
+        return bool((self._bid_px and ("b", self._bid_px[-1]) in self._unconfirmed)
+                    or (self._ask_px and ("a", self._ask_px[0]) in self._unconfirmed))
 
 
 def bbo_to_order_book(symbol: str, contents: dict, *, venue: str = "arcus", ts: float | None = None) -> OrderBook:

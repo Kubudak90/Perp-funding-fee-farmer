@@ -117,6 +117,11 @@ def test_error_classification():
     e = h.TxRejected(20558, "restricted")
     assert e.fatal and not e.retryable and e.code == 20558
     assert h.TxRejected(23000, "rate").retryable
+    # sendTx: internal error / process timeout / 5xx / code-less acks leave the outcome unknown (spec §12)
+    assert all(h.is_ambiguous_tx_code(c) for c in (29500, 29501, 502, -1, None))
+    assert not any(h.is_ambiguous_tx_code(c) for c in (21104, 21506, 23000, 21701, 20558, -403))
+    assert {20558, 21120, 21501, 21701}.issubset(h.DETERMINISTIC_TX_CODES)
+    assert not {21104, 21506, 23000, 29500, 52002, 21739} & h.DETERMINISTIC_TX_CODES
 
 
 # --------------------------------------------------------------------------- funding

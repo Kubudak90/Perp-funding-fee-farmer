@@ -56,6 +56,9 @@ class FakeTransport:
             raise ConnectionError("ws closed")
         if action == "not_sent":
             raise TxNotSent("down")
+        if isinstance(action, tuple) and action[0] == "accept_then":  # executed, but answered with action[1]
+            self.chain.accept(tx)
+            return action[1]
         if isinstance(action, dict):
             return action
         raise AssertionError(action)
@@ -257,3 +260,106 @@ async def test_nonce_fetch_failure_before_send_is_retryable():
     with pytest.raises(TxRejected) as ei:
         await ex.submit(builder("a"))
     assert ei.value.retryable and t.calls == []
+
+
+# --------------------------------------------------------------------------- review fixes
+async def test_ambiguous_ack_after_accept_resolved_by_hash_no_double_execution():
+    """29501 'process timeout' does not prove the tx was dropped: resolve by hash, never report 'not executed'."""
+    ex, t, chain = make()
+    t.ws_script = [("accept_then", {"error": {"code": 29501, "message": "process timeout"}, "id": "x"})]
+    b1 = builder("hedge1")
+    r1 = await ex.submit(b1)
+    assert r1.via == "lookup" and len(b1.built) == 1 and ex.next_nonce == 101
+    r2 = await ex.submit(builder("hedge2"))
+    assert r2.nonce == 101
+    assert sorted(chain.accepted.values()) == [100, 101]  # hedge1 once, hedge2 once
+
+
+async def test_ambiguous_ack_not_executed_resends_identical_payload():
+    ex, t, chain = make()
+    t.ws_script = [{"code": 29500, "message": "internal server error"}]
+    b = builder("hedge")
+    r = await ex.submit(b)
+    assert r.resent and len(b.built) == 1
+    assert chain.accepted == {b.built[0].tx_hash: 100} and ex.next_nonce == 101
+
+
+@pytest.mark.parametrize("code", [21506, 29500, 23000, -403])
+async def test_maybe_dup_rest_copy_transient_rejection_is_resolved(code):
+    """WS died after the frame left (copy executed); the REST copy is refused transiently -> resolve, not reject."""
+    ex, t, chain = make()
+    t.ws_script = ["closed_after_accept"]
+    t.rest_script = [{"code": code, "message": "transient"}]
+    b = builder("hedge")
+    r = await ex.submit(b)
+    assert r.via == "lookup" and len(b.built) == 1 and ex.next_nonce == 101
+    await ex.submit(builder("next"))
+    assert sorted(chain.accepted.values()) == [100, 101]  # the hedge executed exactly once
+
+
+async def test_maybe_dup_deterministic_rejection_is_not_resolved():
+    ex, t, chain = make()
+    t.ws_script = ["closed"]
+    t.rest_script = [{"code": 21701, "message": "invalid base amount"}]
+    with pytest.raises(TxRejected) as ei:
+        await ex.submit(builder("bad"))
+    assert ei.value.tx_code == 21701 and t.lookups == 0 and ex.next_nonce == 100
+
+
+@pytest.mark.parametrize("resend", [{"code": 21506, "message": "too many pending txs"},
+                                    ("accept_then", {"code": 29500, "message": "internal server error"})])
+async def test_identical_resend_transient_answer_is_unknown(resend):
+    """The first copy's outcome is unknown by definition: a transient answer to the resend cannot settle it."""
+    ex, t, chain = make()
+    t.ws_script = ["lost", resend]
+    with pytest.raises(TxUnknown):
+        await ex.submit(builder("hedge"))
+    assert ex.next_nonce is None and ex.stats["unknown"] == 1
+
+
+async def test_second_invalid_nonce_after_resync_is_retryable():
+    """nextNonce lags while an earlier tx sits in the speed bump: a second 21104 is transient."""
+    chain = FakeChain(101)  # tx 100 accepted, still pending
+    ex, t, _ = make(chain)
+    ex.next_nonce = 100
+    t.fetch_next_nonce = lambda: _const(100)  # type: ignore[assignment]  # lagging nextNonce
+    with pytest.raises(TxRejected) as ei:
+        await ex.submit(builder("hedge"))
+    assert ei.value.tx_code == 21104 and ei.value.retryable and ex.next_nonce is None
+
+
+async def _const(n):
+    return n
+
+
+async def test_request_resync_rereads_nonce_before_next_tx():
+    """A sequencer failure (status 0) does not consume the nonce: the next tx must be signed with nextNonce."""
+    ex, t, chain = make()
+    r1 = await ex.submit(builder("a"))
+    assert r1.nonce == 100 and ex.next_nonce == 101
+    chain.nonce = 100  # tx 100 failed in the sequencer (status 0): nonce not consumed
+    ex.request_resync()
+    r2 = await ex.submit(builder("b"))
+    assert r2.nonce == 100 and t.nonce_fetches == 2
+
+
+async def test_request_resync_during_submit_is_not_lost():
+    ex, t, chain = make()
+    ex.next_nonce = 100
+    gate = asyncio.Event()
+    orig = t.send_ws
+
+    async def slow(tx, timeout):
+        await gate.wait()
+        return await orig(tx, timeout)
+
+    t.send_ws = slow  # type: ignore[assignment]
+    task = asyncio.create_task(ex.submit(builder("a")))
+    await asyncio.sleep(0.01)
+    ex.request_resync()  # an earlier tx reported status 0 while this one is in flight
+    gate.set()
+    await task
+    assert ex.next_nonce == 101
+    fetches = t.nonce_fetches
+    await ex.submit(builder("b"))
+    assert t.nonce_fetches == fetches + 1

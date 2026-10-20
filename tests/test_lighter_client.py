@@ -137,10 +137,11 @@ class FakeWS:
         self.sent: list[tuple[int, dict, str]] = []
         self.script: list = []
         self.stats = {}
+        self.rx_age = 0.05
 
     @property
     def can_send_tx(self):
-        return self.connected and not self.restricted
+        return self.connected and not self.restricted and self.rx_age < 3.0
 
     @property
     def channels(self):
@@ -168,7 +169,7 @@ class FakeWS:
         return self.connected
 
     def last_rx_age(self):
-        return 0.05
+        return self.rx_age
 
     async def send_tx(self, tx_type, tx_info, tx_hash, timeout):
         self.sent.append((tx_type, tx_info, tx_hash))
@@ -177,6 +178,8 @@ class FakeWS:
             return {"id": "x", "code": 200, "tx_hash": tx_hash}
         if action == "timeout":
             raise asyncio.TimeoutError
+        if callable(action):
+            return action(tx_type, tx_info, tx_hash)
         return action
 
 
@@ -529,6 +532,12 @@ async def test_snapshot_trades_not_reemitted_unless_tracked(mocked):
         snap2["trades"]["0"].insert(0, our_trade(coi, 2**49 + 1, 999999999999, "0.0100", "2403.00"))
         ex._on_ws_message(snap2)
         assert [f.trade_id for f in fills] == ["999999999999"]
+        # replayed from a snapshot: flagged so the hedger reconciles instead of adding it blindly
+        assert fills[0].recovered is True
+        # a live update frame is not a replay
+        ex._on_ws_message(frame_account_all(trades={"0": [our_trade(coi, 2**49 + 1, 999999999998, "0.0010",
+                                                                        "2403.00")]}))
+        assert [f.trade_id for f in fills][-1] == "999999999998" and fills[-1].recovered is False
     finally:
         await ex.close()
 
@@ -740,13 +749,39 @@ async def test_set_leverage(mocked):
 async def test_funding_payments_from_ws(mocked):
     ex, _ = await make_exchange(mocked)
     try:
-        ex._funding_rest_at = time.monotonic()  # skip the REST reconcile
+        ex._funding_rest_at = time.monotonic() + 3600  # skip the REST backfill
         frame = next(f for f in load("ws_account_all_funding.json") if f["channel"] == f"account_all:{ACCT}")
         ex._on_ws_message(frame)
         ex._on_ws_message(frame)  # deduped by (funding_id, market_id)
         pays = await ex.fetch_funding_payments()
         assert len(pays) == 1 and pays[0].amount == D("-0.218616") and pays[0].symbol == "ETH"
         assert await ex.fetch_funding_payments(since_ts=pays[0].ts + 1) == []
+    finally:
+        await ex.close()
+
+
+async def test_funding_backfill_follows_cursor_and_retries_soon_after_failure(mocked):
+    ex, _ = await make_exchange(mocked)
+    path = "/api/v1/positionFunding"
+
+    def rows(start, n):
+        return [{"timestamp": 1792429200 - 3600 * i, "market_id": 0, "funding_id": i, "change": "-0.01",
+                 "rate": "0.000012", "position_size": "1", "position_side": "long", "discount": "0"}
+                for i in range(start, start + n)]
+
+    try:
+        mocked.get(path, payload={"code": 200, "position_fundings": rows(0, 100), "next_cursor": "c1"})
+        mocked.get(path, payload={"code": 200, "position_fundings": rows(100, 7), "next_cursor": "c2"})
+        pays = await ex.fetch_funding_payments(since_ts=1.0)
+        calls = mocked.calls("GET", path)
+        assert len(pays) == 107 and len(calls) == 2
+        assert "cursor" not in calls[0]["query"] and calls[1]["query"]["cursor"] == "c1"
+        assert len(await ex.fetch_funding_payments(since_ts=1.0)) == 107 and len(mocked.calls("GET", path)) == 2
+        # a failed backfill is retried after about a minute, not 15
+        ex._funding_rest_at = 0.0
+        mocked.get(path, status=500, body="oops")
+        await ex.fetch_funding_payments(since_ts=1.0)
+        assert 30 < ex._funding_rest_at - time.monotonic() <= 60
     finally:
         await ex.close()
 
@@ -796,5 +831,226 @@ async def test_stale_pending_order_confirmed_over_rest(mocked):
         req = mocked.calls("GET", ACCOUNT_ORDERS)[0]
         assert req["query"]["client_order_indexes"] == str(coi) and req["query"]["account_index"] == str(ACCT)
         assert req["headers"]["Authorization"].split(":")[1:3] == [str(ACCT), "5"]
+    finally:
+        await ex.close()
+
+
+# --------------------------------------------------------------------------- review fixes
+def frame_account_tx(h, *, status, ae="", typ=14):
+    return {"channel": f"account_tx:{ACCT}", "type": "update/account_tx",
+            "txs": [{"hash": h, "type": typ, "status": status, "event_info": json.dumps({"ae": ae} if ae else {})}]}
+
+
+async def test_rest_positions_refused_while_fills_pending_replay(mocked):
+    """WS down: REST positions already include the hedge's fill that the reconnect snapshot re-emits."""
+    ex, _ = await make_exchange(mocked)
+    fills, _, _ = collect(ex)
+    try:
+        snap = load("ws_account_all_snapshot_313004.json")
+        ex._on_ws_message(snap)
+        ex._ws.connected = False
+        ex._on_ws_disconnect("test")
+        mocked.post(SENDTX, payload={"code": 200, "tx_hash": "x" * 80, "predicted_execution_time_ms": 1})
+        r = await ex.place_market("ETH", Side.BUY, D("0.0100"), worst_price=D("2410"))
+        assert r.ok and r.order.status is OrderStatus.PENDING
+        mocked.get(ACCOUNT, payload=load("rest_account_313004.json"), repeat=True)  # includes the fill
+        with pytest.raises(ExchangeError) as ei:
+            await ex.fetch_positions()
+        assert ei.value.retryable and "pending replay" in str(ei.value)
+        assert mocked.calls("GET", ACCOUNT) == []
+        # the stream comes back: the snapshot replays the fill exactly once, positions come from the WS cache
+        coi = ex._cid_to_coi[r.order.client_id]
+        ex._ws.connected = True
+        snap2 = copy.deepcopy(snap)
+        snap2["trades"]["0"].insert(0, our_trade(coi, 2**49 + 1, 999999999999, "0.0100", "2403.00"))
+        ex._on_ws_message(snap2)
+        assert [f.trade_id for f in fills] == ["999999999999"] and r.order.status is OrderStatus.FILLED
+        assert (await ex.fetch_positions())["ETH"].size == D("3.9663")
+        # nothing left to replay: a later outage may use REST again
+        ex._ws.connected = False
+        ex._on_ws_disconnect("test")
+        assert (await ex.fetch_positions())["ETH"].size == -D("19.0112")
+    finally:
+        await ex.close()
+
+
+async def test_rest_positions_replay_guard_is_bounded(mocked):
+    ex, _ = await make_exchange(mocked)
+    try:
+        r = await ex.place_market("ETH", Side.BUY, D("0.0100"), worst_price=D("2410"))
+        ex._ws.connected = False
+        mocked.get(ACCOUNT, payload=load("rest_account_313004.json"), repeat=True)
+        with pytest.raises(ExchangeError):
+            await ex.fetch_positions()
+        ex._meta[ex._cid_to_coi[r.order.client_id]].sent_at -= 1000  # long outage: do not block reads forever
+        assert (await ex.fetch_positions())["ETH"].size == -D("19.0112")
+    finally:
+        await ex.close()
+
+
+async def test_stalled_connected_ws_is_not_venue_truth(mocked):
+    """A socket that is 'connected' but silent may be stalled: neither its position cache nor its sendtx is used."""
+    ex, _ = await make_exchange(mocked)
+    try:
+        ex._on_ws_message(load("ws_account_all_snapshot_313004.json"))
+        ex._on_ws_message(load("ws_user_stats_313004.json"))
+        assert (await ex.fetch_positions())["ETH"].size == D("3.9663")
+        ex._ws.rx_age = 15.0  # no frame for 15 s, watchdog not tripped yet
+        mocked.get(ACCOUNT, payload=load("rest_account_313004.json"), repeat=True)
+        assert (await ex.fetch_positions())["ETH"].size == -D("19.0112")  # REST, not the frozen cache
+        assert len(mocked.calls("GET", ACCOUNT)) == 1
+        mocked.post(SENDTX, payload={"code": 200, "tx_hash": "x" * 80, "predicted_execution_time_ms": 1})
+        r = await ex.place_market("ETH", Side.BUY, D("0.0100"), worst_price=D("2410"))
+        assert r.ok and ex._ws.sent == [] and len(mocked.calls("POST", SENDTX)) == 1  # tx over REST
+        # an expired in-flight hedge must not be dropped against the frozen cache: positions are deferred
+        with pytest.raises(ExchangeError) as ei:
+            await ex.fetch_positions()
+        assert ei.value.retryable
+    finally:
+        await ex.close()
+
+
+async def test_budget_health_includes_tx_cap(mocked):
+    ex, _ = await make_exchange(mocked, max_tx_per_minute=4)
+    try:
+        h0 = ex.budget_health()
+        for _ in range(3):
+            assert ex._tx_limiter.try_acquire()
+        assert ex.budget_health() == 0.25 < h0  # 1 of 4 txs left although the shared bucket is nearly free
+    finally:
+        await ex.close()
+
+
+async def test_private_ok_tracks_account_stream(mocked):
+    ex, _ = await make_exchange(mocked)
+    try:
+        ok, why = ex.private_ok()
+        assert not ok and "not synced" in why  # no account/orders snapshot yet
+        ex._on_ws_message(load("ws_account_all_snapshot_313004.json"))
+        ex._on_ws_message(frame_orders([], snapshot=True))
+        assert ex.private_ok() == (True, "")
+        ex._ws.rx_age = ex._ws_watchdog_s + 1  # silent socket
+        assert not ex.private_ok()[0]
+        ex._ws.rx_age = 0.05
+        ex._ws.connected = False
+        ex._on_ws_disconnect("test")
+        assert not ex.private_ok()[0]
+    finally:
+        await ex.close()
+    pub, _ = await make_exchange(mocked, creds=False)
+    try:
+        assert not pub.private_ok()[0]
+    finally:
+        await pub.close()
+
+
+async def test_account_tx_status0_resyncs_nonce_for_any_of_our_txs(mocked):
+    ex, signer = await make_exchange(mocked)  # nextNonce route answers 10
+    try:
+        r = await ex.place_market("ETH", Side.BUY, D("0.0100"), worst_price=D("2410"))
+        h = ex._meta[ex._cid_to_coi[r.order.client_id]].tx_hash
+        assert ex._executor.next_nonce == 11
+        ex._on_ws_message(frame_account_tx(h, status=0))  # failed before apply: nonce 10 NOT consumed
+        assert r.order.status is OrderStatus.REJECTED
+        await ex.place_market("ETH", Side.BUY, D("0.0100"), worst_price=D("2410"))
+        assert signer.calls[-1][1]["Nonce"] == 10
+        # same for a non-order tx (cancel)
+        assert await ex.cancel_order("ETH", order_id="562946773250577")
+        cancel_hash = ex._ws.sent[-1][2]
+        assert ex._executor.next_nonce == 12
+        ex._on_ws_message(frame_account_tx(cancel_hash, status=0, typ=15))
+        await ex.place_market("ETH", Side.BUY, D("0.0100"), worst_price=D("2410"))
+        assert signer.calls[-1][1]["Nonce"] == 10
+        # an applied no-op (status 2 + error) consumed its nonce: no resync
+        h2 = ex._ws.sent[-1][2]
+        ex._on_ws_message(frame_account_tx(h2, status=2, ae="21738 reduce-only wrong direction"))
+        assert not ex._executor._resync
+    finally:
+        await ex.close()
+
+
+async def test_stale_order_lookup_status0_resyncs_nonce(mocked):
+    ex, signer = await make_exchange(mocked)
+    try:
+        r = await ex.place_market("ETH", Side.BUY, D("0.0100"), worst_price=D("2410"))
+        coi = ex._cid_to_coi[r.order.client_id]
+        meta = ex._meta[coi]
+        mocked.get(ACCOUNT_ORDERS, payload={"code": 200, "orders": []}, repeat=True)
+        mocked.get(TX, payload={"code": 200, "hash": meta.tx_hash, "status": 0, "event_info": ""}, repeat=True)
+        meta.sent_at -= 60
+        for _ in range(2):
+            meta.last_check = 0.0
+            await ex._confirm_stale_orders()
+        assert r.order.status is OrderStatus.REJECTED
+        await ex.place_market("ETH", Side.BUY, D("0.0100"), worst_price=D("2410"))
+        assert signer.calls[-1][1]["Nonce"] == 10
+    finally:
+        await ex.close()
+
+
+async def test_account_tx_failure_before_submit_returns_rejects_order(mocked):
+    """The ack is lost; account_tx reports the tx as a no-op while the executor is still resolving it by hash."""
+    ex, _ = await make_exchange(mocked)
+    try:
+        ex._executor.lookup_interval_s = 0.0
+
+        def lost_ack_then_frame(tx_type, tx_info, tx_hash):
+            ex._on_ws_message(frame_account_tx(tx_hash, status=2, ae="21738 reduce-only order wrong direction"))
+            raise asyncio.TimeoutError
+
+        ex._ws.script = [lost_ack_then_frame]
+        mocked.get(TX, payload={"code": 200, "hash": "h", "status": 2, "event_info": ""}, repeat=True)
+        r = await ex.place_market("ETH", Side.SELL, D("0.0100"), worst_price=D("2390"), reduce_only=True)
+        assert not r.ok and r.order.status is OrderStatus.REJECTED and "sequencer" in r.order.error
+    finally:
+        await ex.close()
+
+
+async def test_lookup_receipt_with_applied_error_rejects_order(mocked):
+    ex, _ = await make_exchange(mocked)
+    try:
+        ex._executor.lookup_interval_s = 0.0
+        ex._ws.script = ["timeout"]
+        mocked.get(TX, payload={"code": 200, "hash": "h", "status": 2,
+                                "event_info": json.dumps({"ae": "21738 reduce-only order wrong direction"})}, repeat=True)
+        r = await ex.place_market("ETH", Side.SELL, D("0.0100"), worst_price=D("2390"), reduce_only=True)
+        assert not r.ok and r.order.status is OrderStatus.REJECTED and "21738" in r.order.error
+    finally:
+        await ex.close()
+
+
+async def test_taker_minimum_checked_at_mid_not_worst_price(mocked):
+    ex, signer = await make_exchange(mocked)
+    try:
+        await ex.subscribe_books(["ETH"])
+        ex._on_ws_message({"channel": "order_book:0", "type": "subscribed/order_book",
+                           "order_book": {"nonce": 5, "asks": [{"price": "2381.05", "size": "1"}],
+                                          "bids": [{"price": "2380.95", "size": "1"}]}})
+        # 0.0042 x mid 2381.00 = 10.0002 USDC (the hedger's check passes); x worst 2379.04 = 9.99
+        r = await ex.place_market("ETH", Side.SELL, D("0.0042"), worst_price=D("2379.04"))
+        assert r.ok and signer.calls[-1][1]["Price"] == 237904 and signer.calls[-1][1]["BaseAmount"] == 42
+        # genuinely below the minimum at the mid: refused, but retryable (no error-breaker feed)
+        r2 = await ex.place_market("ETH", Side.SELL, D("0.0041"), worst_price=D("2379.04"))
+        assert not r2.ok and r2.retryable and "minimum" in r2.error
+    finally:
+        await ex.close()
+
+
+async def test_auth_token_rotated_by_rest_caller_resubscribes_ws(mocked):
+    ex, _ = await make_exchange(mocked)
+    try:
+        provider = ex._ws.subs[f"account_tx/{ACCT}"]
+        tok1 = provider()  # the WS subscribed the auth channels with tok1
+        t, exp, created = ex._auth
+        age = 0.85 * (exp - created)
+        ex._auth = (t, exp - age, created - age)
+        tok2 = ex._auth_token()  # a REST auth read (accountOrders, positionFunding...) rotates it first
+        assert tok2 != tok1
+        ex._ws.resubs.clear()
+        ex._maybe_refresh_auth()
+        assert set(ex._ws.resubs) == {f"account_all_orders/{ACCT}", f"account_tx/{ACCT}"}
+        ex._ws.resubs.clear()
+        ex._maybe_refresh_auth()
+        assert ex._ws.resubs == []  # once per rotation
     finally:
         await ex.close()

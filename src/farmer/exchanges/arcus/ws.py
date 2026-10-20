@@ -6,6 +6,8 @@ One instance = one socket that is kept alive forever:
 - protocol pings (library) + JSON ``{"type":"ping"}`` every ``ping_interval_s`` (the ``pong`` doubles
   as an application-level liveness probe);
 - silent-drop watchdog: no frame at all for ``watchdog_s`` -> force reconnect;
+- subscriptions not acknowledged within ``subscribe_timeout_s`` are re-sent (bounded); a ``degraded``
+  frame means "pending, server retries": the timer is re-armed with its ``retryAfterMs``;
 - proactive roll before the server's 24 h connection lifetime;
 - RPC ``get``/``post`` with strictly increasing integer ids per connection (reset to 1 on reconnect,
   pending futures failed on disconnect).
@@ -64,6 +66,7 @@ class ArcusWsConnection:
         backoff_max_s: float = 30.0,
         open_timeout_s: float = 15.0,
         subscribe_timeout_s: float = 15.0,
+        max_subscribe_retries: int = 3,
         connect: Callable[..., Any] | None = None,
     ) -> None:
         self.url = url
@@ -78,11 +81,14 @@ class ArcusWsConnection:
         self.backoff_max_s = backoff_max_s
         self.open_timeout_s = open_timeout_s
         self.subscribe_timeout_s = subscribe_timeout_s
+        self.max_subscribe_retries = max_subscribe_retries
         self._connect = connect or websockets.connect
         self.log = logging.getLogger(f"farmer.arcus.ws.{name}")
 
         self._subs: dict[SubKey, dict] = {}
-        self._pending_subs: dict[SubKey, float] = {}
+        self._pending_subs: dict[SubKey, float] = {}  # key -> time the ack timeout counts from
+        self._sub_retries: dict[SubKey, int] = {}
+        self.degraded: dict[SubKey, dict] = {}  # key -> last ``degraded`` frame (pending on the server)
         self._ws: Any = None
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -154,6 +160,8 @@ class ArcusWsConnection:
     async def unsubscribe(self, key: SubKey) -> None:
         m = self._subs.pop(key, None)
         self._pending_subs.pop(key, None)
+        self._sub_retries.pop(key, None)
+        self.degraded.pop(key, None)
         if m is not None and self.connected:
             await self._send_json(self._unsub_msg(m))
 
@@ -244,6 +252,8 @@ class ArcusWsConnection:
                 self._ws = None
                 self._fail_pending(ConnectionError(f"arcus ws {self.name} reconnecting"))
                 self._pending_subs.clear()
+                self._sub_retries.clear()
+                self.degraded.clear()
                 if self.on_disconnect is not None:
                     try:
                         self.on_disconnect()
@@ -321,9 +331,21 @@ class ArcusWsConnection:
             self.connection_id = str(msg.get("connection_id"))
         elif t in ("subscribed", "degraded", "unsubscribed"):
             if t == "subscribed":
-                self._pending_subs.pop(sub_key(msg), None)
+                key = sub_key(msg)
+                self._pending_subs.pop(key, None)
+                self._sub_retries.pop(key, None)
+                self.degraded.pop(key, None)
             elif t == "degraded":
-                self.log.warning("subscription degraded: %s", {k: msg.get(k) for k in ("channel", "id", "reason")})
+                key = sub_key(msg)
+                self.degraded[key] = msg
+                try:
+                    retry_s = max(0.0, int(msg.get("retryAfterMs") or 0) / 1000.0)
+                except (TypeError, ValueError):
+                    retry_s = 0.0
+                if key in self._subs:  # still pending: the server retries, so restart the ack timer later
+                    self._pending_subs[key] = time.monotonic() + retry_s
+                self.log.warning("subscription degraded: %s",
+                                 {k: msg.get(k) for k in ("channel", "id", "reason", "retryAfterMs")})
         elif t == "error":
             self.log.warning("arcus ws %s error frame: %.300s", self.name, msg.get("message"))
         try:
@@ -341,7 +363,7 @@ class ArcusWsConnection:
                 return
 
     async def _watchdog(self, ws: Any) -> None:
-        period = max(0.05, min(self.watchdog_s / 4, 5.0))
+        period = max(0.05, min(self.watchdog_s / 4, self.subscribe_timeout_s / 4, 5.0))
         while True:
             await asyncio.sleep(period)
             now = time.monotonic()
@@ -354,9 +376,23 @@ class ArcusWsConnection:
                 await self._close_quietly(ws)
                 return
             for key, sent in list(self._pending_subs.items()):
-                if now - sent > self.subscribe_timeout_s:
-                    self.log.warning("subscription %s not acknowledged after %.0fs", key, now - sent)
+                if now - sent <= self.subscribe_timeout_s:
+                    continue
+                n = self._sub_retries.get(key, 0)
+                if key not in self._subs or n >= self.max_subscribe_retries:
+                    self.log.error("subscription %s not acknowledged after %d attempt(s) -> giving up until the "
+                                   "next reconnect", key, n + 1)
                     self._pending_subs.pop(key, None)
+                    continue
+                self._sub_retries[key] = n + 1
+                self.log.warning("subscription %s not acknowledged after %.0fs -> re-sending (%d/%d)", key,
+                                 now - sent, n + 1, self.max_subscribe_retries)
+                try:
+                    await self.resubscribe(key)  # unsubscribe + subscribe, re-arms the timer
+                except Exception as exc:  # the socket is broken: reconnect (resubscribes everything)
+                    self.log.warning("re-sending subscription %s failed: %r -> reconnect", key, exc)
+                    await self._close_quietly(ws)
+                    return
 
 
 async def _guard(coro: Awaitable, logger: logging.Logger, what: str) -> None:
