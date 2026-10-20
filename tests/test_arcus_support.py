@@ -12,10 +12,11 @@ import asyncio
 import inspect
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from aiohttp import web
 from multidict import CIMultiDict
@@ -162,7 +163,7 @@ def mock_rest(srv: FakeHttp, *, creds: bool = True, whitelisted: bool = True, ap
 
 # --------------------------------------------------------------------------- fake websocket
 class FakeSocket:
-    def __init__(self, server: "FakeWsServer") -> None:
+    def __init__(self, server: FakeWsServer) -> None:
         self.server = server
         self.sent: list[dict] = []
         self.q: asyncio.Queue = asyncio.Queue()

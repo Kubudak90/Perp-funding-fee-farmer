@@ -21,7 +21,7 @@ from typing import Any
 
 import aiohttp
 
-from farmer.exchanges.lighter.helpers import RESTRICTED_MESSAGE, ERR_RESTRICTED, parse_ack
+from farmer.exchanges.lighter.helpers import ERR_RESTRICTED, RESTRICTED_MESSAGE, parse_ack
 
 log = logging.getLogger("farmer.lighter.keys")
 
@@ -175,7 +175,7 @@ async def register_api_key(
         try:
             resp = json.loads(text)
         except ValueError:
-            raise KeySetupError(f"sendTx: non-JSON HTTP {r.status}: {text[:200]}")
+            raise KeySetupError(f"sendTx: non-JSON HTTP {r.status}: {text[:200]}") from None
         ok, code, msg = parse_ack(resp)
         if not ok:
             if code == ERR_RESTRICTED:

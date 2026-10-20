@@ -2,7 +2,12 @@
 
 The strategy asks ``check_quote`` before (re)quoting and ``check_open`` before increasing a
 position; hedging is never gated here (risk-reducing). ``run`` polls balances on every venue
-with credentials and enforces the daily loss limit. ``halt`` is sticky until ``resume``.
+with credentials and enforces the daily loss limit.
+
+Halts have a kind. A circuit-breaker halt (``HALT_ERROR``: ``max_consecutive_errors`` on one venue) clears
+itself once no venue error was recorded for ``error_halt_cooldown_s`` (doubling with every automatic resume
+within 24 h, at most ``max_auto_resumes_per_day``); every other kind (daily loss, margin reduction, hedge
+failures, manual) is sticky until ``resume`` / a restart, and keeps the bot halted while it is active.
 
 Margin: ``check_open`` refuses new exposure when a venue's maintenance/equity ratio reaches
 ``max_margin_ratio`` or its free collateral cannot post the clip's initial margin with a buffer
@@ -15,10 +20,12 @@ rebalance collateral (the bot never moves funds between venues).
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import time
+from collections.abc import Awaitable, Callable, Mapping
 from decimal import Decimal
-from typing import TYPE_CHECKING, Awaitable, Callable, Mapping
+from typing import TYPE_CHECKING
 
 from farmer.config import RiskConfig
 from farmer.exchanges.base import Exchange
@@ -33,6 +40,13 @@ log = logging.getLogger("farmer.risk")
 
 SECONDS_PER_DAY = 86400
 REDUCE_RETRY_S = 60.0  # re-run the reducer this long after the previous run ended while margin stays high
+MAX_ERROR_COOLDOWN_S = 4 * 3600.0  # cap of the doubling circuit-breaker cooldown
+
+# halt kinds; only HALT_ERROR clears itself (see the module docstring)
+HALT_ERROR = "error"
+HALT_LOSS = "daily_loss"
+HALT_MARGIN = "margin"
+HALT_MANUAL = "manual"
 
 
 def utc_midnight(ts: float) -> float:
@@ -54,8 +68,8 @@ class RiskManager:
         self,
         cfg: RiskConfig,
         venues: dict[str, Exchange],
-        store: "Store | None" = None,
-        notifier: "Notifier | None" = None,
+        store: Store | None = None,
+        notifier: Notifier | None = None,
         *,
         interval_s: float = 10.0,
         clock: Callable[[], float] = time.time,
@@ -74,11 +88,12 @@ class RiskManager:
         self.balance_timeout_s = float(cfg.balance_timeout_s)
         self.balance_max_age_s = max(float(cfg.balance_max_age_s), 2 * self.interval_s)
 
-        self._halted = False
-        self._halt_reason: str | None = None
-        self._halt_ts: float | None = None
+        self._halts: dict[str, tuple[str, float]] = {}  # kind -> (reason, ts); insertion order = halt order
         self._errors: dict[str, int] = {}
         self._last_error: dict[str, str] = {}
+        self._last_error_ts: float | None = None
+        self._auto_resumes: collections.deque[float] = collections.deque()  # ts of automatic resumes (24 h)
+        self._auto_resume_exhausted = False
         self._exposure: dict[str, dict[str, Decimal]] = {}  # venue -> symbol -> abs notional
         self._balances: dict[str, Balance] = {}
         self._balance_ts: dict[str, float] = {}  # local clock time of the last successful fetch
@@ -101,11 +116,16 @@ class RiskManager:
     # ================================================================== state
     @property
     def halted(self) -> bool:
-        return self._halted
+        return bool(self._halts)
 
     @property
     def halt_reason(self) -> str | None:
-        return self._halt_reason
+        """Reason of the oldest active halt."""
+        return next(iter(self._halts.values()))[0] if self._halts else None
+
+    @property
+    def _halt_ts(self) -> float | None:
+        return next(iter(self._halts.values()))[1] if self._halts else None
 
     def balance(self, venue: str) -> Balance | None:
         return self._balances.get(venue)
@@ -134,8 +154,12 @@ class RiskManager:
             except Exception:
                 log.exception("daily loss check failed")
             try:
+                self.maybe_auto_resume()
+            except Exception:
+                log.exception("automatic resume check failed")
+            try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.interval_s)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     def stop(self) -> None:
@@ -158,7 +182,7 @@ class RiskManager:
             *(asyncio.wait_for(self.venues[n].fetch_balance(), self.balance_timeout_s) for n in names),
             return_exceptions=True,
         )
-        for name, res in zip(names, results):
+        for name, res in zip(names, results, strict=True):
             if isinstance(res, BaseException):
                 if isinstance(res, asyncio.CancelledError):
                     raise res
@@ -215,7 +239,8 @@ class RiskManager:
             return False
         high = ", ".join(f"{v} {b.margin_ratio:.3f}" for v, b in self._balances.items()
                          if b.margin_ratio >= self.cfg.reduce_margin_ratio)
-        self.halt(f"margin ratio >= reduce_margin_ratio {self.cfg.reduce_margin_ratio} ({high}): reducing positions")
+        self.halt(f"margin ratio >= reduce_margin_ratio {self.cfg.reduce_margin_ratio} ({high}): reducing positions",
+                  kind=HALT_MARGIN)
         if self._reducer is None:
             if not self._no_reducer_warned:
                 self._no_reducer_warned = True
@@ -325,34 +350,70 @@ class RiskManager:
         self._daily_pnl_ts = now
         limit = Decimal(self.cfg.max_daily_loss)
         if limit > 0 and pnl < -limit:
-            self.halt(f"daily loss limit breached: pnl {pnl:.2f} USD < -{limit} USD")
+            self.halt(f"daily loss limit breached: pnl {pnl:.2f} USD < -{limit} USD", kind=HALT_LOSS)
         return pnl
 
     # ================================================================== halt / resume
-    def halt(self, reason: str) -> None:
-        """Stop quoting/opening (idempotent). Logs CRITICAL, records an event, notifies."""
-        if self._halted:
-            log.debug("already halted (%s); ignoring: %s", self._halt_reason, reason)
+    def halt(self, reason: str, *, kind: str = HALT_MANUAL) -> None:
+        """Stop quoting/opening; one halt per ``kind`` (repeats are ignored). Logs CRITICAL, records an event,
+        notifies. Only a ``HALT_ERROR`` halt clears itself (``maybe_auto_resume``)."""
+        if kind in self._halts:
+            log.debug("already halted (%s); ignoring: %s", self._halts[kind][0], reason)
             return
-        self._halted = True
-        self._halt_reason = reason
-        self._halt_ts = self._clock()
-        log.critical("TRADING HALTED: %s", reason)
-        self._record("halt", {"reason": reason})
+        also = self.halted
+        self._halts[kind] = (reason, self._clock())
+        log.critical("TRADING HALTED%s: %s", " (again)" if also else "", reason)
+        self._record("halt", {"reason": reason, "kind": kind})
         self._notify(f"HALT: {reason}")
 
     def resume(self) -> None:
-        """Clear the halt and the error counters (a still-breached daily loss re-halts on the next check)."""
-        if not self._halted:
+        """Clear every halt and the error counters (a still-breached daily loss re-halts on the next check)."""
+        if not self._halts:
             return
-        prev = self._halt_reason
-        self._halted = False
-        self._halt_reason = None
-        self._halt_ts = None
+        prev = "; ".join(r for r, _ in self._halts.values())
+        self._halts.clear()
         self._errors.clear()
+        self._auto_resume_exhausted = False
         log.warning("trading resumed (was halted: %s)", prev)
         self._record("resume", {"previous_reason": prev})
         self._notify(f"RESUMED (was: {prev})")
+
+    def maybe_auto_resume(self) -> bool:
+        """Clear a circuit-breaker halt once no venue error was recorded for the cooldown (``error_halt_cooldown_s``
+        doubled per automatic resume within 24 h). Other halt kinds stay. Returns True when it cleared one."""
+        h = self._halts.get(HALT_ERROR)
+        base = float(self.cfg.error_halt_cooldown_s or 0)
+        if h is None or base <= 0:
+            return False
+        now = self._clock()
+        while self._auto_resumes and now - self._auto_resumes[0] >= SECONDS_PER_DAY:
+            self._auto_resumes.popleft()
+        n = len(self._auto_resumes)
+        if n >= int(self.cfg.max_auto_resumes_per_day):
+            if not self._auto_resume_exhausted:
+                self._auto_resume_exhausted = True
+                msg = (f"circuit breaker: {n} automatic resume(s) within 24 h already; staying halted until restart "
+                       f"({h[0]})")
+                log.critical(msg)
+                self._notify(msg)
+            return False
+        cooldown = min(base * 2 ** n, MAX_ERROR_COOLDOWN_S)
+        quiet = now - max(h[1], self._last_error_ts or h[1])
+        if quiet < cooldown:
+            return False
+        del self._halts[HALT_ERROR]
+        self._errors.clear()
+        self._auto_resumes.append(now)
+        self._auto_resume_exhausted = False
+        if self._halts:
+            log.warning("circuit breaker cleared after %.0fs without venue errors, still halted: %s", quiet,
+                        self.halt_reason)
+        else:
+            log.warning("trading resumed automatically: no venue error for %.0fs (was halted: %s)", quiet, h[0])
+        self._record("resume", {"previous_reason": h[0], "auto": True, "quiet_s": round(quiet, 1)})
+        self._notify(f"RESUMED automatically after {quiet:.0f}s without venue errors (was: {h[0]})"
+                     + (f"; still halted: {self.halt_reason}" if self._halts else ""))
+        return True
 
     def _record(self, kind: str, data: dict) -> None:
         if self.store is None:
@@ -392,8 +453,9 @@ class RiskManager:
         n = self._errors.get(venue, 0) + 1
         self._errors[venue] = n
         self._last_error[venue] = err
+        self._last_error_ts = self._clock()
         if n >= self.cfg.max_consecutive_errors:
-            self.halt(f"circuit breaker: {n} consecutive errors on {venue} (last: {err})")
+            self.halt(f"circuit breaker: {n} consecutive errors on {venue} (last: {err})", kind=HALT_ERROR)
         elif n >= max(1, self.cfg.max_consecutive_errors // 2):
             log.warning("%s: %d consecutive errors (last: %s)", venue, n, err)
 
@@ -429,8 +491,8 @@ class RiskManager:
         divergence_bps: Decimal | None = None,
     ) -> tuple[bool, str]:
         """May the maker leg quote ``symbol`` now? Returns (ok, reason)."""
-        if self._halted:
-            return False, f"halted: {self._halt_reason}"
+        if self.halted:
+            return False, f"halted: {self.halt_reason}"
         now = self._clock()
         for which, book in (("maker", maker_book), ("taker", taker_book)):
             problem = self._book_problem(which, book, now)
@@ -459,8 +521,8 @@ class RiskManager:
         Per venue with a known balance: fresh, margin ratio below ``max_margin_ratio`` and free collateral of at
         least ``add / leverage * min_free_collateral_mult`` (the hedge leg must be able to post its initial margin,
         or a filled maker clip stays unhedged until the emergency flatten)."""
-        if self._halted:
-            return False, f"halted: {self._halt_reason}"
+        if self.halted:
+            return False, f"halted: {self.halt_reason}"
         now = self._clock()
         add = abs(Decimal(add_notional))
         lev = max(1, int(leverage)) if leverage else self.leverage_for(symbol)
@@ -497,9 +559,10 @@ class RiskManager:
     def status(self) -> dict:
         now = self._clock()
         return {
-            "halted": self._halted,
-            "halt_reason": self._halt_reason,
+            "halted": self.halted,
+            "halt_reason": self.halt_reason,
             "halt_ts": self._halt_ts,
+            "halts": {k: r for k, (r, _) in self._halts.items()},
             "must_reduce": self.must_reduce(),
             "reducing": self._reduce_task is not None and not self._reduce_task.done(),
             "equity_diverged": self._equity_diverged,
@@ -524,4 +587,4 @@ class RiskManager:
         }
 
 
-__all__ = ["RiskManager", "utc_midnight"]
+__all__ = ["HALT_ERROR", "HALT_LOSS", "HALT_MANUAL", "HALT_MARGIN", "RiskManager", "utc_midnight"]

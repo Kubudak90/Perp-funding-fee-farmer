@@ -39,6 +39,7 @@ def test_parse_markets_symbols_and_flags(markets):
     assert bonk.step_size == D("1") and bonk.tick_size == D("0.000001")
     assert markets["GME"].active is False  # force_reduce_only
     assert markets["GME"].extra["force_reduce_only"] is True
+    assert markets["GME"].reduce_only_ok and not markets["ETH"].extra["reduce_only_allowed"]
     inactive = [m for m in markets.values() if m.extra["status"] != "active"]
     assert inactive and all(not m.active for m in inactive)
     assert markets["MKR"].min_notional == 0

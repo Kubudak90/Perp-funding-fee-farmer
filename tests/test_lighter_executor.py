@@ -45,10 +45,10 @@ class FakeTransport:
         if action == "accept":
             return self.chain.accept(tx)
         if action == "lost":  # never reached the server, no ack
-            raise asyncio.TimeoutError
+            raise TimeoutError
         if action == "accepted_no_ack":
             self.chain.accept(tx)
-            raise asyncio.TimeoutError
+            raise TimeoutError
         if action == "closed_after_accept":
             self.chain.accept(tx)
             raise ConnectionError("ws closed")

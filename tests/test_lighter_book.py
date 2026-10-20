@@ -43,13 +43,13 @@ def test_top_levels_sorted_and_zero_sizes_removed():
                          "asks": [{"price": "101.00", "size": "1"}, {"price": "100.50", "size": "2"}],
                          "bids": [{"price": "99.00", "size": "3"}, {"price": "99.50", "size": "4"}]})
     bids, asks = book.top(20)
-    assert [l.price for l in asks] == [D("100.50"), D("101.00")]
-    assert [l.price for l in bids] == [D("99.50"), D("99.00")]
+    assert [lvl.price for lvl in asks] == [D("100.50"), D("101.00")]
+    assert [lvl.price for lvl in bids] == [D("99.50"), D("99.00")]
     assert book.apply_update({"begin_nonce": 10, "nonce": 15, "asks": [{"price": "100.50", "size": "0.0000"}],
                               "bids": [{"price": "99.75", "size": "1"}, {"price": "99.00", "size": "0"}]})
     bids, asks = book.top(20)
-    assert [l.price for l in asks] == [D("101.00")]
-    assert [l.price for l in bids] == [D("99.75"), D("99.50")]
+    assert [lvl.price for lvl in asks] == [D("101.00")]
+    assert [lvl.price for lvl in bids] == [D("99.75"), D("99.50")]
     # update of an existing level replaces its size (new total, not a delta)
     assert book.apply_update({"begin_nonce": 15, "nonce": 16, "bids": [{"price": "99.50", "size": "7"}], "asks": []})
     assert book.top(5)[0][1].size == D("7")

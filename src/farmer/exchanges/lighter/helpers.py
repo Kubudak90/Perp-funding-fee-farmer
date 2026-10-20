@@ -15,8 +15,9 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Callable
 from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, InvalidOperation
-from typing import Any, Callable
+from typing import Any
 
 from farmer.exchanges.base import ExchangeError
 from farmer.models import (
@@ -256,6 +257,7 @@ def parse_market(d: dict) -> MarketInfo | None:
     extra = {
         "status": status,
         "force_reduce_only": force_ro,
+        "reduce_only_allowed": status == "active" and force_ro and not frozen,
         "isolated_only": cfg.get("market_margin_mode") == 1,
         "min_imf": min_imf,
         "default_imf": int(d.get("default_initial_margin_fraction") or 0),

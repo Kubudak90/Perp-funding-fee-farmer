@@ -456,6 +456,21 @@ async def test_reduce_only_rules():
     assert ro.order.status is OrderStatus.CANCELED and px.position("BTC") == 0
 
 
+async def test_reduce_only_market_accepts_only_reduce_only_orders():
+    inner, px = make()
+    inner.set_book("BTC", [(100, 5)], [(101, 5)])
+    await px.place_market("BTC", Side.BUY, D("1"), worst_price=D("110"))
+    m = inner.markets["BTC"]
+    m.active, m.extra["reduce_only_allowed"] = False, True
+    r = await px.place_market("BTC", Side.BUY, D("1"), worst_price=D("110"))
+    assert not r.ok and "reduce-only orders only" in r.error
+    r = await px.place_market("BTC", Side.SELL, D("1"), worst_price=D("90"), reduce_only=True)
+    assert r.ok and px.position("BTC") == 0
+    m.extra["reduce_only_allowed"] = False
+    r = await px.place_market("BTC", Side.SELL, D("1"), worst_price=D("90"), reduce_only=True)
+    assert not r.ok and "not active" in r.error
+
+
 async def test_insufficient_margin_rejected():
     inner, px = make(cfg=pcfg(initial_balance=D("1000")))
     inner.set_book("BTC", [(100, 500)], [(101, 500)])

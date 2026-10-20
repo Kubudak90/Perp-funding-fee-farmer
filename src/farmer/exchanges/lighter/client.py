@@ -31,9 +31,10 @@ import asyncio
 import collections
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Callable
+from typing import Any
 
 import aiohttp
 
@@ -147,7 +148,7 @@ class _OrderMeta:
 class _Transport:
     """TxTransport for the executor: WS ``sendtx`` + REST fallback, all under the shared budget."""
 
-    def __init__(self, ex: "LighterExchange") -> None:
+    def __init__(self, ex: LighterExchange) -> None:
         self.ex = ex
 
     def ws_ready(self) -> bool:
@@ -163,7 +164,7 @@ class _Transport:
             if tx:
                 await asyncio.wait_for(ex._tx_limiter.acquire(), wait)
             await asyncio.wait_for(ex._limiter.acquire(), wait)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise TxNotSent("lighter rate budget exhausted") from exc
 
     async def send_ws(self, tx: SignedTx, timeout: float) -> dict:
@@ -191,7 +192,7 @@ class _Transport:
         except ValueError:
             if status == 403:  # CDN/WAF page: request blocked before reaching the API
                 return {"error": {"code": -403, "message": text[:200]}}
-            raise ConnectionError(f"sendTx HTTP {status} non-JSON body: {text[:120]}")
+            raise ConnectionError(f"sendTx HTTP {status} non-JSON body: {text[:120]}") from None
         if status >= 500:
             raise ConnectionError(f"sendTx HTTP {status}: {text[:200]}")  # may have been accepted -> resolve
         return j if isinstance(j, dict) else {"error": {"code": -status, "message": text[:200]}}
@@ -441,7 +442,7 @@ class LighterExchange(Exchange):
             async with self._http.get(self._url(path), params=params, headers=headers) as r:
                 text = await r.text()
                 status = r.status
-        except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as exc:
+        except (TimeoutError, aiohttp.ClientError, OSError) as exc:
             raise ExchangeError(f"lighter GET {path} failed: {exc!r}", retryable=True) from exc
         return self._parse_rest(path, status, text)
 
@@ -772,7 +773,7 @@ class LighterExchange(Exchange):
     def _on_order_json(self, o: dict) -> None:
         try:
             oidx = int(o.get("order_index"))
-            mid = int(o.get("market_index"))
+            int(o.get("market_index"))  # malformed frames are dropped
         except (TypeError, ValueError):
             return
         coi = int(o.get("client_order_index") or 0)
@@ -1372,6 +1373,9 @@ class LighterExchange(Exchange):
             raise ValueError("size and price must be Decimal")
         if size <= 0 or price <= 0:
             raise ValueError("size and price must be positive")
+        if not m.active and not (reduce_only and m.reduce_only_ok):
+            why = "reduce-only" if m.reduce_only_ok else (m.extra.get("status") or "not active")
+            raise ValueError(f"market {m.symbol} is {why}")
         assert m.size_decimals is not None and m.price_decimals is not None
         base = size_to_int(size, m.size_decimals, exact=True)
         px = worst_price_to_int(price, side, m.price_decimals) if taker else price_to_int(price, m.price_decimals)
@@ -1441,7 +1445,7 @@ class LighterExchange(Exchange):
         if wait_s > 0 and order.status is OrderStatus.PENDING:
             try:
                 await asyncio.wait_for(meta.event.wait(), wait_s)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         if order.status is OrderStatus.CANCELED and order.error == "canceled-post-only":
             return OrderResult(ok=False, order=order, error="post-only order would cross", would_cross=True)
@@ -1599,7 +1603,7 @@ class LighterExchange(Exchange):
         if meta is not None and self._order_ack_timeout_s > 0:
             try:
                 await asyncio.wait_for(meta.event.wait(), self._order_ack_timeout_s)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         if target.status is OrderStatus.CANCELED and target.error == "canceled-post-only":
             return OrderResult(ok=False, order=target, error="post-only order would cross", would_cross=True)

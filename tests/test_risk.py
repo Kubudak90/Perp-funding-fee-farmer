@@ -218,6 +218,82 @@ async def test_halt_idempotent_and_resume():
     assert len(notifier.sent) == 2
 
 
+def _clocked(**cfg):
+    now = [1_000_000.0]
+    venues = {"arcus": FakeExchange("arcus"), "lighter": FakeExchange("lighter")}
+    notifier = FakeNotifier()
+    rm = RiskManager(RiskConfig(**cfg), venues, Store(":memory:"), notifier, clock=lambda: now[0])
+    return rm, now, notifier
+
+
+async def test_circuit_breaker_halt_clears_after_a_quiet_cooldown():
+    rm, now, notifier = _clocked(max_consecutive_errors=2, error_halt_cooldown_s=300)
+    rm.record_error("lighter", "e1")
+    rm.record_error("lighter", "e2")
+    assert rm.halted and "circuit breaker" in rm.halt_reason
+    now[0] += 200
+    rm.record_error("lighter", "e3")  # hedges failing while halted: the venue is not healthy yet
+    now[0] += 299
+    assert not rm.maybe_auto_resume() and rm.halted
+    now[0] += 2
+    assert rm.maybe_auto_resume()
+    assert not rm.halted and rm.status()["errors"] == {}
+    assert rm.check_quote("BTC", book("arcus", 100, 100.1), book("lighter", 100, 100.1))[0]
+    ev = rm.store.recent_events(1)[0]
+    assert ev[1] == "resume" and ev[2]["auto"] is True
+    await _drain()
+    assert notifier.sent[-1].startswith("RESUMED automatically")
+
+
+async def test_circuit_breaker_cooldown_doubles_and_gives_up_after_the_daily_limit():
+    rm, now, notifier = _clocked(max_consecutive_errors=1, error_halt_cooldown_s=100, max_auto_resumes_per_day=2)
+    for wait in (100, 200):  # 100 s, then doubled
+        rm.record_error("arcus", "x")
+        now[0] += wait - 1
+        assert not rm.maybe_auto_resume()
+        now[0] += 1
+        assert rm.maybe_auto_resume() and not rm.halted
+    rm.record_error("arcus", "x")
+    now[0] += 10_000
+    assert not rm.maybe_auto_resume() and rm.halted  # third time within 24 h: stays halted
+    assert not rm.maybe_auto_resume()
+    await _drain()
+    assert sum("staying halted until restart" in m for m in notifier.sent) == 1
+    now[0] += 86400  # the window rolls: automatic resumes are allowed again
+    assert rm.maybe_auto_resume() and not rm.halted
+
+
+async def test_sticky_halts_are_never_cleared_automatically():
+    rm, now, _ = _clocked(max_consecutive_errors=1, error_halt_cooldown_s=10)
+    rm.halt("unhedged delta persists")  # hedger / manual: sticky
+    now[0] += 10_000
+    assert not rm.maybe_auto_resume() and rm.halted
+    rm.resume()
+    rm.record_error("arcus", "x")
+    rm.halt("daily loss limit breached", kind="daily_loss")
+    assert rm.status()["halts"].keys() == {"error", "daily_loss"} and "circuit breaker" in rm.halt_reason
+    now[0] += 11
+    assert rm.maybe_auto_resume()  # the circuit breaker part clears ...
+    assert rm.halted and rm.halt_reason == "daily loss limit breached"  # ... the loss halt stays
+
+
+async def test_auto_resume_disabled_and_run_loop_drives_it():
+    rm, now, _ = _clocked(max_consecutive_errors=1, error_halt_cooldown_s=0)
+    rm.record_error("arcus", "x")
+    now[0] += 1e6
+    assert not rm.maybe_auto_resume() and rm.halted
+    rm2, venues, *_ = setup(max_consecutive_errors=1, error_halt_cooldown_s=0.05)
+    rm2.interval_s = 0.01
+    rm2.record_error("arcus", "x")
+    task = asyncio.create_task(rm2.run())
+    t0 = time.monotonic()
+    while rm2.halted and time.monotonic() - t0 < 2:
+        await asyncio.sleep(0.01)
+    rm2.stop()
+    await asyncio.wait_for(task, 1.0)
+    assert not rm2.halted
+
+
 def test_halt_without_running_loop_does_not_raise():
     rm = RiskManager(RiskConfig(), {}, None, FakeNotifier())
     rm.halt("sync context")

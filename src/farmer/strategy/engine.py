@@ -1,9 +1,11 @@
 """Engine: wires venues, maps markets, starts monitors/hedgers/traders and shuts everything down safely.
 
 Lifecycle:
-- ``start()``: connect venues, resolve pairs, set leverage, cancel stale maker orders, read positions,
-  subscribe books, start the funding monitor, the risk manager and one Hedger per pair (pre-existing delta is
-  hedged right away). Traders are created but do not quote yet.
+- ``start()``: connect venues, resolve pairs, set leverage, cancel stale maker orders, read positions (and warn
+  about positions no pair manages), subscribe books, start the funding monitor, the risk manager and one Hedger
+  per pair (pre-existing delta is hedged right away). Traders are created but do not quote yet.
+  ``include_reduce_only`` (close-all) also maps markets that only accept reduce-only orders as ``close_only``
+  pairs: a hedger (reduce-only) but no trader; ``close_all`` flattens them with reduce-only IOCs in either mode.
 - ``run()``: ``start()`` + traders + periodic status log, until ``request_stop()``; then ``shutdown()``.
 - ``shutdown()``: stop traders (cancel quotes; then cancel_all on every maker market as insurance), let hedgers
   flush and settle (fills racing the cancels), optionally ``close_all("taker")`` (``risk.close_on_exit``, only if
@@ -17,8 +19,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Literal
 
 from farmer.config import AppConfig
 from farmer.exchanges.base import Exchange
@@ -34,8 +37,9 @@ log = logging.getLogger("farmer.engine")
 
 class Engine:
     def __init__(self, cfg: AppConfig, venues: dict[str, Exchange], store: Any, notifier: Any, risk: Any, *,
-                 funding: FundingMonitor | None = None) -> None:
+                 funding: FundingMonitor | None = None, include_reduce_only: bool = False) -> None:
         self.cfg = cfg
+        self.include_reduce_only = include_reduce_only
         self.venues = venues
         self.store = store
         self.notifier = notifier
@@ -96,7 +100,8 @@ class Engine:
                 log.warning("%s: connect failed (unused venue): %r", v.name, r)
 
         self.pairs, self.skipped = await resolve_pairs(self.maker, self.taker, self.cfg.enabled_markets(),
-                                                       check_prices=self.check_prices)
+                                                       check_prices=self.check_prices,
+                                                       allow_reduce_only=self.include_reduce_only)
         for reason in self.skipped:
             log.warning("market skipped: %s", reason)
         for p in self.pairs:
@@ -104,15 +109,17 @@ class Engine:
         self._record("pairs", {"pairs": [p.describe() for p in self.pairs], "skipped": self.skipped})
         if not self.pairs:
             raise RuntimeError("no tradeable pairs: " + "; ".join(self.skipped))
+        tradeable = [p for p in self.pairs if p.tradeable]
 
         self._trading = self.maker.has_credentials and self.taker.has_credentials
         if not self._trading:
             log.warning("credentials missing (maker=%s taker=%s): read-only engine", self.maker.has_credentials,
                         self.taker.has_credentials)
         if self._trading:
-            await self._set_leverage()
+            await self._set_leverage(tradeable)
             await self._cancel_stale_orders()
         m_pos, t_pos = await self._read_positions()
+        self._warn_unmanaged(m_pos, t_pos)
 
         for p in self.pairs:
             h = Hedger(p, self.maker, self.taker, scfg, self.cfg.risk, self.risk, self.store, notifier=self.notifier)
@@ -127,10 +134,10 @@ class Engine:
         await self._subscribe_books()
 
         if self.funding is None:
-            self.funding = FundingMonitor(self.maker, self.taker, [p.symbol for p in self.pairs],
+            self.funding = FundingMonitor(self.maker, self.taker, [p.symbol for p in tradeable],
                                           refresh_s=scfg.funding_refresh_s,
-                                          maker_symbols={p.symbol: p.maker_symbol for p in self.pairs},
-                                          taker_symbols={p.symbol: p.taker_symbol for p in self.pairs})
+                                          maker_symbols={p.symbol: p.maker_symbol for p in tradeable},
+                                          taker_symbols={p.symbol: p.taker_symbol for p in tradeable})
         try:
             await asyncio.wait_for(self.funding.refresh(), 15.0)
             for snap in self.funding.all().values():
@@ -138,7 +145,7 @@ class Engine:
         except Exception as exc:
             log.warning("initial funding refresh failed: %r", exc)
 
-        for p in self.pairs:
+        for p in tradeable:
             self.traders[p.symbol] = PairTrader(p, self.maker, self.taker, scfg, self.risk, self.funding, self.store,
                                                 hedger=self.hedgers[p.symbol], rcfg=self.cfg.risk,
                                                 notifier=self.notifier)
@@ -295,7 +302,21 @@ class Engine:
             await asyncio.wait(pending, timeout=timeout_s)
 
     # ------------------------------------------------------------------ start helpers
-    async def _set_leverage(self) -> None:
+    def _warn_unmanaged(self, m_pos: dict[str, Decimal], t_pos: dict[str, Decimal]) -> None:
+        """Positions on markets no pair manages are neither hedged nor closed by the bot: say so at startup."""
+        mine = {self.maker.name: {p.maker_symbol for p in self.pairs},
+                self.taker.name: {p.taker_symbol for p in self.pairs}}
+        extra = [f"{ex.name}:{s} {fmt(q)}" for ex, pos in ((self.maker, m_pos), (self.taker, t_pos))
+                 for s, q in sorted(pos.items()) if q != 0 and s not in mine[ex.name]]
+        if not extra:
+            return
+        msg = (f"positions not managed by any pair (neither hedged nor closed by the bot): {', '.join(extra)}. "
+               "Close them on the venue, or with `farmer close-all` if they belong to a configured market")
+        log.warning(msg)
+        self._notify(f"WARNING: {msg}")
+        self._record("unmanaged_positions", {"positions": extra, "skipped": self.skipped})
+
+    async def _set_leverage(self, pairs: list[PairSpec]) -> None:
         """Per pair on both venues (venues in parallel, markets sequentially: Arcus setLeverage costs 125 IP
         weight, Lighter one tx of the shared 60/min budget). Failures are logged, never fatal."""
         if not self.cfg.strategy.set_leverage_on_start:
@@ -308,8 +329,8 @@ class Engine:
                 except Exception as exc:
                     log.warning("%s: set_leverage(%s, %s) failed: %r", ex.name, sym, lev, exc)
 
-        await asyncio.gather(one_venue(self.maker, [(p.maker_symbol, int(p.cfg.leverage)) for p in self.pairs]),
-                             one_venue(self.taker, [(p.taker_symbol, int(p.cfg.leverage)) for p in self.pairs]))
+        await asyncio.gather(one_venue(self.maker, [(p.maker_symbol, int(p.cfg.leverage)) for p in pairs]),
+                             one_venue(self.taker, [(p.taker_symbol, int(p.cfg.leverage)) for p in pairs]))
 
     async def _cancel_stale_orders(self) -> None:
         """Cancel resting maker orders on our markets (by id: cancelAll can cost far more pool units)."""
@@ -417,7 +438,7 @@ class Engine:
         if task is not None and not task.done():
             try:
                 await asyncio.wait_for(asyncio.shield(task), 5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            except (TimeoutError, asyncio.CancelledError, Exception):
                 task.cancel()
         return ok
 
@@ -489,7 +510,8 @@ class Engine:
     # ------------------------------------------------------------------ close all
     async def close_all(self, mode: Literal["maker", "taker"] = "maker", timeout_s: float = 600) -> dict:
         """Flatten every pair. ``maker``: hedged post-only closing (taker hedges) until flat; traders stay in
-        forced-close afterwards. ``taker``: stop quoting and IOC both legs (reduce-only) until flat.
+        forced-close afterwards. ``taker``: stop quoting and IOC both legs (reduce-only) until flat. ``close_only``
+        pairs (no trader) are flattened with reduce-only IOCs in both modes.
 
         Returns {symbol: {"maker_pos", "taker_pos", "flat"}}.
         """
@@ -511,9 +533,11 @@ class Engine:
             for t in self.traders.values():
                 t.force_close(True)
             self._start_traders()
+            close_only = [h for h in self.hedgers.values() if h.close_only]
             while time.monotonic() < deadline:
                 if all(self._is_flat(h, mode) for h in self.hedgers.values()):
                     break
+                await self._flatten_pending(close_only)
                 await asyncio.sleep(0.05 if self.cfg.strategy.loop_interval_s < 0.05 else 0.25)
         else:
             await asyncio.gather(*(self._stop_trader(t) for t in self.traders.values()), return_exceptions=True)
@@ -521,15 +545,9 @@ class Engine:
                 h.close_mode = True
             try:
                 while time.monotonic() < deadline:
-                    pending = [h for h in self.hedgers.values() if not h.is_flat()]
-                    if not pending:
+                    if all(h.is_flat() for h in self.hedgers.values()):
                         break
-                    for h in pending:
-                        if not h.has_inflight():
-                            try:
-                                await h.flatten()
-                            except Exception:
-                                log.exception("%s flatten failed", h.symbol)
+                    await self._flatten_pending(list(self.hedgers.values()))
                     await asyncio.sleep(0.05 if self.cfg.strategy.loop_interval_s < 0.05 else 0.5)
             finally:
                 for h in self.hedgers.values():
@@ -546,10 +564,22 @@ class Engine:
         return result
 
     @staticmethod
+    async def _flatten_pending(hedgers: list[Hedger]) -> None:
+        """One reduce-only IOC round on both legs of every hedger that is not flat and has nothing in flight."""
+        for h in hedgers:
+            if h.is_flat() or h.has_inflight():
+                continue
+            try:
+                await h.flatten()
+            except Exception:
+                log.exception("%s flatten failed", h.symbol)
+
+    @staticmethod
     def _is_flat(h: Hedger, mode: str) -> bool:
         """Maker mode: a maker residual below the PAIR minimum can never be quoted (the forced-close trader stops
-        there), so it is dust like in the trader; taker mode uses the per-venue minimums (``flatten``)."""
-        if mode != "maker":
+        there), so it is dust like in the trader; taker mode (and close-only pairs, which are always flattened with
+        IOCs) uses the per-venue minimums (``flatten``)."""
+        if mode != "maker" or h.close_only:
             return h.is_flat()
         px = h.ref_price()
         return h.is_flat(maker_min=h.pair.min_size(px) if px is not None and px > 0 else None)

@@ -186,7 +186,7 @@ class ArcusRest:
                 if not exc.retryable or attempt >= self.get_retries:
                     raise
                 delay = (exc.retry_after_ms / 1000.0) if exc.retry_after_ms else 0.5 * 2 ** attempt
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            except (TimeoutError, aiohttp.ClientError) as exc:
                 if attempt >= self.get_retries:
                     raise ExchangeError(f"arcus GET {path} failed: {exc!r}", retryable=True) from exc
                 delay = 0.5 * 2 ** attempt

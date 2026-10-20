@@ -18,8 +18,9 @@ import collections
 import enum
 import logging
 import time
+from collections.abc import Callable
 from decimal import Decimal
-from typing import Any, Callable
+from typing import Any
 
 from farmer.config import RiskConfig, StrategyConfig
 from farmer.exchanges.base import Exchange
@@ -282,7 +283,7 @@ class PairTrader:
                     continue
                 try:
                     await asyncio.wait_for(self._wake.wait(), self.heartbeat_s)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
                 self._wake.clear()
         finally:
@@ -291,13 +292,13 @@ class PairTrader:
                 self.hedger.stop()
                 try:
                     await asyncio.wait_for(hedger_task, 5.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                except (TimeoutError, asyncio.CancelledError, Exception):
                     hedger_task.cancel()
 
     async def _sleep(self, s: float) -> None:
         try:
             await asyncio.wait_for(self._stop.wait(), s)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     async def stop(self, cancel_quotes: bool = True) -> bool:
@@ -595,7 +596,7 @@ class PairTrader:
             if not ok:
                 return None, False, f"risk: {why}"
         if reducing:
-            if not (mm.active and tm.active):
+            if not (mm.reduce_only_ok and tm.reduce_only_ok):  # a reduce-only market can still be closed
                 return None, False, "market inactive"
         else:
             if not self._venues_open():

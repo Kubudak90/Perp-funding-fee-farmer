@@ -18,10 +18,11 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from farmer import __version__
 from farmer.config import AppConfig, ArcusConfig, LighterConfig, MarketConfig, ResolvedMarket, load_config
@@ -558,7 +559,7 @@ async def status(cfg: AppConfig, out=None) -> int:
         maker_n, taker_n = cfg.strategy.maker_venue, cfg.strategy.taker_venue
         if maker_n in positions and taker_n in positions:
             pairs, skipped = await resolve_pairs(usable[maker_n], usable[taker_n], cfg.enabled_markets(),
-                                                 check_prices=False)
+                                                 check_prices=False, allow_reduce_only=True)
             print("\n== delta per pair (maker + taker, base units) ==", file=out)
             for p in pairs:
                 mp = positions[maker_n].get(p.maker_symbol)
@@ -571,7 +572,9 @@ async def status(cfg: AppConfig, out=None) -> int:
                 hedged = abs(delta) < p.min_size(px) if px else delta == 0
                 usd = f" (${fmt(abs(delta) * px, 2)})" if px and delta else ""
                 print(f"{p.symbol:<10} maker {fmt(m_sz):>14} taker {fmt(t_sz):>14} delta {fmt(delta):>12}{usd}"
-                      f"{'' if hedged else '  <-- UNHEDGED'}", file=out)
+                      f"{'' if hedged else '  <-- UNHEDGED'}"
+                      f"{'  (reduce-only market: close with farmer close-all)' if p.close_only and (m_sz or t_sz) else ''}",
+                      file=out)
             for s in skipped:
                 print(f"  (skipped {s})", file=out)
             known = {p.maker_symbol for p in pairs} | {p.taker_symbol for p in pairs}
@@ -659,7 +662,8 @@ async def close_all(cfg: AppConfig, *, taker: bool, timeout_s: float, out=None) 
     store = Store(store_path(cfg, False))
     notifier = make_notifier(cfg.monitoring.telegram_bot_token, cfg.monitoring.telegram_chat_id)
     risk = make_risk(cfg, venues, store, notifier)
-    engine = Engine(cfg, venues, store, notifier, risk)
+    # markets that only accept reduce-only orders (e.g. Lighter force_reduce_only) are closed too, with IOCs
+    engine = Engine(cfg, venues, store, notifier, risk, include_reduce_only=True)
     mode = "taker" if taker else "maker"
     rc = EXIT_OK
     loop = asyncio.get_running_loop()

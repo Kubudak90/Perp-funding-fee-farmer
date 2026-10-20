@@ -20,10 +20,10 @@ import math
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Iterator
 
 from farmer.models import Fill, FundingPayment
 

@@ -339,6 +339,37 @@ async def test_close_all_reports_positions_no_pair_could_close(monkeypatch, tmp_
     assert "not touched: lighter:XRP 5" in text
 
 
+async def test_close_all_closes_a_reduce_only_market_and_status_flags_it(monkeypatch, tmp_path):
+    """A configured market Lighter switched to force_reduce_only: `run` skips it, but close-all flattens both legs
+    with reduce-only IOCs (also in maker mode) instead of reporting it UNMANAGED."""
+    creds_env(monkeypatch)
+    cfg = cli._load(cli.build_parser().parse_args(["close-all"]))
+    cfg = cfg.model_copy(update={"data_dir": tmp_path, "risk": fast_risk(),
+                                 "strategy": fast_strategy(markets=[MarketConfig(symbol="BTC"),
+                                                                    MarketConfig(symbol="SOL")])})
+    venues = fake_venues()
+    for name, ex in venues.items():
+        m = make_market(name, "SOL", tick="0.01", step="0.01", min_size="0.01", min_notional="1", market_id=7)
+        ex.markets["SOL"] = m
+        ex.set_book("SOL", [(150, 100)], [(150.1, 100)])
+    lm = venues["lighter"].markets["SOL"]
+    lm.active = False
+    lm.extra.update(force_reduce_only=True, reduce_only_allowed=True)
+    venues["arcus"].positions["SOL"] = D("-10")
+    venues["lighter"].positions["SOL"] = D("10")
+    monkeypatch.setattr(cli, "build_venues", lambda *a, **k: venues)
+    out = io.StringIO()
+    assert await cli.status(cfg, out=out) == cli.EXIT_OK
+    assert "reduce-only market: close with farmer close-all" in out.getvalue()
+    out = io.StringIO()
+    rc = await cli.close_all(cfg, taker=False, timeout_s=10, out=out)
+    text = out.getvalue()
+    assert rc == cli.EXIT_OK and "UNMANAGED" not in text
+    assert venues["arcus"].positions.get("SOL", D(0)) == 0 and venues["lighter"].positions.get("SOL", D(0)) == 0
+    sol = [c for ex in venues.values() for c in ex.calls if c[0] == "place_market" and c[1] == "SOL"]
+    assert len(sol) == 2 and all(c[5] for c in sol)  # reduce-only on both legs
+
+
 async def test_close_all_maker_switches_to_taker_when_risk_halts(monkeypatch, tmp_path):
     """A halted risk manager stops all quoting, so a maker close would only wait out its timeout. Today's daily
     loss no longer halts close-all at all; other halts (here: margin) switch it to IOC mode."""

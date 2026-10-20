@@ -5,7 +5,9 @@ Rules (research: specs/overlap-feasibility.md section 3):
    ``"BTC"`` or a venue ticker such as ``"BTC-USD"``).
 2. Otherwise the same base symbol on both venues.
 3. Otherwise the K <-> 1000 prefix rule (Arcus ``KBONK`` == Lighter ``1000BONK``, same contract scale).
-4. Both markets must be active (Lighter ``force_reduce_only`` / Arcus ``OFFLINE`` markets are inactive).
+4. Both markets must be active (Lighter ``force_reduce_only`` / Arcus ``OFFLINE`` markets are inactive). With
+   ``allow_reduce_only`` (close-all) a market that still accepts reduce-only orders is mapped as a ``close_only``
+   pair: flattened with reduce-only orders, never quoted.
 5. ALWAYS verify the price ratio ``maker_mid / taker_mid`` lies within ``1 +/- 2 %``: it catches different
    instruments that share a ticker (live: Arcus QNT = 0.18 x Lighter QNT). Commodity ETFs are never mapped to
    spot proxies (GLD != XAU): there is no proxy table here on purpose.
@@ -42,6 +44,11 @@ class PairSpec:
     taker_market: MarketInfo
     cfg: ResolvedMarket
     price_ratio: Decimal | None = None  # maker/taker price at mapping time (None if not checked)
+    close_only: bool = False  # a leg's market only accepts reduce-only orders: flatten it, never quote
+
+    @property
+    def tradeable(self) -> bool:
+        return not self.close_only
 
     @property
     def step(self) -> Decimal:
@@ -55,7 +62,7 @@ class PairSpec:
     def describe(self) -> str:
         r = f" ratio={self.price_ratio:.4f}" if self.price_ratio is not None else ""
         return (f"{self.symbol}: {self.maker_market.venue}:{self.maker_symbol} <-> "
-                f"{self.taker_market.venue}:{self.taker_symbol}{r}")
+                f"{self.taker_market.venue}:{self.taker_symbol}{r}{' (close only)' if self.close_only else ''}")
 
 
 def candidate_symbols(symbol: str) -> list[str]:
@@ -132,15 +139,26 @@ async def venue_prices(ex: Exchange, symbols: list[str]) -> dict[str, Decimal]:
     return out
 
 
+def _inactive_reason(m: MarketInfo) -> str:
+    if m.reduce_only_ok or m.extra.get("force_reduce_only"):
+        return "reduce-only"
+    return m.extra.get("status") or "not active"
+
+
 async def resolve_pairs(maker: Exchange, taker: Exchange, markets: list[ResolvedMarket], *,
-                        check_prices: bool = True,
+                        check_prices: bool = True, allow_reduce_only: bool = False,
                         max_ratio_dev: Decimal = DEFAULT_MAX_RATIO_DEV) -> tuple[list[PairSpec], list[str]]:
     """Map configured markets onto both venues. Returns (pairs, human-readable skip reasons).
 
-    Both venues must have their markets loaded (``connect()``/``load_markets()``).
+    ``allow_reduce_only``: an inactive market that still accepts reduce-only orders yields a ``close_only`` pair
+    instead of a skip (close-all). Both venues must have their markets loaded (``connect()``/``load_markets()``).
     """
     skipped: list[str] = []
     staged: list[tuple[ResolvedMarket, str, str]] = []
+
+    def usable(m: MarketInfo) -> bool:
+        return m.active or (allow_reduce_only and m.reduce_only_ok)
+
     used_maker: dict[str, str] = {}
     used_taker: dict[str, str] = {}
     for cfg in markets:
@@ -150,8 +168,8 @@ async def resolve_pairs(maker: Exchange, taker: Exchange, markets: list[Resolved
             skipped.append(f"{sym}: {how_m}")
             continue
         m_info = maker.markets[mk]
-        if not m_info.active:
-            skipped.append(f"{sym}: {maker.name}:{mk} inactive ({m_info.extra.get('status') or 'not active'})")
+        if not usable(m_info):
+            skipped.append(f"{sym}: {maker.name}:{mk} inactive ({_inactive_reason(m_info)})")
             continue
         tk, how_t = find_market(taker, sym, _override_for(cfg, taker))
         if tk is None and not _override_for(cfg, taker) and mk != sym:
@@ -164,10 +182,8 @@ async def resolve_pairs(maker: Exchange, taker: Exchange, markets: list[Resolved
                            f"({maker.name}:{mk} / {taker.name}:{tk})")
             continue
         t_info = taker.markets[tk]
-        if not t_info.active:
-            why = "reduce-only" if t_info.extra.get("force_reduce_only") else (t_info.extra.get("status") or
-                                                                              "not active")
-            skipped.append(f"{sym}: {taker.name}:{tk} inactive ({why})")
+        if not usable(t_info):
+            skipped.append(f"{sym}: {taker.name}:{tk} inactive ({_inactive_reason(t_info)})")
             continue
         used_maker[mk] = sym
         used_taker[tk] = sym
@@ -197,8 +213,9 @@ async def resolve_pairs(maker: Exchange, taker: Exchange, markets: list[Resolved
                 skipped.append(f"{sym}: price ratio {maker.name}/{taker.name} = {ratio:.4f} outside "
                                f"[{lo}, {hi}] ({pm} vs {pt}): different instruments?")
                 continue
-        pairs.append(PairSpec(symbol=sym, maker_symbol=mk, taker_symbol=tk, maker_market=maker.markets[mk],
-                              taker_market=taker.markets[tk], cfg=cfg, price_ratio=ratio))
+        mm, tm = maker.markets[mk], taker.markets[tk]
+        pairs.append(PairSpec(symbol=sym, maker_symbol=mk, taker_symbol=tk, maker_market=mm, taker_market=tm, cfg=cfg,
+                              price_ratio=ratio, close_only=not (mm.active and tm.active)))
     return pairs, skipped
 
 

@@ -312,3 +312,53 @@ async def test_orphan_sweep_loop_hands_open_orders_to_traders(tmp_path):
     assert resting(maker)  # the tracked quote stays
     eng.request_stop()
     await asyncio.wait_for(task, 5)
+
+
+# --------------------------------------------------------------------------- unmanaged / reduce-only markets
+def _reduce_only_eth(maker, taker):
+    m = make_market("lighter", "ETH", tick="0.01", step="0.01", min_size="0.01", min_notional="5", market_id=2)
+    m.active = False
+    m.extra.update(force_reduce_only=True, reduce_only_allowed=True)
+    taker.markets["ETH"] = m
+    taker.set_book("ETH", [(2400, 50)], [(2402, 50)])
+    maker.positions["ETH"], taker.positions["ETH"] = D("0.5"), D("-0.5")
+
+
+async def test_start_warns_about_positions_no_pair_manages(tmp_path):
+    eng, maker, taker, risk, notifier, store = build(tmp_path)
+    _reduce_only_eth(maker, taker)  # configured, but its Lighter market is reduce-only -> skipped by `run`
+    taker.positions["SOL"] = D("-3")  # not configured at all
+    maker.positions["BTC"], taker.positions["BTC"] = D("0.01"), D("-0.01")  # managed by the BTC pair
+    await eng.start()
+    try:
+        assert [p.symbol for p in eng.pairs] == ["BTC"]
+        assert any("ETH: lighter:ETH inactive (reduce-only)" in s for s in eng.skipped)
+        await wait_until(lambda: any("not managed by any pair" in m for m in notifier.messages))
+        msg = next(m for m in notifier.messages if "not managed by any pair" in m)
+        assert "arcus:ETH 0.5" in msg and "lighter:ETH -0.5" in msg and "lighter:SOL -3" in msg
+        assert "BTC" not in msg
+        ev = next(d for _, k, d in store.recent_events(50) if k == "unmanaged_positions")
+        assert len(ev["positions"]) == 3
+    finally:
+        await eng.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["maker", "taker"])
+async def test_close_all_flattens_a_reduce_only_market_with_iocs(tmp_path, mode):
+    eng, maker, taker, risk, notifier, store = build(tmp_path)
+    eng.include_reduce_only = True  # close-all
+    _reduce_only_eth(maker, taker)
+    await eng.start()
+    try:
+        eth = next(p for p in eng.pairs if p.symbol == "ETH")
+        assert eth.close_only and "ETH" not in eng.traders and eng.hedgers["ETH"].close_only
+        assert eng.funding.symbols == ["BTC"]
+        assert "ETH" not in maker.leverage and "ETH" not in taker.leverage
+        assert not any("not managed by any pair" in m for m in notifier.messages)
+        res = await eng.close_all(mode, timeout_s=3)
+    finally:
+        await eng.shutdown()
+    assert res["ETH"] == {"maker_pos": D(0), "taker_pos": D(0), "flat": True} and res["BTC"]["flat"]
+    mk = [(c[1], c[2], c[3], c[5]) for c in maker.calls if c[0] == "place_market"]
+    tk = [(c[1], c[2], c[3], c[5]) for c in taker.calls if c[0] == "place_market"]
+    assert mk == [("ETH", Side.SELL, D("0.50"), True)] and tk == [("ETH", Side.BUY, D("0.50"), True)]

@@ -544,7 +544,8 @@ async def test_margin_cancel_counts_toward_circuit_breaker():
         h, maker, taker, risk, _ = setup()
         n = {"x": 0}
 
-        async def cancel(symbol, side, size, *, worst_price, reduce_only=False, client_id=None, reason=reason):
+        async def cancel(symbol, side, size, *, worst_price, reduce_only=False, client_id=None, reason=reason, n=n,
+                         taker=taker):
             n["x"] += 1
             o = Order("lighter", symbol, side, worst_price, size, client_id, status=OrderStatus.PENDING, ioc=True)
             res = OrderResult(ok=True, order=o)
@@ -558,7 +559,7 @@ async def test_margin_cancel_counts_toward_circuit_breaker():
         taker.place_market = cancel
         async with running(h):
             maker_fill(maker, Side.BUY, "0.01")
-            await wait_until(lambda: n["x"] >= 2)
+            await wait_until(lambda n=n: n["x"] >= 2)
             h.stop()
         assert (len(risk.errors) >= 1) is permanent, reason
 
@@ -638,3 +639,27 @@ async def test_late_fill_after_terminal_adopted_is_not_double_counted():
         await wait_until(lambda: h._reconcile_requested is None)
         await asyncio.sleep(0.05)
     assert h.taker_pos == D("-0.01") and h.delta == 0 and len(markets(taker)) == 1
+
+
+async def test_reduce_only_taker_market_only_gets_reducing_hedges():
+    """A taker market that only accepts reduce-only orders (Lighter force_reduce_only, also a close-only pair): a
+    hedge that would open on it is never sent (the delta escalates instead); a reducing hedge is."""
+    h, maker, taker, *_ = setup()
+    lm = h.pair.taker_market
+    lm.active = False
+    lm.extra["reduce_only_allowed"] = True
+    async with running(h):
+        maker_fill(maker, Side.BUY, "0.01")  # would need a SELL that opens a taker short
+        await asyncio.sleep(0.1)
+        assert markets(taker) == [] and h.delta == D("0.01")
+        h.taker_pos = D("-0.02")  # now a short taker leg exists: the hedge BUY would increase it -> still none
+        maker_fill(maker, Side.SELL, "0.03")  # maker 0.01 - 0.03 = -0.02; delta -0.04 -> BUY 0.04 > |taker|
+        await asyncio.sleep(0.1)
+        assert markets(taker) == []
+    h2, maker2, taker2, *_ = setup()
+    h2.close_only = True  # close-only pair on an active market: same rule
+    h2.set_positions(D("-0.01"), D("0.02"))  # delta +0.01 -> SELL 0.01 reduces the long taker leg
+    async with running(h2):
+        await wait_until(lambda: h2.delta == 0)
+    [(_, _, side, size, _, reduce_only)] = markets(taker2)
+    assert (side, size, reduce_only) == (Side.SELL, D("0.0100"), True)

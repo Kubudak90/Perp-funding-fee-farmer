@@ -32,8 +32,8 @@ def common_step(a: Decimal, b: Decimal) -> Decimal:
     ia, ib = int(a * scale), int(b * scale)
     from math import gcd
 
-    l = ia * ib // gcd(ia, ib)
-    return Decimal(l) / scale
+    lcm = ia * ib // gcd(ia, ib)
+    return Decimal(lcm) / scale
 
 
 def round_down(x: Decimal, step: Decimal) -> Decimal:

@@ -139,6 +139,20 @@ async def test_real_captured_markets():
     assert btc.min_size(D("80000")) >= t.markets["BTC"].min_size
 
 
+async def test_allow_reduce_only_maps_close_only_pairs():
+    """close-all: a Lighter force_reduce_only market (GME) becomes a close-only pair; Arcus OFFLINE (F) accepts no
+    orders at all and stays skipped."""
+    m, t = _real_venues()
+    assert t.markets["GME"].reduce_only_ok and not t.markets["GME"].active
+    assert not m.markets["F"].reduce_only_ok
+    cfg = [rm(s) for s in ("BTC", "GME", "F")]
+    pairs, skipped = await resolve_pairs(m, t, cfg, allow_reduce_only=True)
+    got = {p.symbol: p.close_only for p in pairs}
+    assert got == {"BTC": False, "GME": True}
+    assert "close only" in next(p for p in pairs if p.symbol == "GME").describe()
+    assert len(skipped) == 1 and "F: arcus:F inactive (OFFLINE)" in skipped[0]
+
+
 def test_find_market_how():
     m, _ = venues(["KBONK"], [])
     assert find_market(m, "1000BONK") == ("KBONK", "prefix rule (KBONK)")

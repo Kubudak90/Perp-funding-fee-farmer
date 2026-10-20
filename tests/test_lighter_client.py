@@ -177,7 +177,7 @@ class FakeWS:
         if action is None:
             return {"id": "x", "code": 200, "tx_hash": tx_hash}
         if action == "timeout":
-            raise asyncio.TimeoutError
+            raise TimeoutError
         if callable(action):
             return action(tx_type, tx_info, tx_hash)
         return action
@@ -307,7 +307,7 @@ async def test_books_from_ws_frames_and_gap_resubscribe(mocked):
     try:
         await ex.subscribe_books(["ETH"])
         assert "order_book/0" in ex._ws.subs
-        frames = [json.loads(l) for l in (DATA / "ws_order_book_eth.jsonl").read_text().splitlines()]
+        frames = [json.loads(line) for line in (DATA / "ws_order_book_eth.jsonl").read_text().splitlines()]
         book_frames = [f for f in frames if f["channel"] == "order_book:0"]
         for f in book_frames[:50]:
             ex._on_ws_message(f)
@@ -338,7 +338,7 @@ async def test_fetch_book_rest_aggregates_orders(mocked):
         mocked.get(OBO, payload=raw)
         b = await ex.fetch_book("BTC", depth=5)
         assert mocked.calls("GET", OBO)[0]["query"] == {"market_id": "1", "limit": "25"}
-        assert len(b.asks) <= 5 and b.asks == sorted(b.asks, key=lambda l: l.price)
+        assert len(b.asks) <= 5 and b.asks == sorted(b.asks, key=lambda lvl: lvl.price)
         top = D(raw["asks"][0]["price"])
         assert b.best_ask == top and b.asks[0].size == sum(D(a["remaining_base_amount"]) for a in raw["asks"] if D(a["price"]) == top)
     finally:
@@ -435,6 +435,16 @@ async def test_order_validation(mocked):
         r = await ex.place_market("NOPE", Side.BUY, D("1"), worst_price=D("1"))
         assert not r.ok
         assert sum(1 for k, _ in signer.calls if k == "create") == 1
+        eth = ex.market("ETH")  # the venue switches ETH to force_reduce_only: only reduce-only orders go out
+        eth.active, eth.extra["reduce_only_allowed"] = False, True
+        r = await ex.place_market("ETH", Side.BUY, D("0.0100"), worst_price=D("2420"))
+        assert not r.ok and "reduce-only" in r.error and not r.retryable
+        r = await ex.place_market("ETH", Side.SELL, D("0.0100"), worst_price=D("2390"), reduce_only=True)
+        assert r.ok
+        eth.extra["reduce_only_allowed"] = False  # frozen / not active: nothing goes out
+        r = await ex.place_market("ETH", Side.SELL, D("0.0100"), worst_price=D("2390"), reduce_only=True)
+        assert not r.ok
+        assert sum(1 for k, _ in signer.calls if k == "create") == 2
     finally:
         await ex.close()
 
@@ -996,7 +1006,7 @@ async def test_account_tx_failure_before_submit_returns_rejects_order(mocked):
 
         def lost_ack_then_frame(tx_type, tx_info, tx_hash):
             ex._on_ws_message(frame_account_tx(tx_hash, status=2, ae="21738 reduce-only order wrong direction"))
-            raise asyncio.TimeoutError
+            raise TimeoutError
 
         ex._ws.script = [lost_ack_then_frame]
         mocked.get(TX, payload={"code": 200, "hash": "h", "status": 2, "event_info": ""}, repeat=True)

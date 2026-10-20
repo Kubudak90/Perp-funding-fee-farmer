@@ -71,7 +71,14 @@ construction, minus hedge slippage from the taker latency).
 
 ## Safety
 
-- Hedging is ALWAYS allowed (risk-reducing) even when quoting is paused/halted.
+- Hedging is ALWAYS allowed (risk-reducing) even when quoting is paused/halted. On a taker market that only
+  accepts reduce-only orders (Lighter `force_reduce_only`, `MarketInfo.reduce_only_ok`) only reducing hedges are
+  sent; a delta that needs an opening hedge escalates to the maker-leg emergency flatten. Closing (reduce-only)
+  maker quotes stay allowed on such markets.
+- Halts have a kind (`RiskManager.halt(reason, kind=...)`). A circuit-breaker halt (`max_consecutive_errors`)
+  clears itself after `error_halt_cooldown_s` without any venue error (doubling per automatic resume, at most
+  `max_auto_resumes_per_day` in 24 h); daily-loss, margin-reduction, hedge-failure and manual halts are sticky.
+- Startup logs/notifies positions no pair manages (unconfigured, unmapped or reduce-only markets).
 - Pause quoting when: either book stale (`stale_book_s`), venue mids diverge (`max_divergence_bps`),
   unhedged delta above `max_unhedged_notional`, margin ratio above `max_margin_ratio` or free collateral
   below `clip / leverage * min_free_collateral_mult` on a venue (opening only), RWA market outside regular
@@ -92,7 +99,9 @@ construction, minus hedge slippage from the taker latency).
   market, verified by polling open orders), flush hedgers until no maker fill arrived for `shutdown_settle_s`,
   alert on any unconfirmed cancel or unhedged pair; `close_on_exit` (only after a completed start)
   flattens both legs. `close-all` ignores the daily-loss halt, switches a maker close to taker mode when the
-  risk manager halts, and fails (non-zero exit) for positions in configured markets no pair could close.
+  risk manager halts, maps reduce-only markets as `close_only` pairs (hedger in permanent close mode, no trader,
+  flattened with reduce-only IOCs in both modes) and fails (non-zero exit) for positions in configured markets
+  no pair could close (e.g. Arcus `OFFLINE`, price check failed).
 
 ## Event-loop hygiene
 

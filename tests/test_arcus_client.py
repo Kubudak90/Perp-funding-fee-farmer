@@ -737,6 +737,31 @@ async def test_dms_armed_only_while_orders_rest(env):
     assert len(m.calls("POST", "/v1/scheduleCancel")) == n + 1  # an order may rest -> no disarm at close
 
 
+async def test_quote_placed_during_the_idle_disarm_arms_the_switch_again(env):
+    """The idle disarm marks the switch unarmed BEFORE its request: a place racing it waits and re-arms instead of
+    trusting the pre-disarm timestamp (and resting unprotected until the next refresh)."""
+    factory, server, m = env
+    ex = await factory(dead_mans_switch_s=60)
+    calls = []
+    gate = asyncio.Event()
+
+    async def fake_arm(t):
+        calls.append(t)
+        if not t:
+            await gate.wait()  # the disarm request is slow
+        ex._dms_last_ok = time.monotonic() if t else None
+
+    ex.arm_dead_mans_switch = fake_arm
+    ex._dms_last_ok = time.monotonic()  # armed a moment ago, nothing rests
+    disarm = asyncio.create_task(ex._refresh_dms())
+    await wait_for(lambda: calls == [0])
+    arm = asyncio.create_task(ex._ensure_dms_armed())  # a quote goes out meanwhile
+    await asyncio.sleep(0.02)
+    gate.set()
+    await asyncio.gather(disarm, arm)
+    assert calls == [0, 60.0] and ex._dms_last_ok is not None
+
+
 async def test_dms_disarmed_at_close_when_nothing_rests(env):
     factory, server, m = env
     m.post("/v1/scheduleCancel", payload={"status": "scheduled"}, repeat=True)

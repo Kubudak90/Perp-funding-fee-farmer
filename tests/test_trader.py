@@ -324,6 +324,28 @@ async def test_rwa_closed_gates_opening_but_not_closing():
         assert resting(maker)[0].reduce_only
 
 
+async def test_hedge_market_turning_reduce_only_still_closes_but_never_opens():
+    """Lighter switches the hedge market to force_reduce_only at runtime: the position is still closed with
+    reduce-only maker quotes (hedged with reduce-only IOCs), no new opening quote is placed."""
+    t, maker, taker, risk = setup(target_notional=D("500"))
+    async with running(t):
+        await fill_next(t, maker)
+        lm = t.pair.taker_market
+        lm.active, lm.extra["reduce_only_allowed"] = False, True
+        await wait_until(lambda: t.phase is Phase.CLOSING and resting(maker))
+        assert resting(maker)[0].reduce_only
+        await fill_next(t, maker)
+        assert t.hedger.maker_pos == 0 and t.hedger.taker_pos == 0
+        assert all(c[5] for c in calls(taker, "place_market")[1:])  # the closing hedge was reduce-only
+        await wait_until(lambda: t.phase is Phase.OPENING)
+        await asyncio.sleep(0.1)
+        assert not resting(maker) and "market closed" in t.block_reason
+        lm.extra["reduce_only_allowed"] = False  # frozen: not even reducing quotes
+        t.hedger.maker_pos, t.hedger.taker_pos = D("-0.005"), D("0.005")  # a BUY toward the goal would reduce
+        await wait_until(lambda: t.block_reason == "market inactive")
+        assert not resting(maker)
+
+
 async def test_halted_cancels_quotes_but_hedging_continues():
     t, maker, taker, risk = setup()
     async with running(t):

@@ -191,8 +191,10 @@ risk:
   min_free_collateral_mult: 1.5    # yeni pozisyon için serbest teminat >= clip / kaldıraç x bu (her iki borsada)
   max_equity_divergence_frac: 0.3  # iki borsadaki özsermaye bu oranda ayrışırsa uyarı (teminatı dengeleyin; 0 = kapalı)
   max_daily_loss: 100              # USD (gerçekleşen + ücret + funding); aşılırsa bot durur (0 = kapalı)
-  max_consecutive_errors: 20
-  close_on_exit: false             # true: kapanışta iki bacağı da taker emirle düzle
+  max_consecutive_errors: 20       # bir borsada art arda bu kadar kalıcı hata olursa devre kesici bot'u durdurur (halt)
+  error_halt_cooldown_s: 300.0     # devre kesici halt'ı bu kadar süre hiç hata gelmezse kendiliğinden kalkar (0 = kalkmaz)
+  max_auto_resumes_per_day: 3      # 24 saatte en fazla bu kadar otomatik devam; bekleme süresi her seferinde iki katına çıkar
+  close_on_exit: false            # true: kapanışta iki bacağı da taker emirle düzle
   skip_rwa_off_hours: true         # RWA yalnızca Arcus işlem saatlerinde
   emergency_flatten: true          # hedge sürekli başarısızsa maker bacağı taker emirle kapat
   emergency_cooldown_s: 300.0      # acil kapatmadan sonra bu kadar süre kotasyon verilmez

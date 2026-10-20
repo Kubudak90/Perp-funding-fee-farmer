@@ -22,7 +22,8 @@ import logging
 import random
 import time
 import uuid
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
@@ -147,7 +148,7 @@ class LighterWS:
         try:
             await asyncio.wait_for(self._connected.wait(), timeout)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False
 
     async def wait_first_attempt(self, timeout: float) -> bool:
@@ -155,7 +156,7 @@ class LighterWS:
         try:
             await asyncio.wait_for(self._first_attempt_done.wait(), timeout)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False
 
     def last_rx_age(self) -> float:
@@ -325,7 +326,7 @@ class LighterWS:
                 raise
             except InvalidStatus as exc:
                 reason = self._on_handshake_rejected(exc)
-            except (OSError, ConnectionClosed, InvalidHandshake, asyncio.TimeoutError, TimeoutError) as exc:
+            except (OSError, ConnectionClosed, InvalidHandshake, TimeoutError) as exc:
                 reason = f"{type(exc).__name__}: {exc}"
                 self.log.warning("lighter ws connection error: %s", reason)
             except Exception as exc:  # never let the loop die

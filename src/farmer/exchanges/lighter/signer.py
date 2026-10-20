@@ -20,8 +20,9 @@ import json
 import logging
 import time
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from farmer.exchanges.base import ExchangeError
 from farmer.exchanges.lighter.helpers import (
@@ -343,7 +344,7 @@ class TxExecutor:
                 return await self.t.send_ws(tx, self.ack_timeout_s), False, "ws"
             except TxNotSent:
                 pass
-            except (asyncio.TimeoutError, TimeoutError):
+            except TimeoutError:
                 return None, False, "ws"  # sent, no ack
             except Exception as exc:  # socket died after the frame may have left
                 self.log.warning("lighter ws send failed (%s): %s; falling back to REST", tx.label, exc)

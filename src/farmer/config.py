@@ -191,7 +191,7 @@ class StrategyConfig(_Base):
     set_leverage_on_start: bool = True
 
     @model_validator(mode="after")
-    def _check(self) -> "StrategyConfig":
+    def _check(self) -> StrategyConfig:
         if self.maker_venue == self.taker_venue:
             raise ValueError("maker_venue and taker_venue must differ")
         if not (Decimal(0) <= self.churn_floor_frac < Decimal(1)):
@@ -200,7 +200,7 @@ class StrategyConfig(_Base):
             raise ValueError("notional sizes must be positive")
         return self
 
-    def for_market(self, m: MarketConfig) -> "ResolvedMarket":
+    def for_market(self, m: MarketConfig) -> ResolvedMarket:
         def pick(name: str):
             v = getattr(m, name)
             return v if v is not None else getattr(self, name)
@@ -243,6 +243,10 @@ class RiskConfig(_Base):
     max_equity_divergence_frac: Decimal = Decimal("0.3")  # warn when venue equities differ by more (0 = off)
     max_daily_loss: Decimal = Decimal("100")  # USD realized+fees+funding; stop the bot if breached
     max_consecutive_errors: int = 20
+    # a circuit-breaker halt (max_consecutive_errors) clears itself after this long without any venue error; the
+    # cooldown doubles with every automatic resume within 24 h (0 = off: stay halted until restart)
+    error_halt_cooldown_s: float = 300.0
+    max_auto_resumes_per_day: int = 3  # after this many automatic resumes in 24 h the circuit breaker stays halted
     close_on_exit: bool = False  # flatten both legs on shutdown
     skip_rwa_off_hours: bool = True  # RWA pairs only while Arcus isOutsideRth == false
     emergency_flatten: bool = True  # flatten the maker leg with a taker order if hedging keeps failing

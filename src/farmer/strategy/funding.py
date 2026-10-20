@@ -133,7 +133,7 @@ class FundingMonitor:
                 log.exception("funding refresh failed")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.refresh_s)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     def stop(self) -> None:

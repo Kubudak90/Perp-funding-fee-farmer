@@ -69,7 +69,12 @@ tam döngü Arcus'ta yaklaşık $4.000, Lighter'da da yaklaşık $4.000 hacim ü
   - marj oranı yüksek (`max_margin_ratio`) ya da serbest teminat yetersiz (`min_free_collateral_mult`),
   - RWA piyasası işlem saatleri dışında,
   - günlük zarar limiti aşıldı (`max_daily_loss`),
-  - art arda çok hata oldu (devre kesici).
+  - art arda çok hata oldu (devre kesici). Devre kesici halt'ı `error_halt_cooldown_s` (300 sn) boyunca hiç hata
+    gelmezse kendiliğinden kalkar. Bekleme süresi her otomatik devamda iki katına çıkar. 24 saatte
+    `max_auto_resumes_per_day` (3) kez devam ettikten sonra bot yeniden başlatılana kadar durur. Günlük zarar,
+    marj ve hedge kaynaklı halt'lar kendiliğinden kalkmaz.
+- Açılışta hiçbir çiftin yönetmediği pozisyonlar (config dışı piyasalar, eşlenemeyen ya da reduce-only piyasalar)
+  log ve Telegram ile bildirilir. Bot bu pozisyonları ne hedge eder ne kapatır.
 - Arcus **dead man's switch** kullanılır. Bot ölürse borsa, `dead_mans_switch_s` saniye sonra tüm emirleri iptal eder.
 - Kapanışta (Ctrl+C / SIGTERM) kotasyonlar iptal edilir ve açık delta hedge edilir. `close_on_exit: true` ise iki
   bacak da kapatılır.
@@ -275,8 +280,8 @@ yarıda kesilirse de aynı güvenli kapanışı yapar ve hata koduyla çıkar.
 |---|---|
 | `farmer scan [--top N] [--skipped]` | Halka açık tarama. Tüm örtüşen piyasalar listelenir, config'tekiler önce örneklenir. Lighter defterleri readonly websocket'ten alınır, 60 req/dk bütçesi harcanmaz. |
 | `farmer run [--paper\|--live] [--yes] [--duration SN]` | Motoru çalıştırır. `--live` için iki borsada anahtar ve `--yes` ya da `mode: live` gerekir. Paper verisi `data/farmer-paper.db`, canlı veri `data/farmer.db` dosyasına yazılır. |
-| `farmer status` | Bakiye, marj oranı, pozisyonlar, açık emirler ve çift başına delta. `UNHEDGED` işareti hedgelenmemiş delta demektir. Canlı anahtar gerekir. |
-| `farmer close-all [--taker] [--yes] [--timeout SN]` | Tüm çiftleri düzler. Varsayılan maker modudur (hedge'li post-only kapanış, ucuz ama yavaş). `--taker` iki bacakta da IOC ile hemen kapatır. Günlük zarar limiti close-all'ı durdurmaz; risk yöneticisi başka bir sebeple durursa maker kapanış kendiliğinden taker moduna geçer. Eşlenemeyen bir çiftteki pozisyon (ör. Lighter `force_reduce_only` piyasası, fiyat kontrolü başarısız) `UNMANAGED` olarak listelenir ve komut hata koduyla çıkar: bu pozisyonu borsada elle kapatın. Çalışan bir bot varken çalışmaz (kilit dosyası). |
+| `farmer status` | Bakiye, marj oranı, pozisyonlar, açık emirler ve çift başına delta. `UNHEDGED` işareti hedgelenmemiş delta demektir. Yalnızca reduce-only emir kabul eden bir piyasadaki pozisyon ayrıca işaretlenir (`farmer close-all` ile kapatın). Canlı anahtar gerekir. |
+| `farmer close-all [--taker] [--yes] [--timeout SN]` | Tüm çiftleri düzler. Varsayılan maker modudur (hedge'li post-only kapanış, ucuz ama yavaş). `--taker` iki bacakta da IOC ile hemen kapatır. Yalnızca reduce-only emir kabul eden piyasalar (ör. Lighter `force_reduce_only`) iki modda da iki bacakta reduce-only IOC ile kapatılır. Günlük zarar limiti close-all'ı durdurmaz; risk yöneticisi başka bir sebeple durursa maker kapanış kendiliğinden taker moduna geçer. Hiç emir kabul etmeyen (ör. Arcus `OFFLINE`) ya da eşlenemeyen (fiyat kontrolü başarısız) bir çiftteki pozisyon `UNMANAGED` olarak listelenir ve komut hata koduyla çıkar: bu pozisyonu borsada elle kapatın. Çalışan bir bot varken çalışmaz (kilit dosyası). |
 | `farmer stats [--since SAAT] [--paper\|--live] [--no-marks]` | Veritabanından rapor: borsa başına hacim (maker/taker), ücret, funding, rol bazında dolumlar, PnL tahmini ve $1M hacim başına PnL (Arcus hacmi başına ve iki borsanın toplam hacmi başına). `--since 0` tüm zamanlar demektir. |
 | `farmer keygen arcus\|lighter` | API anahtarı üretir ve kaydeder (yukarıya bakın). |
 
@@ -307,6 +312,7 @@ Tüm alanlar Türkçe açıklamalarıyla `config.example.yaml` içindedir. En ö
 | `strategy.direction_mode` | auto | `long_maker` / `short_maker` yönü sabitler. |
 | `risk.max_unhedged_notional` | 150 | Bu USD deltanın üstünde kotasyon durur. |
 | `risk.max_daily_loss` | 100 | Aşılırsa bot durur (halt). Yeniden başlatana kadar kotasyon vermez. |
+| `risk.max_consecutive_errors` / `error_halt_cooldown_s` | 20 / 300 | Bir borsada art arda bu kadar kalıcı hata devre kesiciyi tetikler. Bu süre boyunca hata gelmezse halt kendiliğinden kalkar (0 = kalkmaz). |
 | `risk.max_margin_ratio` / `reduce_margin_ratio` | 0.25 / 0.4 | Bakım marjı / özsermaye. Sırasıyla yeni pozisyon açmayı durdurur / botu durdurup tüm pozisyonları taker ile kapatır. |
 | `risk.min_free_collateral_mult` | 1.5 | Yeni pozisyon için her borsada serbest teminat >= clip / kaldıraç × bu değer. |
 | `risk.max_equity_divergence_frac` | 0.3 | İki borsanın özsermayesi bu oranda ayrışırsa uyarı (teminatı dengeleyin). |
@@ -370,7 +376,9 @@ TimeoutStopSec=180
 | Log: `basis warm-up` / `waiting for books` | Normal başlangıç | ~30 sn bekleyin. Sürerse ağ veya websocket bağlantısını kontrol edin. |
 | Log: `no edge-compliant quote` | Defter `min_edge_bps` için yeterince iyi değil | Normaldir. Daha çok dolum için `min_edge_bps` değerini düşürün (negatif olabilir). |
 | Log: `market closed (trading hours)` | RWA piyasası saat dışında | Normaldir. Bot RTH'de kotasyon verir. |
-| Log: `HALTED` | Günlük zarar, devre kesici veya hedge başarısız | Sebebi giderin, `farmer status` ile pozisyonları kontrol edin, botu yeniden başlatın. |
+| Log: `HALTED` | Günlük zarar, devre kesici veya hedge başarısız | Devre kesici halt'ı hatalar kesilince kendiliğinden kalkar (`RESUMED automatically`). Diğerlerinde sebebi giderin, `farmer status` ile pozisyonları kontrol edin, botu yeniden başlatın. |
+| Log: `positions not managed by any pair` | Hiçbir çiftin yönetmediği pozisyon var (config dışı, eşlenemeyen ya da reduce-only piyasa) | Config'teki bir piyasaysa `farmer close-all`, değilse borsada elle kapatın. |
+| Lighter `market ... is reduce-only` | Lighter piyasayı `force_reduce_only` yaptı | Bot o piyasada yeni pozisyon açmaz, mevcut pozisyonu reduce-only emirlerle kapatabilir. `farmer close-all` kullanın. |
 | `another farmer process is running` | Kilit dosyası (`data/farmer*.lock`) | Aynı veritabanında ikinci süreç çalıştırılamaz. Önce diğerini durdurun. |
 
 ## Geliştirici notları
@@ -383,5 +391,9 @@ TimeoutStopSec=180
 - Canlı, salt okunur testleri açmak için:
   ```bash
   FARMER_LIVE_TESTS=1 .venv/bin/pytest -q -m live
+  ```
+- Lint (kurallar `pyproject.toml` içinde; `ruff` dev bağımlılıklarıyla kurulur):
+  ```bash
+  .venv/bin/ruff check src tests
   ```
 - Fiyat ve miktarların hepsi `Decimal` ile tutulur. Funding oranları saatlik kesirdir, pozisyonlar işaretlidir.

@@ -20,8 +20,9 @@ import asyncio
 import collections
 import dataclasses
 import time
+from collections.abc import Awaitable, Callable
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import aiohttp
 
@@ -258,7 +259,7 @@ class ArcusExchange(Exchange):
                 try:
                     await asyncio.wait_for(asyncio.gather(self._orders_synced.wait(), self._fills_synced.wait()),
                                            self.private_ready_timeout_s)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     self.log.warning("arcus private stream not ready after %.0fs (continuing)",
                                      self.private_ready_timeout_s)
 
@@ -1216,7 +1217,7 @@ class ArcusExchange(Exchange):
 
     def _validate(self, m: MarketInfo, size: Decimal, price: Decimal, *, reduce_only: bool,
                   notional_price: Decimal | None = None) -> str | None:
-        if not m.active:
+        if not m.active and not (reduce_only and m.reduce_only_ok):
             return f"market {m.symbol} is {m.extra.get('status') or 'not active'}"
         if not isinstance(size, Decimal) or not isinstance(price, Decimal):
             return "size and price must be Decimal"
@@ -1263,7 +1264,7 @@ class ArcusExchange(Exchange):
         try:
             await asyncio.wait_for(rec.acked.wait(), remaining)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False
 
     def _apply_write_response(self, rec: _OrderRec, data: Any, http_status: int) -> None:
@@ -1373,7 +1374,7 @@ class ArcusExchange(Exchange):
             if wait_for_budget:
                 try:
                     await asyncio.wait_for(self._order_bucket.acquire(), 10.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     return OrderResult(ok=False, retryable=True, error="arcus local order budget exhausted")
             elif not self._order_bucket.try_acquire():
                 return OrderResult(ok=False, retryable=True, error="arcus local order budget exhausted")
@@ -1594,7 +1595,7 @@ class ArcusExchange(Exchange):
                 return OrderResult(ok=True, order=dataclasses.replace(rec.order, status=OrderStatus.PENDING))
             try:
                 kind, val = await asyncio.wait_for(asyncio.shield(fut), remaining_s)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return OrderResult(ok=True, order=dataclasses.replace(rec.order, status=OrderStatus.PENDING))
             if kind == "action_reject":
                 if val == "ORDER_NOT_FOUND_FOR_MODIFY":
@@ -1667,6 +1668,9 @@ class ArcusExchange(Exchange):
                 await self.arm_dead_mans_switch(float(self.cfg.dead_mans_switch_s))
             elif self._dms_last_ok is not None:
                 self.log.info("arcus: nothing resting -> disarming the dead man's switch")
+                # unarmed from now on: a quote placed while the disarm is in flight must arm again (it waits for
+                # this lock) instead of trusting the old timestamp and resting unprotected until the next refresh
+                self._dms_last_ok = None
                 await self.arm_dead_mans_switch(0)
 
     async def _ensure_dms_armed(self) -> None:

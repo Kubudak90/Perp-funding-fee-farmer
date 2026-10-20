@@ -19,9 +19,10 @@ import collections
 import logging
 import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Callable
+from typing import Any
 
 from farmer.config import RiskConfig, StrategyConfig
 from farmer.exchanges.base import Exchange
@@ -164,6 +165,7 @@ class Hedger:
         self._stream_ok: dict[str, bool] = {}
         self._halt_requested = False
         self.close_mode = False  # only reduce-only hedges (close_all taker mode)
+        self.close_only = pair.close_only  # a leg only accepts reduce-only orders: close_mode for good
         self._running = False
         self._bg: set[asyncio.Future] = set()
         self._warned: dict[str, float] = {}
@@ -429,7 +431,7 @@ class Hedger:
         if not self._wake.is_set():
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         self._wake.clear()
 
@@ -578,8 +580,10 @@ class Hedger:
             # reduce-only only if it strictly reduces the taker leg INCLUDING hedges already in flight
             tp_eff = self.taker_pos + self.taker_inflight
             reduce_only = tp_eff != 0 and _sign(tp_eff) == -side.sign and size <= abs(tp_eff)
-            if self.close_mode and not reduce_only:
-                return  # flatten mode: never open on the taker leg
+            if (self.close_mode or self.close_only or not tm.active) and not reduce_only:
+                # flatten mode / reduce-only market: never open on the taker leg (a delta that only an opening
+                # hedge could cover escalates to the maker-leg emergency flatten)
+                return
             book = await self._book(self.taker, self.ts)
             if book is None:
                 self._note_failure(retryable=True, err="no taker book")
@@ -629,7 +633,7 @@ class Hedger:
             e.unknown = True
             task.add_done_callback(lambda t, e=e, ex=ex: self._late_send_result(e, ex, t))
             raise
-        except asyncio.TimeoutError:
+        except TimeoutError:
             e.unknown = True  # still sending: may execute any time -> stays in flight, never re-sent blindly
             task.add_done_callback(lambda t, e=e, ex=ex: self._late_send_result(e, ex, t))
             self._note_failure(retryable=True, venue=ex.name,
@@ -886,7 +890,7 @@ class Hedger:
                 try:  # give in-transit fills time to arrive; abort on a new fill
                     await asyncio.wait_for(self._fill_evt.wait(), self.reconcile_confirm_s)
                     return False
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
                 r2 = await self._read_positions()
                 if r2 is None:
@@ -938,8 +942,6 @@ class Hedger:
             return True
         finally:
             self._reconciling = False
-        self._reconcile_fails = 0
-        self._reconcile_retry_at = 0.0
 
     # ------------------------------------------------------------------ misc
     def _record(self, f: Fill, role: str) -> None:
@@ -998,6 +1000,7 @@ class Hedger:
             "retry_in_s": max(0.0, round(self._retry_at - now, 3)),
             "last_error": self._last_error,
             "close_mode": self.close_mode,
+            "close_only": self.close_only,
             "running": self._running,
             **{k: v for k, v in self.stats.items()},
         }

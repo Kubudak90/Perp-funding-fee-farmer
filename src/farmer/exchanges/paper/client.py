@@ -47,9 +47,9 @@ import logging
 import os
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Callable
 
 from farmer.config import PaperConfig
 from farmer.exchanges.base import Exchange
@@ -246,7 +246,7 @@ class PaperExchange(Exchange):
         try:
             await asyncio.wait_for(self._tx_limiter.acquire(), self._tx_wait_s)
             await asyncio.wait_for(self._req_limiter.acquire(), self._tx_wait_s)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self.log.warning("paper %s: rate budget exhausted (waited %.1fs); order refused unsent", self.name,
                              self._tx_wait_s)
             return f"paper {self.name}: rate budget exhausted (tx not sent)"
@@ -458,8 +458,8 @@ class PaperExchange(Exchange):
 
     def _validate(self, m: MarketInfo, size: Decimal, price: Decimal, *, reduce_only: bool,
                   check_tick: bool = True, notional_price: Decimal | None = None) -> str | None:
-        if not m.active:
-            return f"market {m.symbol} is not active"
+        if not m.active and not (reduce_only and m.reduce_only_ok):
+            return f"market {m.symbol} is not active" + (" (reduce-only orders only)" if m.reduce_only_ok else "")
         if not isinstance(size, Decimal) or not isinstance(price, Decimal):
             return "size and price must be Decimal"
         if size <= 0:

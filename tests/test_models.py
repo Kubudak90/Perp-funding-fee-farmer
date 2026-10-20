@@ -1,7 +1,5 @@
 from decimal import Decimal as D
 
-import pytest
-
 from farmer.models import BookLevel, MarketInfo, OrderBook, Side, TickTier
 from farmer.utils.decimals import common_step, to_plain
 from farmer.utils.ratelimit import SlidingWindowLimiter

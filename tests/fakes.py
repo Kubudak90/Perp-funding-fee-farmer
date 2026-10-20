@@ -313,7 +313,7 @@ class FakeRisk:
         if self._stop is not None:
             self._stop.set()
 
-    def halt(self, reason: str) -> None:
+    def halt(self, reason: str, *, kind: str = "manual") -> None:
         if not self.halted:
             self.halted = True
             self.halt_reason = reason

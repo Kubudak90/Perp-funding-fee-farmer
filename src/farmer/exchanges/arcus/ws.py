@@ -23,8 +23,9 @@ import json
 import logging
 import random
 import time
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import websockets
 
@@ -118,7 +119,7 @@ class ArcusWsConnection:
         try:
             await asyncio.wait_for(self._connected.wait(), timeout)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False
 
     def start(self) -> None:
@@ -267,7 +268,7 @@ class ArcusWsConnection:
             self.log.info("arcus ws %s reconnecting in %.1fs", self.name, delay)
             try:
                 await asyncio.wait_for(self._stop.wait(), delay)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             backoff = min(backoff * 2, self.backoff_max_s)
 

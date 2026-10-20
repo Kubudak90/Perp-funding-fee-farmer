@@ -11,8 +11,9 @@ import inspect
 import logging
 import threading
 import time
+from collections.abc import Callable
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from farmer.exchanges.base import Exchange
 from farmer.models import ZERO
@@ -97,7 +98,7 @@ class IncrementalSummary:
     the store reads in a worker thread when the store supports it, so they never block the event loop.
     """
 
-    def __init__(self, store: "Store", *, tail_s: float = 7200.0, rebase_s: float = 600.0,
+    def __init__(self, store: Store, *, tail_s: float = 7200.0, rebase_s: float = 600.0,
                  clock: Callable[[], float] = time.time) -> None:
         self.store = store
         self.tail_s = float(tail_s)
@@ -265,8 +266,8 @@ class StatsReporter:
 
     def __init__(
         self,
-        store: "Store",
-        notifier: "Notifier",
+        store: Store,
+        notifier: Notifier,
         status_fn: Callable[[], dict],
         venues: dict[str, Exchange],
         interval_s: float = 60,
@@ -307,7 +308,7 @@ class StatsReporter:
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.interval_s)
                 break
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             await self.report_once()
 

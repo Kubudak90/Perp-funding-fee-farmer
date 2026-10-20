@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import enum
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, Decimal
-from typing import Callable
 
 ZERO = Decimal(0)
 ONE = Decimal(1)
@@ -30,11 +30,11 @@ class Side(str, enum.Enum):
         return 1 if self is Side.BUY else -1
 
     @property
-    def opposite(self) -> "Side":
+    def opposite(self) -> Side:
         return Side.SELL if self is Side.BUY else Side.BUY
 
     @staticmethod
-    def from_sign(x: Decimal | int) -> "Side":
+    def from_sign(x: Decimal | int) -> Side:
         if x == 0:
             raise ValueError("cannot derive side from zero quantity")
         return Side.BUY if x > 0 else Side.SELL
@@ -91,6 +91,12 @@ class MarketInfo:
     price_decimals: int | None = None
     size_decimals: int | None = None
     extra: dict = field(default_factory=dict)
+
+    @property
+    def reduce_only_ok(self) -> bool:
+        """Reduce-only orders are accepted: active, or a venue-forced reduce-only market (the adapter sets
+        ``extra["reduce_only_allowed"]``, e.g. Lighter ``force_reduce_only``)."""
+        return self.active or bool(self.extra.get("reduce_only_allowed"))
 
     def tick_for(self, price: Decimal) -> Decimal:
         """Tick size applicable at ``price`` (handles Arcus tick tiers)."""
