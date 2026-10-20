@@ -158,9 +158,19 @@ class BotController:
         log.warning("dashboard: starting the bot in %s mode", mode.upper())
         self.task = asyncio.create_task(self._run(session), name="dashboard:bot")
 
+    async def _sample_loop(self) -> None:
+        """PnL / volume samples for the session chart, also while nobody has the page open."""
+        while True:
+            await asyncio.sleep(SAMPLE_EVERY_S)
+            try:
+                await self.report()
+            except Exception as exc:  # pragma: no cover - the chart just misses a point
+                log.debug("dashboard sample failed: %r", exc)
+
     async def _run(self, session: cli.BotSession) -> None:
         rc: int | None = None
         error: str | None = None
+        sampler = asyncio.create_task(self._sample_loop(), name="dashboard:samples")
         try:
             rc = await session.run()
             error = session.error
@@ -171,6 +181,7 @@ class BotController:
             log.exception("bot session failed")
             rc, error = cli.EXIT_ERROR, f"{exc}"
         finally:
+            sampler.cancel()
             self.last_exit = {"code": rc, "error": error, "ts": time.time(), "mode": self.mode}
             self.bot_state = "stopped"
             self.session = None
@@ -298,7 +309,7 @@ class BotController:
                 rep = jsonable(await session.stats.snapshot())
             except Exception as exc:
                 log.debug("dashboard report failed: %r", exc)
-            if rep is not None and (not self.samples or time.time() - self.samples[-1][0] >= SAMPLE_EVERY_S):
+            if rep is not None and (not self.samples or time.time() - self.samples[-1][0] >= SAMPLE_EVERY_S - 1):
                 self.samples.append((time.time(), rep.get("pnl_all"), (rep.get("all") or {}).get("volume")))
         elif not self.running:
             rep = await self._db_report()

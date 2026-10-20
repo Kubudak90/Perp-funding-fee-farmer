@@ -517,6 +517,8 @@ td.wrap { white-space: normal; min-width: 180px; color: var(--ink-2); }
       const basis = m.basis && m.basis.ema_bps !== null && m.basis.ema_bps !== undefined ?
         nf(1).format(num(m.basis.ema_bps)) + " bps" : "–";
       const delta = num(m.delta !== undefined ? m.delta : hd.delta);
+      // dust below the venue minimum is normal; red only for real unhedged exposure
+      const exposed = hd.escalated || (num(hd.unhedged_notional) || 0) >= 10;
       let status = m.block_reason || (q ? "kotasyonda" : "–");
       if (hd.close_only) status = "yalnızca kapatma (reduce-only piyasa)";
       if (hd.escalated) status = "⚠ " + (hd.escalated_reason || "hedge gecikiyor");
@@ -525,7 +527,7 @@ td.wrap { white-space: normal; min-width: 180px; color: var(--ink-2); }
         h("td", {}, PHASES[m.phase] || m.phase || "–"), h("td", {}, dir),
         h("td", { class: "num" }, fmtQty(m.maker_pos !== undefined ? m.maker_pos : hd.maker_pos)),
         h("td", { class: "num" }, fmtQty(m.taker_pos !== undefined ? m.taker_pos : hd.taker_pos)),
-        h("td", { class: "num " + (delta ? "neg" : "") }, fmtQty(delta)),
+        h("td", { class: "num " + (exposed ? "neg" : "") }, fmtQty(delta)),
         h("td", {}, q ? `${q.side === "BUY" ? "ALIŞ" : "SATIŞ"} ${fmtQty(q.remaining)} @ ${fmtQty(q.price)}` : "–"),
         h("td", { class: "num" }, apr), h("td", { class: "num" }, basis), h("td", { class: "wrap" }, status));
     });

@@ -290,3 +290,17 @@ async def test_close_all_with_the_bot_stopped_needs_live_keys(dash):
     client, *_ = dash
     r = await client.post("/api/bot/close-all", json={"mode": "maker", "confirm": "KAPAT"}, headers=AUTH)
     assert r.status == 400 and "API anahtarı" in (await r.json())["error"]
+
+
+async def test_pnl_samples_are_taken_without_the_page_polling(dash, monkeypatch):
+    import farmer.dashboard.controller as ctlmod
+
+    client, ctl, *_ = dash
+    monkeypatch.setattr(ctlmod, "SAMPLE_EVERY_S", 0.05)
+    monkeypatch.setattr(ctlmod, "REPORT_CACHE_S", 0.0)
+    await client.post("/api/bot/start", json={"mode": "paper"}, headers=AUTH)
+    loop = asyncio.get_running_loop()
+    end = loop.time() + 5
+    while len(ctl.samples) < 2 and loop.time() < end:  # no /api/state requests meanwhile
+        await asyncio.sleep(0.05)
+    assert len(ctl.samples) >= 2
