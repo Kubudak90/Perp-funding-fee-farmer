@@ -85,6 +85,24 @@ def pnl_from_summary(summary: dict[str, VenueSummary], marks: dict[str, Decimal]
     return total
 
 
+def summary_fields(s: VenueSummary | None) -> dict[str, Any]:
+    """One venue's totals as a plain dict (dashboard / JSON)."""
+    s = s or VenueSummary(net_base={})
+    return {"volume": s.volume, "maker_volume": s.maker_volume, "taker_volume": s.taker_volume, "fees": s.fees,
+            "funding": s.funding, "fills": s.fills}
+
+
+def summaries_snapshot(s1h: dict[str, VenueSummary], s24: dict[str, VenueSummary], sall: dict[str, VenueSummary],
+                       venues: list[str]) -> dict[str, Any]:
+    """Per-venue 1 h / 24 h / all-time totals plus their sums across venues."""
+    names = list(dict.fromkeys([*venues, *sall]))
+    out: dict[str, Any] = {"venues": {v: {"1h": summary_fields(s1h.get(v)), "24h": summary_fields(s24.get(v)),
+                                          "all": summary_fields(sall.get(v))} for v in names}}
+    for key, part in (("1h", s1h), ("24h", s24), ("all", sall)):
+        out[key] = {f: sum((s.__dict__[f] for s in part.values()), ZERO) for f in ("volume", "fees", "funding")}
+    return out
+
+
 def _hour_floor(ts: float) -> float:
     return float(int(ts // 3600) * 3600)
 
@@ -468,6 +486,17 @@ class StatsReporter:
         if getattr(self.store, "concurrent_reads", False):
             return await asyncio.to_thread(self._summaries, now)
         return self._summaries(now)
+
+    async def snapshot(self) -> dict[str, Any]:
+        """The report's numbers as data (the dashboard): per-venue totals and the PnL estimates."""
+        now = self._clock()
+        s1h, s24, sall = await self._summaries_async(now)
+        status = self._status()
+        pnl24, miss24 = self._pnl(status, s24)
+        pnl_all, miss_all = self._pnl(status, sall)
+        out = summaries_snapshot(s1h, s24, sall, [getattr(v, "name", k) for k, v in self.venues.items()])
+        out.update(ts=now, pnl_24h=pnl24, pnl_all=pnl_all, missing_marks=sorted(set(miss24) | set(miss_all)))
+        return out
 
     def render_report(self, summaries: tuple[dict[str, VenueSummary], dict[str, VenueSummary],
                                              dict[str, VenueSummary]] | None = None,

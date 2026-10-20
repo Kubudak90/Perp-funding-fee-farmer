@@ -26,10 +26,11 @@ Botun iki amacı vardır:
 4. [Kurulum](#kurulum)
 5. [İlk çalıştırma (önerilen sıra)](#i̇lk-çalıştırma-önerilen-sıra)
 6. [Komutlar](#komutlar)
-7. [Yapılandırma: öne çıkanlar](#yapılandırma-öne-çıkanlar)
-8. [İzleme ve Telegram](#i̇zleme-ve-telegram)
-9. [Sorun giderme ve hata kodları](#sorun-giderme-ve-hata-kodları)
-10. [Geliştirici notları](#geliştirici-notları)
+7. [Web paneli (dashboard)](#web-paneli-dashboard)
+8. [Yapılandırma: öne çıkanlar](#yapılandırma-öne-çıkanlar)
+9. [İzleme ve Telegram](#i̇zleme-ve-telegram)
+10. [Sorun giderme ve hata kodları](#sorun-giderme-ve-hata-kodları)
+11. [Geliştirici notları](#geliştirici-notları)
 
 ---
 
@@ -282,6 +283,7 @@ yarıda kesilirse de aynı güvenli kapanışı yapar ve hata koduyla çıkar.
 | `farmer run [--paper\|--live] [--yes] [--duration SN]` | Motoru çalıştırır. `--live` için iki borsada anahtar ve `--yes` ya da `mode: live` gerekir. Paper verisi `data/farmer-paper.db`, canlı veri `data/farmer.db` dosyasına yazılır. |
 | `farmer status` | Bakiye, marj oranı, pozisyonlar, açık emirler ve çift başına delta. `UNHEDGED` işareti hedgelenmemiş delta demektir. Yalnızca reduce-only emir kabul eden bir piyasadaki pozisyon ayrıca işaretlenir (`farmer close-all` ile kapatın). Canlı anahtar gerekir. |
 | `farmer close-all [--taker] [--yes] [--timeout SN]` | Tüm çiftleri düzler. Varsayılan maker modudur (hedge'li post-only kapanış, ucuz ama yavaş). `--taker` iki bacakta da IOC ile hemen kapatır. Yalnızca reduce-only emir kabul eden piyasalar (ör. Lighter `force_reduce_only`) iki modda da iki bacakta reduce-only IOC ile kapatılır. Günlük zarar limiti close-all'ı durdurmaz; risk yöneticisi başka bir sebeple durursa maker kapanış kendiliğinden taker moduna geçer. Hiç emir kabul etmeyen (ör. Arcus `OFFLINE`) ya da eşlenemeyen (fiyat kontrolü başarısız) bir çiftteki pozisyon `UNMANAGED` olarak listelenir ve komut hata koduyla çıkar: bu pozisyonu borsada elle kapatın. Çalışan bir bot varken çalışmaz (kilit dosyası). |
+| `farmer dashboard [--host 127.0.0.1] [--port 8080]` | Yerel web paneli: durum, ayarlar, API anahtarları, başlat/durdur/close-all. Aşağıya bakın. |
 | `farmer stats [--since SAAT] [--paper\|--live] [--no-marks]` | Veritabanından rapor: borsa başına hacim (maker/taker), ücret, funding, rol bazında dolumlar, PnL tahmini ve $1M hacim başına PnL (Arcus hacmi başına ve iki borsanın toplam hacmi başına). `--since 0` tüm zamanlar demektir. |
 | `farmer keygen arcus\|lighter` | API anahtarı üretir ve kaydeder (yukarıya bakın). |
 
@@ -294,6 +296,42 @@ Ortak seçenekler:
 Loglar konsola ve `data/logs/farmer.log` dosyasına yazılır. Dosya döner: 50 MB × 5.
 
 `python -m farmer ...` de aynı şekilde çalışır.
+
+## Web paneli (dashboard)
+
+```bash
+farmer dashboard            # http://127.0.0.1:8080/#token=... adresini konsola basar
+```
+
+Konsola basılan bağlantıyı tarayıcıda açın. Bağlantıdaki `token` panele erişim anahtarıdır ve her açılışta yeniden
+üretilir. Sabit bir anahtar için `.env` içine `FARMER_DASHBOARD_TOKEN=...` yazın. Bağlantıyı kimseyle paylaşmayın.
+
+- **Genel bakış:** botun durumu ve halt sebebi; 1 sa / 24 sa / toplam hacim, PnL tahmini, funding ve ücretler;
+  borsa başına bakiye ve marj oranı; çift başına faz, yön, pozisyonlar, delta, kotasyon, carry APR ve duraklama
+  sebebi; saatlik hacim ve oturumun PnL grafiği; son olaylar.
+- **Kontrol:** `Paper başlat`; `Canlı başlat` (iki borsada anahtar ve onay kutusuna `CANLI` yazmak gerekir);
+  `Durdur` (Ctrl+C ile aynı güvenli kapanış: kotasyonlar iptal edilir, açık delta hedge edilir); `Tüm pozisyonları
+  kapat` (maker ya da taker, onay için `KAPAT`); `Bağlantıyı test et` (`farmer status` çıktısı).
+- **Ayarlar:** strateji, risk ve piyasa ayarları. Kaydetmeden önce bütün yapılandırma doğrulanır. `config.yaml`
+  yeniden yazılır, önceki dosya `config.yaml.bak` olarak saklanır (yorum satırları korunmaz). Değişiklikler bir
+  sonraki başlatmada geçerli olur.
+- **API anahtarları:** Arcus ve Lighter API anahtarları, Telegram bilgileri. Değerler kaydetmeden önce kontrol
+  edilir ve `.env` dosyasına (izin 600) yazılır. Kayıtlı gizli anahtarlar panelde bir daha gösterilmez.
+  **Ana cüzdan özel anahtarları panele girilmez:** API anahtarı üretmek için `farmer keygen` kullanın.
+- **Log:** son 2000 log satırı, seviye ve metin filtresiyle.
+
+Bot panelin içinde çalışır: paneli durdurmak (Ctrl+C / SIGTERM) önce botu güvenli şekilde durdurur. Panelden
+başlatılan bot, `farmer run` ile aynı kilit dosyasını kullanır; aynı veritabanında ikinci bir bot başlatılamaz.
+
+**Güvenlik:** Panel varsayılan olarak yalnızca `127.0.0.1` adresini dinler ve bağlantı şifresizdir (HTTP). Botu bir
+sunucuda çalıştırıyorsanız portu dışarı açmayın, SSH tüneli kullanın:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 kullanici@sunucu   # sonra yerelde http://127.0.0.1:8080/#token=...
+```
+
+Her API isteği token ister; başka sitelerden gelen istekler (Origin / Host kontrolü) reddedilir. Sayfa dışarıdan hiçbir
+script ya da dosya yüklemez.
 
 ## Yapılandırma: öne çıkanlar
 

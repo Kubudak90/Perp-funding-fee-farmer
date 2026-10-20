@@ -1,0 +1,835 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Farmer Paneli</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --surface-2: #f3f2ef;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --accent: #2a78d6;
+  --accent-ink: #ffffff;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --good: #0ca30c;
+  --good-ink: #006300;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  --critical-ink: #b42323;
+  --critical-wash: rgba(208, 59, 59, 0.08);
+  --input: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --surface-2: #232321;
+    --ink: #f0efec;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --accent: #3987e5;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --good-ink: #0ca30c;
+    --critical-ink: #e66767;
+    --critical-wash: rgba(208, 59, 59, 0.16);
+    --input: #121211;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10); --accent: #3987e5; --series-1: #3987e5;
+  --series-2: #d95926; --good-ink: #0ca30c; --critical-ink: #e66767; --critical-wash: rgba(208, 59, 59, 0.16);
+  --input: #121211;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--page); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
+  padding: 14px 20px; background: var(--surface); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 5;
+}
+header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+header .ver { color: var(--muted); font-size: 12px; }
+.pill { display: inline-flex; align-items: center; gap: 8px; padding: 4px 10px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--border); font-weight: 600; font-size: 13px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.good { background: var(--good); } .dot.warning { background: var(--warning); }
+.dot.critical { background: var(--critical); }
+.live-tag { color: var(--critical-ink); font-weight: 700; }
+nav { display: flex; gap: 4px; margin-left: auto; flex-wrap: wrap; }
+nav button { background: none; border: 0; padding: 6px 12px; border-radius: 8px; color: var(--ink-2);
+  font: inherit; cursor: pointer; }
+nav button[aria-selected="true"] { background: var(--surface-2); color: var(--ink); font-weight: 600; }
+main { max-width: 1280px; margin: 0 auto; padding: 16px 20px 48px; }
+.banner { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: 10px;
+  background: var(--critical-wash); border: 1px solid var(--critical); margin-bottom: 14px; }
+.banner strong { color: var(--critical-ink); }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px;
+  margin-bottom: 14px; min-width: 0; }
+.card h2 { font-size: 14px; margin: 0 0 12px; font-weight: 650; }
+.card h2 .sub { font-weight: 400; color: var(--muted); margin-left: 6px; font-size: 12px; }
+.grid { display: grid; gap: 14px; }
+.cols-2 { grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
+.tile .label { color: var(--ink-2); font-size: 12px; }
+.tile .value { font-size: 22px; font-weight: 650; margin-top: 2px; }
+.tile .note { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.pos { color: var(--good-ink); } .neg { color: var(--critical-ink); }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+button.btn { font: inherit; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--surface-2); color: var(--ink); cursor: pointer; font-weight: 600; }
+button.btn:hover:not(:disabled) { filter: brightness(0.97); }
+button.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+button.btn.danger { background: var(--critical); color: #fff; border-color: transparent; }
+button.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+input, select { font: inherit; color: var(--ink); background: var(--input); border: 1px solid var(--axis);
+  border-radius: 8px; padding: 6px 9px; min-width: 0; }
+input[type="checkbox"] { width: 16px; height: 16px; padding: 0; }
+label.inline { display: inline-flex; align-items: center; gap: 6px; }
+.confirm { display: none; margin-top: 10px; padding: 10px; border-radius: 10px; background: var(--surface-2); }
+.confirm.open { display: block; }
+.msg { margin-top: 10px; font-size: 13px; }
+.msg.err { color: var(--critical-ink); } .msg.ok { color: var(--good-ink); }
+pre { background: var(--surface-2); border-radius: 8px; padding: 10px; margin: 10px 0 0; overflow: auto;
+  max-height: 340px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { color: var(--ink-2); font-weight: 600; font-size: 12px; }
+td.num, th.num { text-align: right; }
+td.wrap { white-space: normal; min-width: 180px; color: var(--ink-2); }
+.muted { color: var(--muted); }
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: 220px; }
+.tooltip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 9px; font-size: 12px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12); display: none;
+  white-space: nowrap; z-index: 3; }
+.tooltip b { display: block; font-size: 13px; }
+.empty { color: var(--muted); padding: 30px 0; text-align: center; }
+.events li { padding: 6px 0; border-bottom: 1px solid var(--grid); list-style: none; display: flex; gap: 10px; }
+.events { padding: 0; margin: 0; max-height: 360px; overflow: auto; }
+.events .t { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+.events .k { font-weight: 600; flex: none; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px 18px; }
+.field { display: grid; gap: 4px; }
+.field label { color: var(--ink-2); font-size: 12px; }
+.field > input, .field > select { width: 100%; }
+.field .row input { flex: 1; min-width: 160px; }
+.chip { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--surface-2);
+  border: 1px solid var(--border); color: var(--ink-2); margin-left: 6px; }
+.chip.set { color: var(--good-ink); }
+.warnbox { padding: 10px 12px; border-radius: 10px; border: 1px solid var(--warning); margin-bottom: 12px;
+  background: rgba(250, 178, 25, 0.08); }
+.hidden { display: none !important; }
+#log { max-height: 70vh; min-height: 300px; }
+.lvl-WARNING { color: #b07400; } .lvl-ERROR, .lvl-CRITICAL { color: var(--critical-ink); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .lvl-WARNING { color: #fab219; } }
+@media (max-width: 520px) {
+  header { padding: 12px 16px; } main { padding: 12px 16px 40px; } .cols-2 { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Farmer Paneli</h1>
+  <span class="ver" id="ver"></span>
+  <span class="pill" id="statePill"><span class="dot"></span><span>bağlanıyor…</span></span>
+  <nav id="tabs" role="tablist">
+    <button role="tab" data-tab="overview" aria-selected="true">Genel bakış</button>
+    <button role="tab" data-tab="settings" aria-selected="false">Ayarlar</button>
+    <button role="tab" data-tab="keys" aria-selected="false">API anahtarları</button>
+    <button role="tab" data-tab="logs" aria-selected="false">Log</button>
+  </nav>
+</header>
+<main>
+  <section id="login" class="card hidden">
+    <h2>Panel erişim anahtarı</h2>
+    <p class="muted">Panel bağlantısı <code>farmer dashboard</code> çalıştırıldığında konsola basılır
+      (<code>http://127.0.0.1:8080/#token=…</code>). O bağlantıyı açın ya da anahtarı buraya yapıştırın.</p>
+    <div class="row"><input id="tokenInput" type="password" size="40" autocomplete="off" placeholder="token">
+      <button class="btn primary" id="tokenBtn">Giriş</button></div>
+  </section>
+
+  <div id="app" class="hidden">
+    <div id="haltBanner" class="banner hidden" role="alert"><span aria-hidden="true">⚠</span>
+      <div><strong>İŞLEM DURDURULDU (HALT)</strong><div id="haltText"></div></div></div>
+
+    <!-- ============================================================ overview -->
+    <section data-panel="overview">
+      <div class="card">
+        <h2>Kontrol <span class="sub" id="ctlSub"></span></h2>
+        <div class="row">
+          <button class="btn primary" id="btnPaper">Paper başlat</button>
+          <button class="btn" id="btnLive">Canlı başlat…</button>
+          <button class="btn" id="btnStop">Durdur</button>
+          <button class="btn" id="btnClose">Tüm pozisyonları kapat…</button>
+          <button class="btn" id="btnTest">Bağlantıyı test et</button>
+        </div>
+        <div class="confirm" id="liveBox">
+          <p><strong>Gerçek emirlerle işlem başlayacak.</strong> İki borsada da teminat olduğundan ve ayarların doğru
+            olduğundan emin olun. Onaylamak için <code>CANLI</code> yazın.</p>
+          <div class="row"><input id="liveConfirm" autocomplete="off" placeholder="CANLI">
+            <button class="btn danger" id="btnLiveGo">Canlı işlemi başlat</button>
+            <button class="btn" data-close="liveBox">Vazgeç</button></div>
+        </div>
+        <div class="confirm" id="closeBox">
+          <p><strong>Tüm çiftler düzlenecek.</strong> Maker: hedge'li post-only kapanış (ucuz, yavaş).
+            Taker: iki bacakta da hemen IOC (hızlı, maliyetli). Onaylamak için <code>KAPAT</code> yazın.</p>
+          <div class="row">
+            <label class="inline"><input type="radio" name="closeMode" value="maker" checked> Maker</label>
+            <label class="inline"><input type="radio" name="closeMode" value="taker"> Taker (IOC)</label>
+            <input id="closeConfirm" autocomplete="off" placeholder="KAPAT">
+            <button class="btn danger" id="btnCloseGo">Kapat</button>
+            <button class="btn" data-close="closeBox">Vazgeç</button></div>
+        </div>
+        <div class="msg" id="ctlMsg"></div>
+        <div id="jobBox" class="hidden"><div class="msg" id="jobHead"></div><pre id="jobOut"></pre></div>
+      </div>
+
+      <div class="tiles" id="tiles"></div>
+      <div class="msg muted" id="tilesNote"></div>
+
+      <div class="card" style="margin-top:14px">
+        <h2>Bakiyeler ve marj</h2>
+        <div class="table-wrap"><table id="balTable"></table></div>
+        <div class="empty hidden" id="balEmpty">Bakiye bilgisi bot çalışırken gelir. Bot durmuşken
+          “Bağlantıyı test et” ile okuyabilirsiniz.</div>
+      </div>
+
+      <div class="card">
+        <h2>Piyasalar</h2>
+        <div class="table-wrap"><table id="mktTable"></table></div>
+        <div class="empty hidden" id="mktEmpty">Bot çalışmıyor.</div>
+      </div>
+
+      <div class="grid cols-2">
+        <div class="card"><h2>Saatlik hacim <span class="sub">iki borsanın toplamı, son 24 saat</span></h2>
+          <div class="chart" id="volChart"></div></div>
+        <div class="card"><h2>PnL tahmini <span class="sub">bu oturum, 30 sn'de bir</span></h2>
+          <div class="chart" id="pnlChart"></div></div>
+      </div>
+
+      <div class="card"><h2>Son olaylar</h2><ul class="events" id="events"></ul>
+        <div class="empty hidden" id="eventsEmpty">Henüz olay yok.</div></div>
+    </section>
+
+    <!-- ============================================================ settings -->
+    <section data-panel="settings" class="hidden">
+      <div class="card">
+        <h2>Strateji ve risk ayarları <span class="sub" id="cfgPath"></span></h2>
+        <p class="muted">Değişiklikler bir sonraki başlatmada geçerli olur. Kaydetmek <code>config.yaml</code>'ı
+          yeniden yazar (önceki dosya <code>config.yaml.bak</code> olarak saklanır; yorum satırları korunmaz).</p>
+        <div id="cfgForm"></div>
+        <h2 style="margin-top:18px">Piyasalar <span class="sub">boş alan = genel değer</span></h2>
+        <div class="table-wrap"><table id="mktForm"></table></div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn" id="btnAddMkt">Piyasa ekle</button>
+          <button class="btn primary" id="btnSaveCfg">Ayarları kaydet</button>
+          <button class="btn" id="btnReloadCfg">Değişiklikleri geri al</button>
+        </div>
+        <div class="msg" id="cfgMsg"></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ keys -->
+    <section data-panel="keys" class="hidden">
+      <div class="card">
+        <h2>API anahtarları</h2>
+        <div class="warnbox"><strong>Ana cüzdan özel anahtarınızı buraya girmeyin.</strong> Buraya yalnızca bot için
+          oluşturulmuş API anahtarları girilir. API anahtarı üretmek için komut satırında
+          <code>farmer keygen arcus</code> / <code>farmer keygen lighter</code> kullanın.
+          Kayıtlı gizli anahtarlar bir daha gösterilmez; değiştirmek için yeni değeri yazın.
+          Anahtarlar <code>.env</code> dosyasına (yalnızca sizin okuyabileceğiniz izinlerle) yazılır.</div>
+        <div id="keysForm"></div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn primary" id="btnSaveKeys">Anahtarları kaydet</button>
+          <button class="btn" id="btnTest2">Bağlantıyı test et</button>
+        </div>
+        <div class="msg" id="keysMsg"></div>
+        <div id="jobBox2" class="hidden"><div class="msg" id="jobHead2"></div><pre id="jobOut2"></pre></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ logs -->
+    <section data-panel="logs" class="hidden">
+      <div class="card">
+        <h2>Log <span class="sub">son 2000 satır (INFO ve üstü)</span></h2>
+        <div class="row">
+          <label class="inline">Seviye <select id="logLevel">
+            <option value="INFO">INFO+</option><option value="WARNING">WARNING+</option>
+            <option value="ERROR">ERROR+</option></select></label>
+          <label class="inline"><input type="checkbox" id="logFollow" checked> Sona kaydır</label>
+          <input id="logFilter" placeholder="filtre (ör. BTC)" size="18">
+        </div>
+        <pre id="log"></pre>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script nonce="{{NONCE}}">
+"use strict";
+(() => {
+  // ---------------------------------------------------------------- auth / api
+  const TOKEN_KEY = "farmer_dashboard_token";
+  const hash = new URLSearchParams(location.hash.slice(1));
+  if (hash.get("token")) {
+    sessionStorage.setItem(TOKEN_KEY, hash.get("token"));
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+  let token = sessionStorage.getItem(TOKEN_KEY) || "";
+  const $ = (id) => document.getElementById(id);
+
+  class ApiError extends Error {}
+  async function api(path, opts = {}) {
+    const init = { method: opts.method || "GET", cache: "no-store", headers: { Authorization: "Bearer " + token } };
+    if (opts.body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(opts.body);
+    }
+    const r = await fetch(path, init);
+    let data = {};
+    try { data = await r.json(); } catch (_) { /* empty body */ }
+    if (r.status === 401) { showLogin(); throw new ApiError("yetkisiz"); }
+    if (!r.ok) throw new ApiError(data.error || ("HTTP " + r.status));
+    return data;
+  }
+
+  function showLogin() { $("login").classList.remove("hidden"); $("app").classList.add("hidden"); }
+  function showApp() { $("login").classList.add("hidden"); $("app").classList.remove("hidden"); }
+  $("tokenBtn").addEventListener("click", () => {
+    token = $("tokenInput").value.trim();
+    sessionStorage.setItem(TOKEN_KEY, token);
+    refreshState().then(() => { loadConfig(); loadKeys(); loadHistory(); });
+  });
+
+  // ---------------------------------------------------------------- helpers
+  function h(tag, attrs, ...kids) {
+    const el = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (v === null || v === undefined || v === false) continue;
+      if (k === "class") el.className = v;
+      else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+      else el.setAttribute(k, v === true ? "" : v);
+    }
+    for (const kid of kids.flat()) {
+      if (kid === null || kid === undefined || kid === false) continue;
+      el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+    }
+    return el;
+  }
+  const num = (x) => (x === null || x === undefined || x === "") ? null : Number(x);
+  const nf = (d) => new Intl.NumberFormat("tr-TR", { minimumFractionDigits: d, maximumFractionDigits: d });
+  const fmtUsd = (x, d = 2) => {
+    const n = num(x); if (n === null || !isFinite(n)) return "–";
+    return (n < 0 ? "-$" : "$") + nf(d).format(Math.abs(n));
+  };
+  const fmtSigned = (x, d = 2) => {
+    const n = num(x); if (n === null || !isFinite(n)) return "–";
+    return (n > 0 ? "+" : n < 0 ? "-" : "") + "$" + nf(d).format(Math.abs(n));
+  };
+  const fmtQty = (x) => {
+    const n = num(x); if (n === null || !isFinite(n)) return "–";
+    if (n === 0) return "0";
+    return new Intl.NumberFormat("tr-TR", { maximumFractionDigits: 6 }).format(n);
+  };
+  const fmtCompact = (n) => new Intl.NumberFormat("tr-TR", { notation: "compact", maximumFractionDigits: 1 }).format(n);
+  const fmtTime = (ts) => new Date(ts * 1000).toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const fmtHour = (ts) => new Date(ts * 1000).toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit" });
+  const fmtAgo = (s) => s < 60 ? Math.round(s) + " sn" : s < 3600 ? Math.round(s / 60) + " dk" :
+    Math.floor(s / 3600) + " sa " + Math.round((s % 3600) / 60) + " dk";
+  const signClass = (x) => { const n = num(x); return n === null ? "" : n > 0 ? "pos" : n < 0 ? "neg" : ""; };
+  function msg(el, text, ok) { el.textContent = text || ""; el.className = "msg " + (text ? (ok ? "ok" : "err") : ""); }
+
+  // ---------------------------------------------------------------- tabs
+  let activeTab = "overview";
+  $("tabs").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-tab]"); if (!b) return;
+    activeTab = b.dataset.tab;
+    for (const t of document.querySelectorAll("#tabs button")) t.setAttribute("aria-selected", String(t === b));
+    for (const p of document.querySelectorAll("[data-panel]")) p.classList.toggle("hidden", p.dataset.panel !== activeTab);
+    if (activeTab === "logs") pollLogs();
+    if (activeTab === "overview") { renderCharts(); }
+  });
+
+  // ---------------------------------------------------------------- state
+  let state = null;
+  const PHASES = { OPENING: "Açılıyor", HOLDING: "Tutuluyor", CLOSING: "Kapanıyor" };
+
+  async function refreshState() {
+    try {
+      state = await api("/api/state");
+      showApp();
+      renderState();
+    } catch (e) {
+      if (!(e instanceof ApiError)) setPill("critical", "panele ulaşılamıyor");
+    }
+  }
+
+  function setPill(kind, text, live) {
+    const kids = [h("span", { class: "dot " + kind }), h("span", {}, text)];
+    if (live) kids.push(h("span", { class: "live-tag" }, "CANLI"));
+    $("statePill").replaceChildren(...kids);
+  }
+
+  function renderState() {
+    const s = state, bot = s.bot;
+    $("ver").textContent = "v" + s.version;
+    const eng = s.engine, risk = eng && eng.risk;
+    const halted = risk && risk.halted;
+    if (bot.state === "running") {
+      const up = bot.started_ts ? fmtAgo(s.now - bot.started_ts) : "";
+      setPill(halted ? "critical" : (bot.engine_started ? "good" : "warning"),
+        (halted ? "Durduruldu (halt)" : bot.engine_started ? "Çalışıyor" : "Başlıyor…") + " · " +
+        (bot.mode === "live" ? "" : "paper") + (up ? " · " + up : ""), bot.mode === "live");
+    } else if (bot.state === "stopping") setPill("warning", "Durduruluyor…");
+    else setPill("", "Durdu");
+    $("haltBanner").classList.toggle("hidden", !halted);
+    if (halted) {
+      const hs = risk.halts || {};
+      $("haltText").textContent = Object.values(hs).join(" · ") || risk.halt_reason || "";
+    }
+    // controls
+    const running = bot.state !== "stopped", jobRun = s.job && s.job.state === "running";
+    $("btnPaper").disabled = running || jobRun;
+    $("btnLive").disabled = running || jobRun;
+    $("btnStop").disabled = bot.state !== "running";
+    $("btnClose").disabled = jobRun || (running && !bot.engine_started);
+    $("btnTest").disabled = jobRun; $("btnTest2").disabled = jobRun;
+    const le = bot.last_exit;
+    $("ctlSub").textContent = bot.state === "stopped" && le ?
+      `son çalışma (${le.mode}) ${fmtTime(le.ts)} bitti` + (le.error ? ` · hata: ${le.error}` : "") :
+      (s.config.error ? "config hatası: " + s.config.error : "");
+    renderJob(s.job);
+    renderTiles(s.report, eng);
+    renderBalances(risk);
+    renderMarkets(eng);
+    renderEvents(s.events);
+  }
+
+  function renderJob(job) {
+    for (const [box, head, out] of [["jobBox", "jobHead", "jobOut"], ["jobBox2", "jobHead2", "jobOut2"]]) {
+      $(box).classList.toggle("hidden", !job);
+      if (!job) continue;
+      const st = { running: "sürüyor…", done: "tamamlandı", failed: "başarısız" }[job.state] || job.state;
+      $(head).textContent = `${job.kind}: ${st}`;
+      $(head).className = "msg " + (job.state === "done" ? "ok" : job.state === "failed" ? "err" : "");
+      $(out).textContent = job.output || (job.state === "running" ? "…" : "");
+      $(out).classList.toggle("hidden", !job.output && job.state !== "running");
+    }
+  }
+
+  function tile(label, value, note, cls) {
+    return h("div", { class: "tile" }, h("div", { class: "label" }, label),
+      h("div", { class: "value " + (cls || "") }, value), note ? h("div", { class: "note" }, note) : null);
+  }
+
+  function renderTiles(rep, eng) {
+    const t = $("tiles");
+    if (!rep) {
+      t.replaceChildren(tile("Hacim (24 sa)", "–", "henüz veri yok"));
+      $("tilesNote").textContent = "";
+      return;
+    }
+    const v = rep.venues || {};
+    const vNote = (k) => Object.entries(v).map(([n, x]) => `${n} ${fmtUsd(x[k].volume, 0)}`).join(" · ");
+    const kids = [
+      tile("Hacim (24 sa)", fmtUsd(rep["24h"].volume, 0), vNote("24h")),
+      tile("Hacim (1 sa)", fmtUsd(rep["1h"].volume, 0), vNote("1h")),
+      tile("Toplam hacim", fmtUsd(rep.all.volume, 0), vNote("all")),
+      tile("PnL tahmini (24 sa)", fmtSigned(rep.pnl_24h), null, signClass(rep.pnl_24h)),
+      tile("PnL tahmini (toplam)", fmtSigned(rep.pnl_all), perMillion(rep), signClass(rep.pnl_all)),
+      tile("Funding (toplam)", fmtSigned(rep.all.funding), "24 sa: " + fmtSigned(rep["24h"].funding), signClass(rep.all.funding)),
+      tile("Ücretler (toplam)", fmtUsd(rep.all.fees), "24 sa: " + fmtUsd(rep["24h"].fees)),
+    ];
+    const dp = eng && eng.risk && eng.risk.daily_pnl;
+    if (dp !== null && dp !== undefined) kids.push(tile("Günlük PnL (risk)", fmtSigned(dp), "limit: " +
+      fmtUsd(eng.risk.max_daily_loss, 0), signClass(dp)));
+    t.replaceChildren(...kids);
+    const miss = rep.missing_marks || [];
+    $("tilesNote").textContent = (rep.from_db ? "Bot durmuş: rakamlar veritabanından. " : "") +
+      (miss.length ? "Fiyatı olmayan: " + miss.join(", ") : "");
+  }
+
+  function perMillion(rep) {
+    const mk = rep.venues && rep.venues.arcus, vol = mk ? num(mk.all.volume) : 0, p = num(rep.pnl_all);
+    if (!vol || p === null) return null;
+    return "Arcus hacminin $1M'ı başına " + fmtSigned(p / vol * 1e6);
+  }
+
+  function renderBalances(risk) {
+    const bals = risk && risk.balances ? Object.entries(risk.balances) : [];
+    $("balEmpty").classList.toggle("hidden", bals.length > 0);
+    if (!bals.length) { $("balTable").replaceChildren(); return; }
+    const maxMr = num(risk.max_margin_ratio) || 0.25;
+    const head = h("tr", {}, h("th", {}, "Borsa"), h("th", { class: "num" }, "Özsermaye"),
+      h("th", { class: "num" }, "Serbest teminat"), h("th", { class: "num" }, "Kullanılan marj"),
+      h("th", { class: "num" }, "Marj oranı"), h("th", {}, "Durum"));
+    const rows = bals.map(([v, b]) => {
+      const mr = num(b.margin_ratio);
+      const kind = mr === null ? "" : mr >= 0.4 ? "critical" : mr >= maxMr ? "warning" : "good";
+      const label = { critical: "kapatma eşiği", warning: "yeni pozisyon yok", good: "normal" }[kind] || "–";
+      return h("tr", {}, h("td", {}, v), h("td", { class: "num" }, fmtUsd(b.equity)),
+        h("td", { class: "num" }, fmtUsd(b.available)), h("td", { class: "num" }, fmtUsd(b.margin_used)),
+        h("td", { class: "num" }, mr === null ? "–" : nf(3).format(mr)),
+        h("td", {}, h("span", { class: "row" }, h("span", { class: "dot " + kind }), label)));
+    });
+    const errs = risk.errors || {};
+    const errRow = Object.keys(errs).length ? h("tr", {}, h("td", { colspan: 6, class: "wrap" },
+      "Art arda hata: " + Object.entries(errs).map(([k, n]) => `${k} ${n}`).join(", "))) : null;
+    $("balTable").replaceChildren(h("thead", {}, head), h("tbody", {}, ...rows, errRow));
+  }
+
+  function renderMarkets(eng) {
+    const mk = eng && eng.markets ? Object.entries(eng.markets) : [];
+    $("mktEmpty").classList.toggle("hidden", mk.length > 0);
+    if (!mk.length) { $("mktTable").replaceChildren(); return; }
+    const head = h("tr", {}, ...["Çift", "Faz", "Yön", "Maker poz.", "Taker poz.", "Delta", "Kotasyon",
+      "Carry APR", "Baz", "Durum"].map((x, i) => h("th", { class: i >= 3 && i <= 5 || i === 7 || i === 8 ? "num" : "" }, x)));
+    const rows = mk.map(([sym, m]) => {
+      const hd = m.hedger || {};
+      const q = m.quote;
+      const dir = m.direction === 1 ? "maker LONG" : m.direction === -1 ? "maker SHORT" : "–";
+      const apr = m.funding && m.funding.carry_apr !== null && m.funding.carry_apr !== undefined ?
+        nf(2).format(num(m.funding.carry_apr) * 100) + "%" : "–";
+      const basis = m.basis && m.basis.ema_bps !== null && m.basis.ema_bps !== undefined ?
+        nf(1).format(num(m.basis.ema_bps)) + " bps" : "–";
+      const delta = num(m.delta !== undefined ? m.delta : hd.delta);
+      let status = m.block_reason || (q ? "kotasyonda" : "–");
+      if (hd.close_only) status = "yalnızca kapatma (reduce-only piyasa)";
+      if (hd.escalated) status = "⚠ " + (hd.escalated_reason || "hedge gecikiyor");
+      return h("tr", {}, h("td", {}, h("strong", {}, sym), m.taker_symbol && m.taker_symbol !== sym ?
+        h("span", { class: "muted" }, " " + m.maker_symbol + "/" + m.taker_symbol) : null),
+        h("td", {}, PHASES[m.phase] || m.phase || "–"), h("td", {}, dir),
+        h("td", { class: "num" }, fmtQty(m.maker_pos !== undefined ? m.maker_pos : hd.maker_pos)),
+        h("td", { class: "num" }, fmtQty(m.taker_pos !== undefined ? m.taker_pos : hd.taker_pos)),
+        h("td", { class: "num " + (delta ? "neg" : "") }, fmtQty(delta)),
+        h("td", {}, q ? `${q.side === "BUY" ? "ALIŞ" : "SATIŞ"} ${fmtQty(q.remaining)} @ ${fmtQty(q.price)}` : "–"),
+        h("td", { class: "num" }, apr), h("td", { class: "num" }, basis), h("td", { class: "wrap" }, status));
+    });
+    $("mktTable").replaceChildren(h("thead", {}, head), h("tbody", {}, ...rows));
+  }
+
+  const EVENT_NAMES = { phase: "Faz", direction: "Yön", halt: "HALT", resume: "Devam", close_all: "Close-all",
+    pairs: "Çiftler", shutdown: "Kapanış", hedge_escalated: "Hedge gecikmesi", emergency_flatten: "Acil kapatma",
+    emergency_unresolved: "Acil durum", position_adopted: "Pozisyon düzeltildi", unmanaged_positions: "Yönetilmeyen poz.",
+    margin_reduce: "Marj azaltma", equity_divergence: "Özsermaye farkı" };
+  function eventText(kind, d) {
+    if (!d || typeof d !== "object") return "";
+    if (kind === "phase") return `${d.symbol} ${PHASES[d.from] || d.from} → ${PHASES[d.to] || d.to} (${d.reason})`;
+    if (kind === "direction") return `${d.symbol} → ${d.direction === 1 ? "maker LONG" : "maker SHORT"}`;
+    if (kind === "halt") return d.reason || "";
+    if (kind === "resume") return (d.auto ? "otomatik · " : "") + (d.previous_reason || "");
+    if (kind === "pairs") return (d.pairs || []).length + " çift" + ((d.skipped || []).length ? `, ${d.skipped.length} atlandı` : "");
+    if (kind === "unmanaged_positions") return (d.positions || []).join(", ");
+    if (kind === "close_all") return d.mode || "";
+    if (kind === "shutdown") return Object.keys(d).join(", ");
+    return Object.entries(d).map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join(" ").slice(0, 240);
+  }
+  function renderEvents(evs) {
+    evs = evs || [];
+    $("eventsEmpty").classList.toggle("hidden", evs.length > 0);
+    $("events").replaceChildren(...evs.map((e) => h("li", {}, h("span", { class: "t" }, fmtTime(e.ts)),
+      h("span", { class: "k" + (e.kind === "halt" || e.kind.startsWith("emergency") ? " neg" : "") },
+        EVENT_NAMES[e.kind] || e.kind), h("span", {}, eventText(e.kind, e.data)))));
+  }
+
+  // ---------------------------------------------------------------- controls
+  async function act(fn, el) {
+    msg($("ctlMsg"), "");
+    try { await fn(); await refreshState(); } catch (e) { msg(el || $("ctlMsg"), e.message, false); }
+  }
+  function openBox(id) { for (const b of ["liveBox", "closeBox"]) $(b).classList.toggle("open", b === id && !$(b).classList.contains("open")); }
+  document.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", () => $(b.dataset.close).classList.remove("open")));
+  $("btnPaper").addEventListener("click", () => act(() => api("/api/bot/start", { method: "POST", body: { mode: "paper" } })));
+  $("btnLive").addEventListener("click", () => openBox("liveBox"));
+  $("btnLiveGo").addEventListener("click", () => act(async () => {
+    await api("/api/bot/start", { method: "POST", body: { mode: "live", confirm: $("liveConfirm").value } });
+    $("liveConfirm").value = ""; $("liveBox").classList.remove("open");
+  }));
+  $("btnStop").addEventListener("click", () => act(() => api("/api/bot/stop", { method: "POST", body: {} })));
+  $("btnClose").addEventListener("click", () => openBox("closeBox"));
+  $("btnCloseGo").addEventListener("click", () => act(async () => {
+    const mode = document.querySelector("input[name=closeMode]:checked").value;
+    await api("/api/bot/close-all", { method: "POST", body: { mode, confirm: $("closeConfirm").value } });
+    $("closeConfirm").value = ""; $("closeBox").classList.remove("open");
+  }));
+  const test = (el) => act(() => api("/api/credentials/test", { method: "POST", body: {} }), el);
+  $("btnTest").addEventListener("click", () => test());
+  $("btnTest2").addEventListener("click", () => test($("keysMsg")));
+
+  // ---------------------------------------------------------------- charts
+  let history_ = { hourly: [], samples: [] };
+  async function loadHistory() {
+    try { history_ = await api("/api/history?hours=24"); renderCharts(); } catch (_) { /* next poll */ }
+  }
+  const SVGNS = "http://www.w3.org/2000/svg";
+  function s(tag, attrs) { const el = document.createElementNS(SVGNS, tag); for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v); return el; }
+  function niceMax(v) {
+    if (v <= 0) return 1;
+    const p = Math.pow(10, Math.floor(Math.log10(v))), m = v / p;
+    return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p;
+  }
+  function frame(host) {
+    host.replaceChildren();
+    const w = Math.max(280, host.clientWidth || 600), hgt = 220;
+    const svg = s("svg", { viewBox: `0 0 ${w} ${hgt}`, role: "img" });
+    const tip = h("div", { class: "tooltip" });
+    host.append(svg, tip);
+    return { svg, tip, w, h: hgt, m: { l: 56, r: 12, t: 10, b: 26 } };
+  }
+  function showTip(f, x, y, title, lines) {
+    f.tip.replaceChildren(h("b", {}, title), ...lines.map((l) => h("div", {}, l)));
+    f.tip.style.display = "block";
+    const tw = f.tip.offsetWidth, left = Math.min(Math.max(0, x + 12), f.w - tw - 4);
+    f.tip.style.left = left + "px"; f.tip.style.top = Math.max(0, y - 10) + "px";
+  }
+  function hideTip(f) { f.tip.style.display = "none"; }
+  function yAxis(f, lo, hi, fmt) {
+    const { svg, w, m } = f, ih = f.h - m.t - m.b;
+    const ticks = 4;
+    for (let i = 0; i <= ticks; i++) {
+      const v = lo + (hi - lo) * i / ticks, y = m.t + ih - ih * i / ticks;
+      svg.append(s("line", { x1: m.l, x2: w - m.r, y1: y, y2: y, stroke: "var(--grid)", "stroke-width": 1 }));
+      const t = s("text", { x: m.l - 8, y: y + 4, "text-anchor": "end", fill: "var(--muted)", "font-size": 11 });
+      t.textContent = fmt(v); svg.append(t);
+    }
+  }
+  function renderVolume() {
+    const host = $("volChart"), f = frame(host), { svg, m } = f;
+    const now = Date.now() / 1000, h0 = Math.floor(now / 3600) * 3600 - 23 * 3600;
+    const buckets = [];
+    for (let i = 0; i < 24; i++) buckets.push({ hour: h0 + i * 3600, total: 0, venues: {} });
+    for (const r of history_.hourly || []) {
+      const i = Math.round((r.hour - h0) / 3600); if (i < 0 || i >= 24) continue;
+      const v = num(r.volume) || 0; buckets[i].total += v; buckets[i].venues[r.venue] = (buckets[i].venues[r.venue] || 0) + v;
+    }
+    const max = niceMax(Math.max(...buckets.map((b) => b.total)));
+    if (!buckets.some((b) => b.total > 0)) { host.replaceChildren(h("div", { class: "empty" }, "Son 24 saatte hacim yok.")); return; }
+    yAxis(f, 0, max, (v) => v === 0 ? "0" : "$" + fmtCompact(v));
+    const iw = f.w - m.l - m.r, ih = f.h - m.t - m.b, band = iw / 24, bw = Math.min(24, band * 0.7);
+    svg.append(s("line", { x1: m.l, x2: f.w - m.r, y1: m.t + ih, y2: m.t + ih, stroke: "var(--axis)", "stroke-width": 1 }));
+    buckets.forEach((b, i) => {
+      const x = m.l + band * i + (band - bw) / 2, bh = b.total / max * ih, y = m.t + ih - bh;
+      if (bh > 0) {
+        const r = Math.min(4, bh, bw / 2);
+        const d = `M${x},${m.t + ih}V${y + r}Q${x},${y} ${x + r},${y}H${x + bw - r}Q${x + bw},${y} ${x + bw},${y + r}V${m.t + ih}Z`;
+        const bar = s("path", { d, fill: "var(--series-1)" });
+        svg.append(bar);
+      }
+      const hit = s("rect", { x: m.l + band * i, y: m.t, width: band, height: ih, fill: "transparent", tabindex: 0 });
+      const show = () => showTip(f, m.l + band * i + band / 2, m.t + ih - bh, fmtUsd(b.total, 0),
+        [fmtHour(b.hour) + "–" + fmtHour(b.hour + 3600), ...Object.entries(b.venues).map(([v, x]) => `${v} ${fmtUsd(x, 0)}`)]);
+      hit.addEventListener("pointermove", show); hit.addEventListener("focus", show);
+      hit.addEventListener("pointerleave", () => hideTip(f)); hit.addEventListener("blur", () => hideTip(f));
+      svg.append(hit);
+      if (i % 4 === 0) {
+        const t = s("text", { x: m.l + band * i + band / 2, y: f.h - 8, "text-anchor": "middle", fill: "var(--muted)", "font-size": 11 });
+        t.textContent = fmtHour(b.hour); svg.append(t);
+      }
+    });
+  }
+  function renderPnl() {
+    const host = $("pnlChart");
+    const pts = (history_.samples || []).map(([t, p, v]) => ({ t, p: num(p), v: num(v) })).filter((x) => x.p !== null);
+    if (pts.length < 2) {
+      host.replaceChildren(h("div", { class: "empty" }, state && state.bot.state === "running" ?
+        "Bot çalışırken her 30 sn'de bir örnek alınır; grafik birkaç örnek sonra görünür." : "Bot çalışmıyor."));
+      return;
+    }
+    const f = frame(host), { svg, m } = f, iw = f.w - m.l - m.r, ih = f.h - m.t - m.b;
+    let lo = Math.min(0, ...pts.map((x) => x.p)), hi = Math.max(0, ...pts.map((x) => x.p));
+    const step = niceMax(Math.max(hi - lo, 0.04) / 4);
+    lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
+    if (hi - lo < 4 * step) { if (hi > 0 || lo === 0) hi = lo + 4 * step; else lo = hi - 4 * step; }
+    yAxis(f, lo, hi, (v) => fmtSigned(v, step < 1 ? 2 : 0));
+    const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+    const X = (t) => m.l + (t1 === t0 ? iw : (t - t0) / (t1 - t0) * iw), Y = (v) => m.t + ih - (v - lo) / (hi - lo) * ih;
+    svg.append(s("line", { x1: m.l, x2: f.w - m.r, y1: Y(0), y2: Y(0), stroke: "var(--axis)", "stroke-width": 1 }));
+    const line = pts.map((x, i) => (i ? "L" : "M") + X(x.t).toFixed(1) + "," + Y(x.p).toFixed(1)).join("");
+    svg.append(s("path", { d: line + `L${X(t1)},${Y(0)}L${X(t0)},${Y(0)}Z`, fill: "var(--series-1)", "fill-opacity": 0.1 }));
+    svg.append(s("path", { d: line, fill: "none", stroke: "var(--series-1)", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    const last = pts[pts.length - 1];
+    svg.append(s("circle", { cx: X(last.t), cy: Y(last.p), r: 4, fill: "var(--series-1)", stroke: "var(--surface)", "stroke-width": 2 }));
+    for (const [t, anchor] of [[t0, "start"], [t1, "end"]]) {
+      const tx = s("text", { x: X(t), y: f.h - 8, "text-anchor": anchor, fill: "var(--muted)", "font-size": 11 });
+      tx.textContent = fmtHour(t); svg.append(tx);
+    }
+    const cross = s("line", { y1: m.t, y2: m.t + ih, stroke: "var(--axis)", "stroke-width": 1, visibility: "hidden" });
+    const dot = s("circle", { r: 4, fill: "var(--series-1)", stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden" });
+    svg.append(cross, dot);
+    const hit = s("rect", { x: m.l, y: m.t, width: iw, height: ih, fill: "transparent" });
+    hit.addEventListener("pointermove", (e) => {
+      const r = svg.getBoundingClientRect(), x = (e.clientX - r.left) * (f.w / r.width);
+      let best = pts[0]; for (const p of pts) if (Math.abs(X(p.t) - x) < Math.abs(X(best.t) - x)) best = p;
+      cross.setAttribute("x1", X(best.t)); cross.setAttribute("x2", X(best.t)); cross.setAttribute("visibility", "visible");
+      dot.setAttribute("cx", X(best.t)); dot.setAttribute("cy", Y(best.p)); dot.setAttribute("visibility", "visible");
+      showTip(f, X(best.t), Y(best.p), fmtSigned(best.p), [fmtTime(best.t), best.v !== null ? "toplam hacim " + fmtUsd(best.v, 0) : ""]);
+    });
+    hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); hideTip(f); });
+    svg.append(hit);
+  }
+  function renderCharts() { if (activeTab !== "overview") return; renderVolume(); renderPnl(); }
+  let rz; window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(renderCharts, 150); });
+
+  // ---------------------------------------------------------------- settings
+  let cfg = null;
+  function inputFor(kind, value, attrs) {
+    if (kind === "bool") { const el = h("input", { type: "checkbox", ...attrs }); el.checked = !!value; return el; }
+    if (kind.startsWith("choice:")) {
+      const el = h("select", attrs, ...kind.slice(7).split(",").map((o) => h("option", { value: o }, o)));
+      el.value = value; return el;
+    }
+    const el = h("input", { type: "text", inputmode: kind === "str" ? "text" : "decimal", size: 10, ...attrs });
+    el.value = value === null || value === undefined ? "" : String(value);
+    return el;
+  }
+  const SECTIONS = { strategy: "Strateji", risk: "Risk", monitoring: "İzleme", paper: "Paper" };
+  function renderConfig() {
+    $("cfgPath").textContent = cfg.path + (cfg.exists ? "" : " (henüz yok: varsayılanlar)");
+    const groups = {};
+    for (const fd of cfg.fields) (groups[fd.section] = groups[fd.section] || []).push(fd);
+    $("cfgForm").replaceChildren(...Object.entries(groups).map(([sec, fds]) => h("div", {},
+      h("h2", { style: "margin-top:12px" }, SECTIONS[sec] || sec),
+      h("div", { class: "form-grid" }, ...fds.map((fd) => {
+        const id = `cfg-${sec}-${fd.name}`;
+        const el = inputFor(fd.kind, cfg.values[sec][fd.name], { id, "data-sec": sec, "data-name": fd.name, "data-kind": fd.kind });
+        return fd.kind === "bool" ? h("div", { class: "field" }, h("label", { class: "inline", for: id }, el, fd.label)) :
+          h("div", { class: "field" }, h("label", { for: id }, fd.label), el);
+      })))));
+    renderMarketRows();
+  }
+  function renderMarketRows() {
+    const mf = cfg.market_fields;
+    const head = h("tr", {}, ...mf.map((x) => h("th", {}, x.label)), h("th", {}, ""));
+    const rows = cfg.markets.map((m, i) => h("tr", {}, ...mf.map((x) => h("td", {},
+      inputFor(x.kind, m[x.name], { "data-row": i, "data-name": x.name, "data-kind": x.kind, size: x.name === "symbol" ? 8 : 7 }))),
+      h("td", {}, h("button", { class: "btn", onclick: () => { readMarkets(); cfg.markets.splice(i, 1); renderMarketRows(); } }, "Sil"))));
+    $("mktForm").replaceChildren(h("thead", {}, head), h("tbody", {}, ...rows));
+  }
+  function readMarkets() {
+    const out = cfg.markets.map(() => ({}));
+    for (const el of $("mktForm").querySelectorAll("[data-row]")) {
+      out[+el.dataset.row][el.dataset.name] = el.dataset.kind === "bool" ? el.checked : el.value.trim();
+    }
+    cfg.markets = out;
+    return out;
+  }
+  async function loadConfig() {
+    try { cfg = await api("/api/config"); renderConfig(); msg($("cfgMsg"), ""); } catch (e) { msg($("cfgMsg"), e.message, false); }
+  }
+  $("btnAddMkt").addEventListener("click", () => { readMarkets(); cfg.markets.push({ symbol: "", enabled: true }); renderMarketRows(); });
+  $("btnReloadCfg").addEventListener("click", loadConfig);
+  $("btnSaveCfg").addEventListener("click", async () => {
+    const patch = {};
+    for (const el of $("cfgForm").querySelectorAll("[data-sec]")) {
+      (patch[el.dataset.sec] = patch[el.dataset.sec] || {})[el.dataset.name] = el.dataset.kind === "bool" ? el.checked : el.value.trim();
+    }
+    patch.markets = readMarkets().map((m) => Object.fromEntries(Object.entries(m).filter(([, v]) => v !== "")));
+    try {
+      cfg = await api("/api/config", { method: "PUT", body: patch }); renderConfig();
+      msg($("cfgMsg"), "Kaydedildi." + (cfg.running ? " Bot çalışıyor: yeni ayarlar bir sonraki başlatmada geçerli." : ""), true);
+    } catch (e) { msg($("cfgMsg"), e.message, false); }
+  });
+
+  // ---------------------------------------------------------------- keys
+  let keysCache = null;
+  const GROUPS = { arcus: "Arcus (maker borsası)", lighter: "Lighter (hedge borsası)", telegram: "Telegram bildirimleri (isteğe bağlı)" };
+  function renderKeys(cr) {
+    keysCache = cr;
+    const groups = {};
+    for (const [name, f] of Object.entries(cr)) (groups[f.group] = groups[f.group] || []).push([name, f]);
+    $("keysForm").replaceChildren(...Object.entries(groups).map(([g, fs]) => h("div", {},
+      h("h2", { style: "margin-top:12px" }, GROUPS[g] || g),
+      h("div", { class: "form-grid" }, ...fs.map(([name, f]) => {
+        const id = "key-" + name;
+        const inp = h("input", { id, "data-key": name, type: f.secret ? "password" : "text", autocomplete: "off",
+          spellcheck: "false", placeholder: f.secret ? (f.set ? "kayıtlı · değiştirmek için yeni değer" : "") : "" });
+        if (!f.secret && f.value) inp.value = f.value;
+        const rm = f.set ? h("button", { class: "btn", type: "button", onclick: () => removeKey(name, f.label) }, "Kaldır") : null;
+        return h("div", { class: "field" }, h("label", { for: id }, f.label,
+          h("span", { class: "chip" + (f.set ? " set" : "") }, f.set ? "kayıtlı" : "boş")),
+          h("div", { class: "row" }, inp, rm), h("span", { class: "muted", style: "font-size:11px" }, name));
+      })))));
+  }
+  async function loadKeys() { try { renderKeys(await api("/api/credentials")); } catch (e) { msg($("keysMsg"), e.message, false); } }
+  async function saveKeys(body) {
+    try {
+      const r = await api("/api/credentials", { method: "PUT", body });
+      renderKeys(r.credentials);
+      msg($("keysMsg"), r.changed.length ? "Kaydedildi: " + r.changed.join(", ") +
+        (r.running ? ". Çalışan bot yeni anahtarları yeniden başlatınca kullanır." : "") : "Değişiklik yok.", true);
+    } catch (e) { msg($("keysMsg"), e.message, false); }
+  }
+  function removeKey(name, label) { if (confirm(label + " silinsin mi?")) saveKeys({ [name]: null }); }
+  $("btnSaveKeys").addEventListener("click", () => {
+    const body = {};
+    for (const el of $("keysForm").querySelectorAll("[data-key]")) {
+      const v = el.value.trim(), f = keysCache[el.dataset.key];
+      if (v && (f.secret || v !== (f.value || ""))) body[el.dataset.key] = v;
+    }
+    saveKeys(body);
+  });
+
+  // ---------------------------------------------------------------- logs
+  let logSeq = 0; const logLines = [];
+  const LEVELS = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
+  async function pollLogs() {
+    try {
+      const r = await api("/api/logs?after=" + logSeq + "&limit=2000");
+      if (r.seq < logSeq) { logLines.length = 0; }  // dashboard restarted
+      logSeq = r.seq;
+      logLines.push(...r.lines); if (logLines.length > 2000) logLines.splice(0, logLines.length - 2000);
+      renderLogs();
+    } catch (_) { /* next poll */ }
+  }
+  function renderLogs() {
+    const min = LEVELS[$("logLevel").value], q = $("logFilter").value.trim().toLowerCase();
+    const shown = logLines.filter((l) => (LEVELS[l.level] || 0) >= min && (!q || (l.name + " " + l.msg).toLowerCase().includes(q)));
+    const pre = $("log");
+    pre.replaceChildren(...shown.map((l) => h("div", { class: "lvl-" + l.level },
+      `${fmtTime(l.ts)} ${l.level.padEnd(7)} ${l.name} | ${l.msg}`)));
+    if ($("logFollow").checked) pre.scrollTop = pre.scrollHeight;
+  }
+  $("logLevel").addEventListener("change", renderLogs);
+  $("logFilter").addEventListener("input", renderLogs);
+
+  // ---------------------------------------------------------------- polling
+  async function loop() {
+    if (!document.hidden) {
+      await refreshState();
+      if (activeTab === "logs") await pollLogs();
+    }
+    setTimeout(loop, 2000);
+  }
+  setInterval(() => { if (!document.hidden && activeTab === "overview") loadHistory(); }, 30000);
+
+  if (!token) showLogin();
+  else { refreshState().then(() => { loadConfig(); loadKeys(); loadHistory(); }); }
+  setTimeout(loop, 2000);
+})();
+</script>
+</body>
+</html>

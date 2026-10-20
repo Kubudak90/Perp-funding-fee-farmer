@@ -350,6 +350,21 @@ class Store:
                 s.net_base[symbol] = s.net_base.get(symbol, D(0)) + D(base)
             s.funding += D(funding)
 
+    def hourly(self, since_ts: float) -> list[tuple[int, str, Decimal, Decimal, int]]:
+        """(hour start ts, venue, volume, funding, fills) per venue and hour from ``agg_hourly`` (worker-thread safe
+        when ``concurrent_reads``)."""
+        h0 = int(since_ts // HOUR)
+        out: dict[tuple[int, str], list] = {}
+        with self._reader() as db:
+            for hour, venue, fills, vol, funding in db.execute(
+                    "SELECT hour, venue, fills, volume, funding FROM agg_hourly WHERE paper=? AND hour>=? ORDER BY hour",
+                    (self.paper, h0)):
+                row = out.setdefault((int(hour) * HOUR, venue), [D(0), D(0), 0])
+                row[0] += D(vol)
+                row[1] += D(funding)
+                row[2] += int(fills)
+        return [(h, v, vol, fund, n) for (h, v), (vol, fund, n) in sorted(out.items())]
+
     def total_volume(self, since_ts: float = 0.0) -> Decimal:
         return sum((s.volume for s in self.summary(since_ts).values()), D(0))
 

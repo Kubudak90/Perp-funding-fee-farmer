@@ -23,7 +23,10 @@ src/farmer/
   monitoring/
     stats.py             StatsReporter: periodic log/Telegram report (volume, fees, funding, pnl, positions)
     notifier.py          Notifier (Telegram or null)
-  cli.py                 `farmer scan|run|status|close-all|stats|keygen`
+  dashboard/             `farmer dashboard`: aiohttp server (token auth, host/origin checks, CSP), BotController
+                         (one BotSession + close-all / connection-test jobs), settings (validated config.yaml
+                         edits), credentials (write-only .env secrets), static/index.html (no external resources)
+  cli.py                 `farmer scan|run|status|close-all|stats|dashboard|keygen`; BotSession = one engine run
 ```
 
 ## Core trade loop (per market)

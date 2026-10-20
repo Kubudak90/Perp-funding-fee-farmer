@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -317,8 +318,11 @@ _ENV_MAP: dict[tuple[str, str], tuple[str, type]] = {
 }
 
 
-def load_config(path: str | os.PathLike | None = None, *, env_file: str | os.PathLike | None = ".env") -> AppConfig:
-    """Load YAML config (optional) and overlay secrets from the environment / .env file."""
+def load_config(path: str | os.PathLike | None = None, *, env_file: str | os.PathLike | None = ".env",
+                environ: Mapping[str, str] | None = None, warn: bool = True) -> AppConfig:
+    """Load YAML config (optional) and overlay secrets from the environment (``environ``, default ``os.environ``)
+    / .env file."""
+    env = os.environ if environ is None else environ
     if env_file:
         try:
             from dotenv import load_dotenv
@@ -335,17 +339,17 @@ def load_config(path: str | os.PathLike | None = None, *, env_file: str | os.Pat
         else:
             raise FileNotFoundError(f"config file not found: {p}")
 
-    for (section, key), (env, typ) in _ENV_MAP.items():
-        val = os.environ.get(env)
+    for (section, key), (name, typ) in _ENV_MAP.items():
+        val = env.get(name)
         if val is None or val.strip() == "":
             continue
         raw.setdefault(section, {})
         raw[section][key] = typ(val.strip())
 
-    if os.environ.get("FARMER_MODE"):
-        raw["mode"] = os.environ["FARMER_MODE"].strip()
+    if env.get("FARMER_MODE"):
+        raw["mode"] = env["FARMER_MODE"].strip()
 
     cfg = AppConfig.model_validate(raw)
-    for w in cfg.warnings():
+    for w in cfg.warnings() if warn else ():
         logging.getLogger("farmer.config").warning("config: %s", w)
     return cfg

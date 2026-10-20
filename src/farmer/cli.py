@@ -1,10 +1,11 @@
-"""Command line entry point: ``farmer scan|run|status|close-all|stats|keygen``.
+"""Command line entry point: ``farmer scan|run|status|close-all|stats|dashboard|keygen``.
 
 - ``scan``      public data only: every Arcus market that maps onto Lighter, funding, carry, spreads, depth, basis.
 - ``run``       the engine (``--paper`` = live public data + simulated orders; ``--live`` = real orders).
 - ``status``    balances, positions, open orders and the delta per pair (credentials required).
 - ``close-all`` flatten every configured pair (maker mode by default, ``--taker`` = immediate IOC).
 - ``stats``     volume / fees / funding / PnL report from the SQLite store.
+- ``dashboard`` local web UI (``farmer.dashboard``): status, settings, API keys, start / stop / close-all.
 - ``keygen``    create + register API keys (wallet keys are read from the environment, never printed).
 """
 
@@ -416,74 +417,115 @@ async def scan(cfg: AppConfig, *, top: int = 0, max_books: int = 60, wait_s: flo
 
 
 # =========================================================================== run
+class BotSession:
+    """One engine run that a caller starts and stops programmatically (``farmer run`` and the dashboard).
+
+    ``acquire()`` takes the per-database run lock; ``run()`` builds the store, notifier, risk manager, engine and
+    stats reporter, trades until ``request_stop()`` (or ``duration``), always cleans up and releases the lock.
+    """
+
+    def __init__(self, cfg: AppConfig, *, paper: bool, venues: dict[str, Any] | None = None) -> None:
+        self.cfg = cfg.model_copy(update={"mode": "paper" if paper else "live"})
+        self.paper = paper
+        self.venues: dict[str, Any] = venues or {}
+        self.lock = RunLock(store_path(self.cfg, paper).with_suffix(".lock"))
+        self.engine: Any = None
+        self.stats: Any = None
+        self.store: Any = None
+        self.error: str | None = None
+        self._stop_requested = False
+
+    def acquire(self) -> bool:
+        return self.lock.acquire()
+
+    def request_stop(self) -> None:
+        """Graceful stop (cancel quotes, flush hedges); safe before ``run()`` started and from a signal handler."""
+        self._stop_requested = True
+        if self.engine is not None:
+            self.engine.request_stop()
+
+    async def run(self, duration: float | None = None) -> int:
+        from farmer.monitoring.notifier import make_notifier
+        from farmer.monitoring.stats import StatsReporter
+        from farmer.persistence.store import Store
+        from farmer.strategy.engine import Engine
+
+        cfg, paper = self.cfg, self.paper
+        try:
+            venues = self.venues = self.venues or build_venues(cfg, paper=paper)
+            store = self.store = Store(store_path(cfg, paper), paper=paper)
+        except BaseException:
+            self.lock.release()
+            raise
+        mon = cfg.monitoring
+        notifier = make_notifier(mon.telegram_bot_token, mon.telegram_chat_id)
+        risk = make_risk(cfg, venues, store, notifier)
+        engine = self.engine = Engine(cfg, venues, store, notifier, risk)
+        # margin ratio at reduce_margin_ratio: the risk manager halts and flattens every pair with reduce-only IOCs
+        risk.set_reducer(lambda: engine.close_all("taker", timeout_s=cfg.strategy.close_on_exit_timeout_s))
+        stats = self.stats = StatsReporter(store, notifier, engine.status, venues, interval_s=mon.report_interval_s,
+                                           notify_every=mon.notify_every, funding_interval_s=mon.funding_collect_s,
+                                           funding_lookback_s=mon.funding_lookback_s)
+        if self._stop_requested:
+            engine.request_stop()
+
+        async def stats_loop() -> None:
+            while not engine.started:
+                await asyncio.sleep(0.5)
+            await stats.run()
+
+        async def stop_after(seconds: float) -> None:
+            await asyncio.sleep(seconds)
+            log.info("--duration %.0fs elapsed: stopping", seconds)
+            engine.request_stop()
+
+        helpers = [asyncio.create_task(stats_loop(), name="farmer:stats")]
+        if duration:
+            helpers.append(asyncio.create_task(stop_after(float(duration)), name="farmer:duration"))
+        rc = EXIT_OK
+        log.info("farmer %s starting in %s mode (pairs: %s)", __version__, cfg.mode.upper(),
+                 ", ".join(m.symbol for m in cfg.enabled_markets()))
+        try:
+            await engine.run()
+        except Exception as exc:
+            rc = EXIT_ERROR
+            self.error = str(exc)
+            log.error("engine stopped with an error: %s", exc)
+            hint = _hint_for(exc)
+            if hint:
+                self.error += f" (hint: {hint})"
+                log.error("hint: %s", hint)
+        finally:
+            stats.stop()
+            for t in helpers:
+                t.cancel()
+            await asyncio.gather(*helpers, return_exceptions=True)
+            if engine.started:
+                with contextlib.suppress(Exception):
+                    await stats.report_once()
+            with contextlib.suppress(Exception):
+                await risk.drain_notifications()
+            with contextlib.suppress(Exception):
+                await notifier.close()
+            store.close()
+            self.lock.release()
+        return rc
+
+
 async def run_engine(cfg: AppConfig, *, paper: bool, duration: float | None = None,
                      venues: dict[str, Any] | None = None) -> int:
     """Build venues/store/risk/engine/stats and trade until a signal or ``duration`` elapses."""
-    from farmer.monitoring.notifier import make_notifier
-    from farmer.monitoring.stats import StatsReporter
-    from farmer.persistence.store import Store
-    from farmer.strategy.engine import Engine
-
-    cfg = cfg.model_copy(update={"mode": "paper" if paper else "live"})
-    lock = RunLock(store_path(cfg, paper).with_suffix(".lock"))
-    if not lock.acquire():
-        print(f"ERROR: another farmer process (pid {lock.holder()}) is running on {store_path(cfg, paper)}",
-              file=sys.stderr)
+    session = BotSession(cfg, paper=paper, venues=venues)
+    if not session.acquire():
+        print(f"ERROR: another farmer process (pid {session.lock.holder()}) is running on "
+              f"{store_path(session.cfg, paper)}", file=sys.stderr)
         return EXIT_ERROR
-    venues = venues or build_venues(cfg, paper=paper)
-    store = Store(store_path(cfg, paper), paper=paper)
-    mon = cfg.monitoring
-    notifier = make_notifier(mon.telegram_bot_token, mon.telegram_chat_id)
-    risk = make_risk(cfg, venues, store, notifier)
-    engine = Engine(cfg, venues, store, notifier, risk)
-    # margin ratio at reduce_margin_ratio: the risk manager halts and flattens every pair with reduce-only IOCs
-    risk.set_reducer(lambda: engine.close_all("taker", timeout_s=cfg.strategy.close_on_exit_timeout_s))
-    stats = StatsReporter(store, notifier, engine.status, venues, interval_s=mon.report_interval_s,
-                          notify_every=mon.notify_every, funding_interval_s=mon.funding_collect_s,
-                          funding_lookback_s=mon.funding_lookback_s)
     loop = asyncio.get_running_loop()
-    installed = _install_stop_signals(loop, engine.request_stop, "graceful shutdown (cancel quotes, flush hedges)")
-
-    async def stats_loop() -> None:
-        while not engine.started:
-            await asyncio.sleep(0.5)
-        await stats.run()
-
-    async def stop_after(seconds: float) -> None:
-        await asyncio.sleep(seconds)
-        log.info("--duration %.0fs elapsed: stopping", seconds)
-        engine.request_stop()
-
-    helpers = [asyncio.create_task(stats_loop(), name="farmer:stats")]
-    if duration:
-        helpers.append(asyncio.create_task(stop_after(float(duration)), name="farmer:duration"))
-    rc = EXIT_OK
-    log.info("farmer %s starting in %s mode (pairs: %s)", __version__, cfg.mode.upper(),
-             ", ".join(m.symbol for m in cfg.enabled_markets()))
+    installed = _install_stop_signals(loop, session.request_stop, "graceful shutdown (cancel quotes, flush hedges)")
     try:
-        await engine.run()
-    except Exception as exc:
-        rc = EXIT_ERROR
-        log.error("engine stopped with an error: %s", exc)
-        hint = _hint_for(exc)
-        if hint:
-            log.error("hint: %s", hint)
+        return await session.run(duration)
     finally:
-        stats.stop()
-        for t in helpers:
-            t.cancel()
-        await asyncio.gather(*helpers, return_exceptions=True)
-        if engine.started:
-            with contextlib.suppress(Exception):
-                await stats.report_once()
         _remove_stop_signals(loop, installed)
-        with contextlib.suppress(Exception):
-            await risk.drain_notifications()
-        with contextlib.suppress(Exception):
-            await notifier.close()
-        store.close()
-        lock.release()
-    return rc
 
 
 def make_risk(cfg: AppConfig, venues: dict[str, Any], store: Any, notifier: Any) -> Any:
@@ -637,7 +679,9 @@ async def _unmanaged_positions(engine: Any, cfg: AppConfig) -> tuple[list[str], 
     return unmanaged, other, errors
 
 
-async def close_all(cfg: AppConfig, *, taker: bool, timeout_s: float, out=None) -> int:
+async def close_all(cfg: AppConfig, *, taker: bool, timeout_s: float, out=None, signals: bool = True) -> int:
+    """Flatten every configured pair (see ``Engine.close_all``). ``signals=False``: the caller owns the signal
+    handlers (the dashboard) and interrupts by cancelling the task; the shutdown path is the same."""
     from farmer.monitoring.notifier import make_notifier
     from farmer.persistence.store import Store
     from farmer.strategy.engine import Engine
@@ -676,7 +720,8 @@ async def close_all(cfg: AppConfig, *, taker: bool, timeout_s: float, out=None) 
 
     # SIGTERM (systemd / docker / timeout) or SIGHUP must not kill the process mid-flatten: cancel the close, then
     # the finally below cancels quotes, flushes the hedgers and closes the venues (signals stay handled meanwhile)
-    installed = _install_stop_signals(loop, interrupt, "interrupting close-all (cancel quotes, flush hedges)")
+    installed = (_install_stop_signals(loop, interrupt, "interrupting close-all (cancel quotes, flush hedges)")
+                 if signals else [])
     try:
         try:
             mode, result = await _close_with_fallback(engine, risk, mode, timeout_s, out)
@@ -1012,6 +1057,10 @@ def build_parser() -> argparse.ArgumentParser:
     sa.add_argument("--live", action="store_true", default=None, help="read the live database")
     sa.add_argument("--no-marks", action="store_true", help="do not fetch public mark prices for the PnL")
 
+    d = sub.add_parser("dashboard", parents=[common], help="local web dashboard: status, settings, API keys, start/stop")
+    d.add_argument("--host", default="127.0.0.1", help="listen address (default 127.0.0.1; use an SSH tunnel remotely)")
+    d.add_argument("--port", type=int, default=8080)
+
     k = sub.add_parser("keygen", parents=[common], help="create and register API keys")
     k.add_argument("venue", choices=["arcus", "lighter"])
     k.add_argument("--account-index", type=int, default=None,
@@ -1028,8 +1077,31 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _dashboard(args: argparse.Namespace) -> int:
+    """The dashboard also starts with a broken config.yaml (it shows the error and can rewrite the file)."""
+    from dotenv import load_dotenv
+
+    from farmer.dashboard.server import serve
+
+    env_file = Path(args.env_file or ".env")
+    if env_file.exists():
+        load_dotenv(env_file, override=False)
+    try:
+        cfg = _load(args)
+    except Exception as exc:
+        print(f"WARNING: config: {exc} (fix it in the dashboard)", file=sys.stderr)
+        cfg = AppConfig()
+    _setup_logging(cfg, quiet_console=True)
+    return asyncio.run(serve(Path(args.config or DEFAULT_CONFIG), env_file, host=args.host, port=args.port))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "dashboard":
+        try:
+            return _dashboard(args)
+        except KeyboardInterrupt:
+            return 130
     try:
         cfg = _load(args)
     except Exception as exc:
