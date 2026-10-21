@@ -294,6 +294,38 @@ async def test_close_all_on_the_running_bot(dash):
     assert venues["arcus"].positions["BTC"] == 0 and venues["lighter"].positions["BTC"] == 0
 
 
+
+async def test_maker_close_all_on_a_halted_bot_uses_iocs(dash):
+    """After a halt (e.g. the price-move auto close timed out) the traders never quote: the default maker close-all
+    must switch to IOCs instead of waiting out its 600 s timeout."""
+    client, ctl, _, venues, _ = dash
+
+    def factory(cfg, paper):
+        v = fake_venues()
+        v["arcus"].positions["BTC"], v["lighter"].positions["BTC"] = D("0.02"), D("-0.02")
+        venues.update(v)
+        return v
+
+    ctl.venues_factory = factory
+    await client.post("/api/bot/start", json={"mode": "paper"}, headers=AUTH)
+
+    async def started() -> bool:
+        return (await _state(client))["bot"]["engine_started"]
+
+    await wait_for(started)
+    ctl.session.engine.risk.halt("price moved >= 19%: simulated", kind="price_move")
+    r = await client.post("/api/bot/close-all", json={"mode": "maker", "confirm": "KAPAT"}, headers=AUTH)
+    assert r.status == 200
+
+    async def done() -> bool:
+        return (await _state(client))["job"]["state"] != "running"
+
+    await wait_for(done, 10)
+    job = (await _state(client))["job"]
+    assert job["state"] == "done" and "taker (IOC)" in job["output"] and "FLAT" in job["output"], job
+    assert venues["arcus"].positions["BTC"] == 0 and venues["lighter"].positions["BTC"] == 0
+
+
 async def test_close_all_with_the_bot_stopped_needs_live_keys(dash):
     client, *_ = dash
     r = await client.post("/api/bot/close-all", json={"mode": "maker", "confirm": "KAPAT"}, headers=AUTH)

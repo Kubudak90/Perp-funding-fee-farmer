@@ -17,11 +17,15 @@ pair), retrying while the ratio stays high. Diverging venue equities are reporte
 rebalance collateral (the bot never moves funds between venues).
 
 Price move: a hedged pair still drains the losing venue's collateral when the price trends (one leg loses
-on every move, in either direction). When a market with exposure first gets a mark, its reference price is
-stored (``Store`` meta, so it survives restarts; normal churn cycles do not reset it). Once the mark is
-``auto_close_move_frac`` away from the reference the manager halts (``HALT_MOVE``) and runs the reducer like a
-margin reduction; it warns once at ``MOVE_WARN_AT`` of the threshold. The engine resets a market's reference
-when a close-all leaves it flat and when it starts with no position in it.
+on every move, in either direction). When a market with exposure first gets a price, its reference is stored:
+the mid of every venue with a fresh two-sided book (``Store`` meta, so it survives a restart with open positions;
+normal churn cycles do not reset it). Books are looked up by each venue's own symbol (``set_pair_symbols``: the
+pair BONK is Arcus KBONK / Lighter 1000BONK). The move is measured per venue against that venue's reference and
+the largest one counts (a frozen book on one venue cannot hide the move on the other). Once it reaches
+``auto_close_move_frac`` the manager halts (``HALT_MOVE``) and runs the reducer like a margin reduction, retried
+every ``reduce_retry_s`` while any pair is still exposed; ``check_open`` refuses new exposure in a market already
+past the threshold (a restart before the first check). It warns once at ``MOVE_WARN_AT`` of the threshold. The
+engine resets a market's reference when a close-all leaves it flat and when it starts with no position in it.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -58,9 +63,31 @@ HALT_MARGIN = "margin"
 HALT_MOVE = "price_move"
 HALT_MANUAL = "manual"
 
-MOVE_REFS_META = "risk.move_refs"  # Store meta key: {symbol: {"price": str, "ts": float}}
+MOVE_REFS_META = "risk.move_refs"  # Store meta: {pair symbol: {"price": str, "ts": float, "venues": {venue: str}}}
 MOVE_WARN_AT = Decimal("0.75")  # warn once at this fraction of auto_close_move_frac ...
 MOVE_WARN_RESET = Decimal("0.6")  # ... and re-arm the warning below this fraction
+MOVE_NOMARK_WARN = 6  # warn once an exposed market had no fresh price on any venue for this many checks
+
+
+@dataclass
+class MoveRef:
+    """Price-move reference of one pair: the mean venue mid and each venue's own mid when it was taken."""
+
+    price: Decimal
+    ts: float
+    venues: dict[str, Decimal] = field(default_factory=dict)
+
+    def base(self, venue: str) -> Decimal:
+        return self.venues.get(venue) or self.price
+
+
+def _positive(x: object) -> Decimal | None:
+    """``x`` as a finite positive Decimal, else None (NaN / Infinity / garbage from a hand-edited database)."""
+    try:
+        d = Decimal(str(x))
+    except Exception:
+        return None
+    return d if d.is_finite() and d > 0 else None
 
 
 def utc_midnight(ts: float) -> float:
@@ -126,9 +153,11 @@ class RiskManager:
         self.reduce_retry_s = REDUCE_RETRY_S
         self._equity_diverged = False
         self._no_reducer_warned = False
-        self._move_refs: dict[str, tuple[Decimal, float]] = self._load_move_refs()  # symbol -> (price, ts)
-        self._moves: dict[str, Decimal] = {}  # symbol -> latest mark / ref - 1
+        self._move_refs: dict[str, MoveRef] = self._load_move_refs()  # pair symbol -> reference
+        self._moves: dict[str, Decimal] = {}  # pair symbol -> latest largest venue move (mid / ref - 1)
         self._move_warned: set[str] = set()
+        self._move_nomark: dict[str, int] = {}  # pair symbol -> consecutive checks without a fresh price
+        self._pair_syms: dict[str, dict[str, str]] = {}  # pair symbol -> {venue name: venue symbol}
 
     # ================================================================== state
     @property
@@ -298,30 +327,54 @@ class RiskManager:
             self._reduce_end = time.monotonic()
 
     # ================================================================== price move auto close
-    def _load_move_refs(self) -> dict[str, tuple[Decimal, float]]:
+    def set_pair_symbols(self, pairs: Mapping[str, Mapping[str, str]]) -> None:
+        """{pair symbol: {venue name: venue symbol}} (the engine, after mapping): the price-move guard reads each
+        venue's book under the venue's own symbol (pair BONK = Arcus KBONK / Lighter 1000BONK)."""
+        self._pair_syms = {str(s): {str(v): str(x) for v, x in m.items()} for s, m in pairs.items()}
+
+    def _move_frac(self) -> Decimal:
+        return abs(Decimal(str(self.cfg.auto_close_move_frac or 0)))
+
+    def _load_move_refs(self) -> dict[str, MoveRef]:
         get = getattr(self.store, "get_meta", None)
         if not callable(get):
             return {}
         try:
             raw = json.loads(get(MOVE_REFS_META) or "{}")
-            return {str(s): (Decimal(str(v["price"])), float(v.get("ts") or 0)) for s, v in raw.items()
-                    if Decimal(str(v["price"])) > 0}
         except Exception:
             log.exception("cannot read stored price-move references; starting without")
             return {}
+        if not isinstance(raw, dict):
+            log.warning("ignoring stored price-move references: %r is not a mapping", type(raw).__name__)
+            return {}
+        out: dict[str, MoveRef] = {}
+        for sym, v in raw.items():  # one bad entry must not discard the others
+            price = _positive(v.get("price")) if isinstance(v, dict) else None
+            if price is None:
+                log.warning("ignoring stored price-move reference %s=%r", sym, v)
+                continue
+            try:
+                ts = float(v.get("ts") or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            venues = v.get("venues") if isinstance(v.get("venues"), dict) else {}
+            out[str(sym)] = MoveRef(price, ts, {str(k): p for k, x in venues.items() if (p := _positive(x))})
+        return out
 
     def _save_move_refs(self) -> None:
         put = getattr(self.store, "set_meta", None)
         if not callable(put):
             return
         try:
-            put(MOVE_REFS_META, json.dumps({s: {"price": str(p), "ts": t} for s, (p, t) in self._move_refs.items()}))
+            put(MOVE_REFS_META, json.dumps({s: {"price": str(r.price), "ts": r.ts,
+                                                "venues": {v: str(p) for v, p in r.venues.items()}}
+                                            for s, r in self._move_refs.items()}))
         except Exception:
             log.exception("cannot store price-move references")
 
     def move_reference(self, symbol: str) -> Decimal | None:
         ref = self._move_refs.get(symbol)
-        return ref[0] if ref else None
+        return ref.price if ref else None
 
     def reset_move_refs(self, symbols: list[str] | None = None) -> None:
         """Forget the reference price of ``symbols`` (all when None): the next exposure takes a fresh one.
@@ -336,56 +389,118 @@ class RiskManager:
         log.info("price-move reference reset for %s", ", ".join(sorted(syms)))
         self._save_move_refs()
 
+    def _move_mids(self, symbol: str) -> dict[str, Decimal]:
+        """{venue name: mid} of every venue whose book of ``symbol`` (under the venue's own symbol) is two-sided and
+        fresh (``stale_book_s``, never stricter than two check intervals): a frozen book is no price."""
+        now = self._clock()
+        max_age = max(float(self.cfg.stale_book_s), 2 * self.interval_s)
+        syms = self._pair_syms.get(symbol)
+        out: dict[str, Decimal] = {}
+        for key, v in self.venues.items():
+            name = getattr(v, "name", None) or key
+            vsym = syms.get(name) if syms else symbol
+            if not vsym:
+                continue
+            try:
+                book = v.get_book(vsym)
+                if book is None or not book.bids or not book.asks or book.age(now) > max_age:
+                    continue
+                mid = book.mid
+            except Exception:
+                continue
+            if mid is not None and mid.is_finite() and mid > 0:
+                out[name] = mid
+        return out
+
+    def _current_move(self, symbol: str, mids: dict[str, Decimal] | None = None
+                      ) -> tuple[Decimal, str, Decimal, Decimal] | None:
+        """Largest venue move of ``symbol`` from its reference: (move, venue, that venue's reference, its mid);
+        None without a reference or a fresh price."""
+        ref = self._move_refs.get(symbol)
+        if ref is None:
+            return None
+        best: tuple[Decimal, str, Decimal, Decimal] | None = None
+        for venue, mid in (self._move_mids(symbol) if mids is None else mids).items():
+            base = ref.base(venue)
+            move = mid / base - 1
+            if best is None or abs(move) > abs(best[0]):
+                best = (move, venue, base, mid)
+        return best
+
+    def _no_move_mark(self, symbol: str) -> None:
+        n = self._move_nomark[symbol] = self._move_nomark.get(symbol, 0) + 1
+        if n == MOVE_NOMARK_WARN:
+            log.warning("%s: no fresh two-sided book on any venue for %d checks: the price-move guard cannot see its "
+                        "price (auto close-all at ±%s%% is blind until it can)", symbol, n,
+                        fmt(self._move_frac() * 100, 2))
+            self._record("price_move_blind", {"symbol": symbol, "checks": n})
+
     def check_price_move(self) -> bool:
         """Halt + flatten everything once an exposed market moved ``auto_close_move_frac`` (either direction)
         from its reference price. Takes a reference for exposed markets that have none, warns once at
-        ``MOVE_WARN_AT`` of the threshold. Returns True when it (re)started or keeps the auto close-all."""
-        frac = abs(Decimal(str(self.cfg.auto_close_move_frac or 0)))
+        ``MOVE_WARN_AT`` of the threshold. While a price-move halt is active and any pair is still exposed (the
+        close-all timed out, or the price came back meanwhile) the reducer is retried every ``reduce_retry_s``.
+        Returns True when it (re)started or keeps the auto close-all."""
+        frac = self._move_frac()
         if frac <= 0:
             return False
         exposed = {sym for per in self._exposure.values() for sym, n in per.items() if n > 0}
+        for sym in [s for s in self._move_nomark if s not in exposed]:
+            del self._move_nomark[sym]
         if not exposed:
             return False
-        marks = self._marks(exposed)
         added: list[str] = []
-        hit: list[tuple[str, Decimal, Decimal, Decimal]] = []
+        hit: list[tuple[str, Decimal, Decimal, Decimal, str]] = []
         for sym in sorted(exposed):
-            mark = marks.get(sym)
-            if mark is None or mark <= 0:
+            mids = self._move_mids(sym)
+            if not mids:
+                self._no_move_mark(sym)
                 continue
-            ref = self._move_refs.get(sym)
-            if ref is None:
-                self._move_refs[sym] = (mark, self._clock())
+            if self._move_nomark.pop(sym, 0) >= MOVE_NOMARK_WARN:
+                log.info("%s: the price-move guard sees prices again", sym)
+            if sym not in self._move_refs:
+                mark = sum(mids.values(), ZERO) / len(mids)
+                self._move_refs[sym] = MoveRef(mark, self._clock(), dict(mids))
                 self._moves[sym] = ZERO
                 added.append(sym)
                 log.info("%s price-move reference %s: auto close-all at %s / %s (±%s%%)", sym, fmt(mark),
                          fmt(mark * (1 - frac), 6), fmt(mark * (1 + frac), 6), fmt(frac * 100, 2))
                 continue
-            move = mark / ref[0] - 1
+            cur = self._current_move(sym, mids)
+            if cur is None:  # pragma: no cover - a reference and a price exist here
+                continue
+            move, venue, base, mark = cur
             self._moves[sym] = move
             if abs(move) >= frac:
-                hit.append((sym, ref[0], mark, move))
+                hit.append((sym, base, mark, move, venue))
             elif abs(move) >= frac * MOVE_WARN_AT:
                 if sym not in self._move_warned:
                     self._move_warned.add(sym)
-                    msg = (f"{sym} moved {move * 100:+.1f}% from its reference {fmt(ref[0])} (now {fmt(mark)}); "
-                           f"the bot closes everything at ±{fmt(frac * 100, 2)}% - consider rebalancing collateral")
+                    msg = (f"{sym} moved {move * 100:+.2f}% from its reference {fmt(base)} on {venue} (now "
+                           f"{fmt(mark)}); the bot closes everything at ±{fmt(frac * 100, 2)}% - consider "
+                           "rebalancing collateral")
                     log.warning(msg)
-                    self._record("price_move_warning", {"symbol": sym, "ref": ref[0], "mark": mark, "move": move})
+                    self._record("price_move_warning", {"symbol": sym, "venue": venue, "ref": base, "mark": mark,
+                                                        "move": move})
                     self._notify(f"WARNING: {msg}")
             elif abs(move) < frac * MOVE_WARN_RESET:
                 self._move_warned.discard(sym)
         if added:
             self._save_move_refs()
-        if not hit:
-            return False
-        desc = "; ".join(f"{s} {m * 100:+.1f}% ({fmt(r)} -> {fmt(mk)})" for s, r, mk, m in hit)
-        eq = ", ".join(f"{v} equity {b.equity:.2f}" for v, b in self._balances.items())
-        self.halt(f"price moved >= ±{fmt(frac * 100, 2)}% from the reference: {desc}"
-                  + (f" [{eq}]" if eq else "") + ": closing every pair", kind=HALT_MOVE)
-        self._start_reducer(f"price move {desc}", "auto_close_move",
-                            {"moves": {s: {"ref": r, "mark": mk, "move": m} for s, r, mk, m in hit}})
-        return True
+        if hit:
+            desc = "; ".join(f"{s} {m * 100:+.2f}% on {v} ({fmt(r)} -> {fmt(mk)})" for s, r, mk, m, v in hit)
+            eq = ", ".join(f"{v} equity {b.equity:.2f}" for v, b in self._balances.items())
+            self.halt(f"price moved >= ±{fmt(frac * 100, 2)}% from the reference: {desc}"
+                      + (f" [{eq}]" if eq else "") + ": closing every pair", kind=HALT_MOVE)
+            self._start_reducer(f"price move {desc}", "auto_close_move",
+                                {"moves": {s: {"venue": v, "ref": r, "mark": mk, "move": m} for s, r, mk, m, v in hit}})
+            return True
+        if HALT_MOVE in self._halts:  # the close-all left positions open: keep closing until every pair is flat
+            still = sorted(exposed)
+            self._start_reducer(f"price-move close-all incomplete, still exposed: {', '.join(still)}",
+                                "auto_close_move_retry", {"symbols": still})
+            return True
+        return False
 
     # ================================================================== daily loss
     def _venue_marks(self, symbols: set[str]) -> dict[tuple[str, str], Decimal]:
@@ -637,6 +752,12 @@ class RiskManager:
         or a filled maker clip stays unhedged until the emergency flatten)."""
         if self.halted:
             return False, f"halted: {self.halt_reason}"
+        frac = self._move_frac()
+        if frac > 0 and symbol in self._move_refs:  # e.g. a restart: traders tick before the first price-move check
+            cur = self._current_move(symbol)
+            if cur is not None and abs(cur[0]) >= frac:
+                return False, (f"{symbol}: price moved {cur[0] * 100:+.2f}% on {cur[1]} from the reference "
+                               f"{fmt(cur[2])} (auto close-all at ±{fmt(frac * 100, 2)}%)")
         now = self._clock()
         add = abs(Decimal(add_notional))
         lev = max(1, int(leverage)) if leverage else self.leverage_for(symbol)
@@ -686,8 +807,8 @@ class RiskManager:
             "max_margin_ratio": self.cfg.max_margin_ratio,
             "reduce_margin_ratio": self.cfg.reduce_margin_ratio,
             "auto_close_move_frac": self.cfg.auto_close_move_frac,
-            "price_moves": {s: {"ref": p, "ref_ts": t, "move": self._moves.get(s)}
-                            for s, (p, t) in self._move_refs.items()},
+            "price_moves": {s: {"ref": r.price, "ref_ts": r.ts, "move": self._moves.get(s)}
+                            for s, r in self._move_refs.items()},
             "errors": dict(self._errors),
             "last_errors": dict(self._last_error),
             "exposure": {v: {"total": sum(d.values(), ZERO), "by_symbol": dict(d)} for v, d in self._exposure.items()},
@@ -706,4 +827,5 @@ class RiskManager:
         }
 
 
-__all__ = ["HALT_ERROR", "HALT_LOSS", "HALT_MANUAL", "HALT_MARGIN", "HALT_MOVE", "RiskManager", "utc_midnight"]
+__all__ = ["HALT_ERROR", "HALT_LOSS", "HALT_MANUAL", "HALT_MARGIN", "HALT_MOVE", "MoveRef", "RiskManager",
+           "utc_midnight"]

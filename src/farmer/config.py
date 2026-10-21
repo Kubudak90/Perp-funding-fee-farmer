@@ -262,6 +262,13 @@ class RiskConfig(_Base):
     balance_timeout_s: float = 10.0  # per-venue fetch_balance timeout
     balance_max_age_s: float = 60.0  # check_open refuses once a venue's last good balance is older (never fetched = ok)
 
+    @model_validator(mode="after")
+    def _check(self) -> RiskConfig:
+        if not (Decimal(0) <= self.auto_close_move_frac < Decimal(1)):  # "19" would mean +1900 %: never fires
+            raise ValueError(f"auto_close_move_frac is a fraction (0.19 = 19 %, 0 = off) in [0, 1); got "
+                             f"{self.auto_close_move_frac}")
+        return self
+
 
 # --------------------------------------------------------------------------- misc
 class PaperConfig(_Base):

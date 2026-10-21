@@ -90,11 +90,18 @@ construction, minus hedge slippage from the taker latency).
   manager's reducer (`Engine.close_all("taker")`: reduce-only IOCs on both legs of every pair, independent of
   halt / edge / book gates), retried while the ratio stays high. Diverging venue equities
   (`max_equity_divergence_frac`) are reported: the bot never moves collateral between venues.
-- Price move: the first time a pair has exposure the risk manager stores its mark as the reference (Store meta
-  `risk.move_refs`; survives restarts, churn cycles do not reset it). At `auto_close_move_frac` from the reference
-  (either direction: one leg always loses) -> `HALT_MOVE` + the same reducer; warning at 75 % of the threshold.
-  `Engine.close_all` drops the reference (and zeroes reported exposure) of pairs it leaves flat; a pair that
-  starts with no position starts without a reference.
+- Price move: the first time a pair has exposure the risk manager stores the mid of every venue with a fresh
+  two-sided book as the reference (Store meta `risk.move_refs`; survives a restart with open positions, churn
+  cycles do not reset it). Books are read under each venue's own symbol (`set_pair_symbols`, wired by the engine:
+  pair BONK = Arcus KBONK / Lighter 1000BONK). Each venue's move is measured against its own reference and the
+  largest counts (a frozen book cannot hide the move on the other venue). At `auto_close_move_frac` (either
+  direction: one leg always loses) -> `HALT_MOVE` + the same reducer, retried every `reduce_retry_s` while any
+  pair is still exposed (also after the price came back); `check_open` refuses new exposure in a market past the
+  threshold (restart before the first check); warning at 75 % of the threshold. `Engine.close_all` drops the
+  reference (and zeroes reported exposure) of pairs it leaves flat and reports the exposure of pairs it left open;
+  a pair that starts with no position starts without a reference. `farmer close-all` runs with the guard off.
+- `Engine.close_all` calls run one at a time (risk reducer vs. operator); a maker close on a halted engine runs in
+  taker (IOC) mode (halted traders never quote).
 - Unhedged delta persisting beyond `unhedged_timeout_s` -> cancel quotes, aggressive hedge with
   2x slippage; beyond 3x timeout -> emergency flatten of the maker leg with a taker order, then no quoting
   for `emergency_cooldown_s`; `max_emergencies_per_hour` emergencies -> halt.

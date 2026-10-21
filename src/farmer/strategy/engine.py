@@ -57,6 +57,7 @@ class Engine:
         self._stop_evt = asyncio.Event()
         self._start_lock = asyncio.Lock()
         self._shutdown_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()  # one close_all at a time (reducer vs. operator)
         self._started = False
         self._trading = False
         self._stopping = False
@@ -110,6 +111,10 @@ class Engine:
         if not self.pairs:
             raise RuntimeError("no tradeable pairs: " + "; ".join(self.skipped))
         tradeable = [p for p in self.pairs if p.tradeable]
+        set_syms = getattr(self.risk, "set_pair_symbols", None)
+        if callable(set_syms):  # the price-move guard reads books under each venue's own symbol (KBONK / 1000BONK)
+            set_syms({p.symbol: {self.maker.name: p.maker_symbol, self.taker.name: p.taker_symbol}
+                      for p in self.pairs})
 
         self._trading = self.maker.has_credentials and self.taker.has_credentials
         if not self._trading:
@@ -516,6 +521,9 @@ class Engine:
         forced-close afterwards. ``taker``: stop quoting and IOC both legs (reduce-only) until flat. ``close_only``
         pairs (no trader) are flattened with reduce-only IOCs in both modes.
 
+        Closes run one at a time (the risk reducer and an operator close-all would otherwise end each other's
+        reduce-only mode or restart stopped traders); a later call waits, then gets its full ``timeout_s``.
+
         Returns {symbol: {"maker_pos", "taker_pos", "flat"}}.
         """
         if mode not in ("maker", "taker"):
@@ -525,6 +533,17 @@ class Engine:
         await self.start()
         if not self._trading:
             raise RuntimeError("cannot close without credentials on both venues")
+        if self._close_lock.locked():
+            log.warning("close_all(%s) waits for the close-all already running", mode)
+        async with self._close_lock:
+            return await self._close_all(mode, timeout_s)
+
+    async def _close_all(self, mode: str, timeout_s: float) -> dict:
+        if mode == "maker" and self.risk is not None and getattr(self.risk, "halted", False):
+            # halted traders never quote: a maker close would only wait out its timeout
+            log.warning("close_all(maker) while risk is halted (%s): closing in taker (IOC) mode instead",
+                        getattr(self.risk, "halt_reason", None))
+            mode = "taker"
         for sym, h in self.hedgers.items():  # hedgers must run (they may be stopped after shutdown began)
             task = self._tasks.get(f"hedger:{sym}")
             if task is None or task.done():
@@ -559,6 +578,7 @@ class Engine:
                   for s, h in self.hedgers.items()}
         self._reset_flat_risk([s for s, r in result.items() if r["flat"]])
         not_flat = [s for s, r in result.items() if not r["flat"]]
+        self._report_open_exposure(not_flat)
         msg = (f"close_all({mode}) done" if not not_flat else
                f"close_all({mode}) TIMED OUT, not flat: " + ", ".join(
                    f"{s} maker={fmt(result[s]['maker_pos'])} taker={fmt(result[s]['taker_pos'])}" for s in not_flat))
@@ -581,6 +601,22 @@ class Engine:
                 reset(symbols)
         except Exception:
             log.exception("risk reset for flat pairs failed")
+
+    def _report_open_exposure(self, symbols: list[str]) -> None:
+        """Pairs a close-all left open: report their exposure from the hedger positions (stopped traders report
+        nothing; close-only pairs never do), so the risk manager keeps reducing them after a halt."""
+        if not symbols or self.risk is None:
+            return
+        try:
+            for s in symbols:
+                h = self.hedgers[s]
+                px = h.ref_price()
+                if px is None or px <= 0:
+                    continue
+                self.risk.update_exposure(s, self.maker.name, abs(h.maker_pos) * px)
+                self.risk.update_exposure(s, self.taker.name, abs(h.taker_pos) * px)
+        except Exception:
+            log.exception("risk exposure report for open pairs failed")
 
     @staticmethod
     async def _flatten_pending(hedgers: list[Hedger]) -> None:

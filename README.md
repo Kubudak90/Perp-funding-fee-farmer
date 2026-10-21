@@ -165,12 +165,17 @@ fiyatı Lighter'ın **~9–14 bps altındadır**.
    - Teminatı düzenli olarak dengeleyin. Bot borsalar arasında para transferi yapmaz. İki borsadaki özsermaye
      `max_equity_divergence_frac` (%30) oranından fazla ayrışırsa uyarı (log + Telegram) gelir.
    - **Fiyat hareketiyle otomatik kapatma (`auto_close_move_frac`, varsayılan %19).** Bot bir marketi ilk açtığında
-     o anki fiyatı referans olarak kaydeder (veritabanında; yeniden başlatmada kaybolmaz, normal aç-kapa döngüleri
-     sıfırlamaz). Fiyat referanstan hangi yönde olursa olsun %19 uzaklaşırsa bot durur (halt) ve tüm çiftlerin iki
-     bacağını reduce-only taker emirlerle kapatır; Telegram'a haber verir. Eşiğin %75'inde (~%14) önceden uyarı
-     gelir. Kapanış bitip pozisyonlar sıfırlanınca referans silinir. Teminatı dengeleyip botu yeniden
-     başlattığınızda yeni pozisyon yeni referansla açılır. Dashboard'daki market tablosunda "Fiyat hareketi"
-     sütunu bunu gösterir. `0` = kapalı.
+     iki borsadaki o anki fiyatı referans olarak kaydeder (veritabanında: pozisyon açıkken yeniden başlatmada
+     korunur, normal aç-kapa döngüleri sıfırlamaz; bot o markette pozisyonsuz başlarsa referans silinir). Hareket
+     her borsada kendi referansına göre ölçülür ve büyük olanı sayılır; donmuş/eski bir defter hesaba katılmaz.
+     Fiyat referanstan hangi yönde olursa olsun %19 uzaklaşırsa bot durur (halt) ve tüm çiftlerin iki bacağını
+     reduce-only taker emirlerle kapatır; Telegram'a haber verir. Kapanış hepsini kapatamazsa, açık pozisyon
+     kaldıkça (fiyat geri dönse bile) her dakika yeniden dener. Eşiğin %75'inde (~%14) önceden uyarı gelir.
+     Kapanış bitip pozisyonlar sıfırlanınca referans silinir. Durmuş bot yeni pozisyon açmaz; teminatı dengeleyip
+     botu durdurup yeniden başlattığınızda yeni pozisyon yeni referansla açılır. Bot durmuşken dashboard'dan
+     "maker" close-all seçilse de kapanış IOC (taker) ile yapılır. `farmer close-all` bu kontrolü çalıştırmaz
+     (zaten kapatıyordur). Dashboard'daki market tablosunda "Fiyat hareketi" sütunu bunu gösterir. Değer bir
+     orandır: `0.19` = %19 (`19` yazılırsa ayar reddedilir). `0` = kapalı.
 6. **USDT/USD bazı (kripto).** Lighter'ın kripto endeksi USDT bazlıdır. USDT'nin USD'den sapması iki bacak arasında PnL
    farkı yaratır.
 7. **RWA (hisse/ETF) piyasaları.**

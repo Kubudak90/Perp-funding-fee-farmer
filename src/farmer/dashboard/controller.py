@@ -240,14 +240,17 @@ class BotController:
             log.warning("dashboard: close_all(%s) on the running bot", mode)
 
             async def on_engine() -> tuple[bool, str]:
-                res = await engine.close_all(mode, timeout_s=timeout)
+                # a halted bot (e.g. after the price-move auto close) never quotes: a maker close switches to IOCs
+                buf = io.StringIO()
+                used, res = await cli._close_with_fallback(engine, engine.risk, mode, timeout, buf)
                 lines = [f"{s}: maker {r['maker_pos']} taker {r['taker_pos']} {'FLAT' if r['flat'] else 'NOT FLAT'}"
                          for s, r in res.items()]
                 ok = all(r["flat"] for r in res.values())
                 tail = ("Pozisyonlar kapatıldı. Bot çalışmaya devam ediyor ama yeni pozisyon açmaz (force close); "
-                        "yeniden işlem için durdurup başlatın." if mode == "maker" else
+                        "yeniden işlem için durdurup başlatın." if used == "maker" else
                         "Pozisyonlar IOC ile kapatıldı. Bot çalışıyor; kotasyon için durdurup yeniden başlatın.")
-                return ok, "\n".join([*lines, tail if ok else "Zaman aşımı: hepsi kapanmadı."])
+                head = [buf.getvalue().strip()] if buf.getvalue().strip() else []
+                return ok, "\n".join([*head, *lines, tail if ok else "Zaman aşımı: hepsi kapanmadı."])
 
             self._start_job(f"close-all ({mode})", on_engine())
             return

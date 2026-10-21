@@ -397,6 +397,69 @@ async def test_close_all_maker_switches_to_taker_when_risk_halts(monkeypatch, tm
     assert venues["arcus"].positions.get("BTC", D(0)) == 0 and venues["lighter"].positions.get("BTC", D(0)) == 0
 
 
+
+async def test_close_all_maker_is_not_halted_by_a_stored_price_move_reference(monkeypatch, tmp_path):
+    """The standalone close-all is the reduction itself: a stored reference far from the price (left by `run`) must
+    neither halt it ("HALT ... closing every pair" with no reducer installed) nor switch the maker close to IOCs; the
+    reference of the pair it leaves flat is dropped."""
+    import asyncio
+
+    from farmer.risk.manager import MOVE_REFS_META
+
+    creds_env(monkeypatch)
+    cfg = cli._load(cli.build_parser().parse_args(["close-all"]))
+    cfg = cfg.model_copy(update={"data_dir": tmp_path, "strategy": fast_strategy(markets=[MarketConfig(symbol="BTC")]),
+                                 "risk": fast_risk(check_interval_s=0.02)})
+    store = Store(cli.store_path(cfg, False))
+    store.set_meta(MOVE_REFS_META, '{"BTC": {"price": "50000", "ts": 1}}')  # +100 % since
+    store.close()
+    venues = fake_venues()
+    venues["arcus"].positions["BTC"] = D("0.01")
+    venues["lighter"].positions["BTC"] = D("-0.01")
+    monkeypatch.setattr(cli, "build_venues", lambda *a, **k: venues)
+    made = []
+    real = cli.make_risk
+    monkeypatch.setattr(cli, "make_risk", lambda *a, **k: made.append(real(*a, **k)) or made[-1])
+
+    async def fill_the_closing_quotes() -> None:
+        await asyncio.sleep(0.5)  # several risk passes with the trader's exposure reported
+        while venues["arcus"].positions.get("BTC"):
+            for o in venues["arcus"].resting("BTC"):
+                venues["arcus"].fill_resting(o.client_id)
+            await asyncio.sleep(0.02)
+
+    filler = asyncio.create_task(fill_the_closing_quotes())
+    out = io.StringIO()
+    try:
+        rc = await cli.close_all(cfg, taker=False, timeout_s=20, out=out)
+    finally:
+        filler.cancel()
+    text = out.getvalue()
+    assert rc == cli.EXIT_OK and "close-all (maker) result" in text and "IOC" not in text, text
+    assert not made[0].halted
+    assert venues["arcus"].positions.get("BTC", D(0)) == 0 and venues["lighter"].positions.get("BTC", D(0)) == 0
+    store = Store(cli.store_path(cfg, False))
+    assert "BTC" not in (store.get_meta(MOVE_REFS_META) or "")
+    store.close()
+
+
+async def test_close_with_fallback_starts_in_taker_mode_when_halted():
+    class Eng:
+        modes: list = []
+
+        async def close_all(self, mode, timeout_s):
+            self.modes.append(mode)
+            return {}
+
+    class Risk:
+        halted, halt_reason = True, "price moved"
+
+    out = io.StringIO()
+    eng = Eng()
+    assert await cli._close_with_fallback(eng, Risk(), "maker", 5, out) == ("taker", {})
+    assert eng.modes == ["taker"] and "price moved" in out.getvalue()
+
+
 def test_make_risk_uses_pair_leverage():
     cfg = AppConfig(strategy=fast_strategy(markets=[MarketConfig(symbol="btc", leverage=3), MarketConfig(symbol="ETH")],
                                            leverage=4))

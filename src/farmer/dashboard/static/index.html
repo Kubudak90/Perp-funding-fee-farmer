@@ -507,7 +507,9 @@ td.wrap { white-space: normal; min-width: 180px; color: var(--ink-2); }
     const mv = pm ? num(pm.move) : null;
     if (mv === null) return h("td", { class: "num muted" }, "–");
     const near = lim > 0 && Math.abs(mv) >= 0.75 * lim;
-    const txt = (mv >= 0 ? "+" : "") + nf(1).format(mv * 100) + "%" + (lim > 0 ? " / ±" + nf(0).format(lim * 100) + "%" : "");
+    const pct = Math.round(mv * 1000) / 10 || 0;  // one decimal; a tiny negative move reads 0,0 (not -0,0)
+    const limTxt = lim > 0 ? " / ±" + nf(lim < 0.01 ? 2 : 0).format(lim * 100) + "%" : "";
+    const txt = (pct > 0 ? "+" : "") + nf(1).format(pct) + "%" + limTxt;
     return h("td", { class: "num" + (near ? " neg" : ""), title: "referans " + pm.ref }, txt);
   }
 

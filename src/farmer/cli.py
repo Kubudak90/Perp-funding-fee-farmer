@@ -630,14 +630,18 @@ async def status(cfg: AppConfig, out=None) -> int:
 
 # =========================================================================== close-all
 async def _close_with_fallback(engine: Any, risk: Any, mode: str, timeout_s: float, out: Any) -> tuple[str, dict]:
-    """``engine.close_all(mode)``; a maker close whose risk manager halts (circuit breaker, margin) can never quote
-    again, so it switches to taker (IOC) mode for the remaining time instead of waiting out the timeout."""
+    """``engine.close_all(mode)``; a maker close whose risk manager halts (circuit breaker, margin, price move) can
+    never quote again, so it switches to taker (IOC) mode for the remaining time instead of waiting out the timeout
+    (and starts in taker mode when the risk manager is halted already)."""
     deadline = time.monotonic() + max(0.0, timeout_s)
+    if mode == "maker" and getattr(risk, "halted", False):
+        print(f"risk is halted ({risk.halt_reason}); closing in taker (IOC) mode", file=out)
+        mode = "taker"
     task = asyncio.ensure_future(engine.close_all(mode, timeout_s=timeout_s))
     try:
         while mode == "maker" and not task.done():
             await asyncio.wait({task}, timeout=0.25)
-            if task.done() or not risk.halted:
+            if task.done() or not getattr(risk, "halted", False):
                 continue
             print(f"risk halted during the maker close ({risk.halt_reason}); switching to taker (IOC) mode", file=out)
             task.cancel()
@@ -694,8 +698,11 @@ async def close_all(cfg: AppConfig, *, taker: bool, timeout_s: float, out=None, 
     cfg = cfg.model_copy(update={
         "mode": "live",
         "strategy": cfg.strategy.model_copy(update={"set_leverage_on_start": False}),
-        # today's loss must not re-halt the closing engine (a halted maker close never quotes)
-        "risk": cfg.risk.model_copy(update={"close_on_exit": False, "max_daily_loss": Decimal(0)}),
+        # today's loss / a stored price-move reference must not re-halt the closing engine (a halted maker close
+        # never quotes, and close-all is the reduction: the guard has no reducer here); references of the pairs it
+        # leaves flat are still dropped, the others stay for the next `farmer run`
+        "risk": cfg.risk.model_copy(update={"close_on_exit": False, "max_daily_loss": Decimal(0),
+                                            "auto_close_move_frac": Decimal(0)}),
     })
     lock = RunLock(store_path(cfg, False).with_suffix(".lock"))
     if not lock.acquire():
