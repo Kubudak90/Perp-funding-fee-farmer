@@ -38,6 +38,7 @@ FIELDS: tuple[tuple[str, str, str, str], ...] = (
     ("risk", "max_daily_loss", "decimal", "Günlük zarar limiti (USD, 0 = kapalı)"),
     ("risk", "max_margin_ratio", "decimal", "Yeni pozisyon açmama marj oranı"),
     ("risk", "reduce_margin_ratio", "decimal", "Durup her şeyi kapatma marj oranı"),
+    ("risk", "auto_close_move_frac", "decimal", "Fiyat bu kadar hareket ederse her şeyi kapat (0.19 = %19, 0 = kapalı)"),
     ("risk", "min_free_collateral_mult", "decimal", "Serbest teminat çarpanı"),
     ("risk", "max_consecutive_errors", "int", "Devre kesici: art arda hata sayısı"),
     ("risk", "error_halt_cooldown_s", "float", "Devre kesici otomatik devam süresi (sn, 0 = kapalı)"),

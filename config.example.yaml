@@ -213,6 +213,11 @@ risk:
   reduce_margin_ratio: 0.4         # bunu aşarsa bot durur (halt) ve tüm çiftleri reduce-only taker emirle kapatır
   min_free_collateral_mult: 1.5    # yeni pozisyon için serbest teminat >= clip / kaldıraç x bu (her iki borsada)
   max_equity_divergence_frac: 0.3  # iki borsadaki özsermaye bu oranda ayrışırsa uyarı (teminatı dengeleyin; 0 = kapalı)
+  auto_close_move_frac: 0.19       # fiyat, botun o marketi ilk açtığı referans fiyattan bu oranda (iki yönde de)
+                                   #   uzaklaşırsa bot durur ve tüm çiftleri reduce-only taker emirle kapatır
+                                   #   (0.19 = %19, 0 = kapalı). Delta-nötrde her harekette bir bacak zarar eder ve
+                                   #   o borsanın teminatı erir; varsayılan $200/3x ayarlarında ~%19'da yeni emirler
+                                   #   zaten durur. Eşiğin %75'inde uyarı gelir. Boyut/kaldıraç değişirse yeniden düşünün.
   max_daily_loss: 15               # USD (gerçekleşen + ücret + funding); aşılırsa bot durur (0 = kapalı). Normal
                                    #   çalışmada tetikleniyorsa limiti değil min_edge_bps'i yükseltin.
   max_consecutive_errors: 20       # bir borsada art arda bu kadar kalıcı hata olursa devre kesici bot'u durdurur (halt)

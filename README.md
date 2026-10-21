@@ -164,6 +164,13 @@ fiyatı Lighter'ın **~9–14 bps altındadır**.
      için botu yeniden başlatın.
    - Teminatı düzenli olarak dengeleyin. Bot borsalar arasında para transferi yapmaz. İki borsadaki özsermaye
      `max_equity_divergence_frac` (%30) oranından fazla ayrışırsa uyarı (log + Telegram) gelir.
+   - **Fiyat hareketiyle otomatik kapatma (`auto_close_move_frac`, varsayılan %19).** Bot bir marketi ilk açtığında
+     o anki fiyatı referans olarak kaydeder (veritabanında; yeniden başlatmada kaybolmaz, normal aç-kapa döngüleri
+     sıfırlamaz). Fiyat referanstan hangi yönde olursa olsun %19 uzaklaşırsa bot durur (halt) ve tüm çiftlerin iki
+     bacağını reduce-only taker emirlerle kapatır; Telegram'a haber verir. Eşiğin %75'inde (~%14) önceden uyarı
+     gelir. Kapanış bitip pozisyonlar sıfırlanınca referans silinir. Teminatı dengeleyip botu yeniden
+     başlattığınızda yeni pozisyon yeni referansla açılır. Dashboard'daki market tablosunda "Fiyat hareketi"
+     sütunu bunu gösterir. `0` = kapalı.
 6. **USDT/USD bazı (kripto).** Lighter'ın kripto endeksi USDT bazlıdır. USDT'nin USD'den sapması iki bacak arasında PnL
    farkı yaratır.
 7. **RWA (hisse/ETF) piyasaları.**
@@ -371,7 +378,8 @@ istikrarlı funding), ama Arcus bakım marjı %6,7 ve likidasyon ücreti %1'dir.
   | Fiyat hareketi | Ne olur |
   |---|---|
   | ~%12 | İki borsanın özsermayesi %30'dan fazla ayrışır: uyarı gelir, teminatı dengeleyin. |
-  | ~%19 (kısa bacak) / ~%37 (uzun bacak) | Serbest teminat yetmez: yeni clip açılmaz. |
+  | ~%14 | `auto_close_move_frac` uyarısı (eşiğin %75'i). |
+  | **%19** | **`auto_close_move_frac`: bot durur ve tüm çiftleri reduce-only taker emirle kapatır** (aynı noktada kısa bacakta serbest teminat da yeni clip'e yetmez hale gelir). |
   | ~%55 (Arcus kısa) / ~%65 (Lighter uzun) | `reduce_margin_ratio`: bot durur ve iki bacağı reduce-only taker emirle kapatır. |
   | ~%62 / ~%66 | Likidasyon. |
 
@@ -430,6 +438,7 @@ Tüm alanlar Türkçe açıklamalarıyla `config.example.yaml` içindedir. En ö
 | `risk.max_margin_ratio` / `reduce_margin_ratio` | 0.25 / 0.4 | Bakım marjı / özsermaye. Sırasıyla yeni pozisyon açmayı durdurur / botu durdurup tüm pozisyonları taker ile kapatır. |
 | `risk.min_free_collateral_mult` | 1.5 | Yeni pozisyon için her borsada serbest teminat >= clip / kaldıraç × bu değer. |
 | `risk.max_equity_divergence_frac` | 0.3 | İki borsanın özsermayesi bu oranda ayrışırsa uyarı (teminatı dengeleyin). |
+| `risk.auto_close_move_frac` | 0.19 | Fiyat, botun marketi ilk açtığı referans fiyattan bu oranda (iki yönde de) uzaklaşırsa bot durur ve her şeyi taker ile kapatır (0 = kapalı). |
 | `risk.close_on_exit` | false | `true`: kapanışta iki bacak da taker ile kapatılır. |
 | `paper.initial_balance` | 200 | Paper modunda borsa başına başlangıç bakiyesi. |
 | `arcus.dead_mans_switch_s` | 60 | Bot ölürse Arcus emirleri bu kadar saniye sonra iptal edilir. |

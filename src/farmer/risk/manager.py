@@ -15,12 +15,20 @@ Margin: ``check_open`` refuses new exposure when a venue's maintenance/equity ra
 and runs the ``reducer`` the engine owner installed (``set_reducer``: reduce-only taker flatten of every
 pair), retrying while the ratio stays high. Diverging venue equities are reported so the operator can
 rebalance collateral (the bot never moves funds between venues).
+
+Price move: a hedged pair still drains the losing venue's collateral when the price trends (one leg loses
+on every move, in either direction). When a market with exposure first gets a mark, its reference price is
+stored (``Store`` meta, so it survives restarts; normal churn cycles do not reset it). Once the mark is
+``auto_close_move_frac`` away from the reference the manager halts (``HALT_MOVE``) and runs the reducer like a
+margin reduction; it warns once at ``MOVE_WARN_AT`` of the threshold. The engine resets a market's reference
+when a close-all leaves it flat and when it starts with no position in it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -31,6 +39,7 @@ from farmer.config import RiskConfig
 from farmer.exchanges.base import Exchange
 from farmer.models import BPS, ZERO, Balance, OrderBook
 from farmer.monitoring.stats import IncrementalSummary, net_base, pnl_from_summary
+from farmer.utils.decimals import fmt
 
 if TYPE_CHECKING:  # pragma: no cover
     from farmer.monitoring.notifier import Notifier
@@ -46,7 +55,12 @@ MAX_ERROR_COOLDOWN_S = 4 * 3600.0  # cap of the doubling circuit-breaker cooldow
 HALT_ERROR = "error"
 HALT_LOSS = "daily_loss"
 HALT_MARGIN = "margin"
+HALT_MOVE = "price_move"
 HALT_MANUAL = "manual"
+
+MOVE_REFS_META = "risk.move_refs"  # Store meta key: {symbol: {"price": str, "ts": float}}
+MOVE_WARN_AT = Decimal("0.75")  # warn once at this fraction of auto_close_move_frac ...
+MOVE_WARN_RESET = Decimal("0.6")  # ... and re-arm the warning below this fraction
 
 
 def utc_midnight(ts: float) -> float:
@@ -112,6 +126,9 @@ class RiskManager:
         self.reduce_retry_s = REDUCE_RETRY_S
         self._equity_diverged = False
         self._no_reducer_warned = False
+        self._move_refs: dict[str, tuple[Decimal, float]] = self._load_move_refs()  # symbol -> (price, ts)
+        self._moves: dict[str, Decimal] = {}  # symbol -> latest mark / ref - 1
+        self._move_warned: set[str] = set()
 
     # ================================================================== state
     @property
@@ -147,6 +164,10 @@ class RiskManager:
                 self.check_margin()
             except Exception:
                 log.exception("margin check failed")
+            try:
+                self.check_price_move()
+            except Exception:
+                log.exception("price move check failed")
             try:
                 await self.check_daily_loss_async()
             except asyncio.CancelledError:
@@ -241,26 +262,29 @@ class RiskManager:
                          if b.margin_ratio >= self.cfg.reduce_margin_ratio)
         self.halt(f"margin ratio >= reduce_margin_ratio {self.cfg.reduce_margin_ratio} ({high}): reducing positions",
                   kind=HALT_MARGIN)
+        self._start_reducer(f"margin ratio {high} >= {self.cfg.reduce_margin_ratio}", "margin_reduce",
+                            {"venues": high})
+        return True
+
+    def _start_reducer(self, why: str, event: str, data: dict) -> None:
+        """Run the reducer unless it runs already or ended less than ``reduce_retry_s`` ago."""
         if self._reducer is None:
             if not self._no_reducer_warned:
                 self._no_reducer_warned = True
-                log.critical("margin ratio %s >= %s and no reducer installed: positions are NOT being reduced",
-                             high, self.cfg.reduce_margin_ratio)
-            return True
+                log.critical("%s and no reducer installed: positions are NOT being reduced", why)
+            return
         if self._reduce_task is not None and not self._reduce_task.done():
-            return True
+            return
         if time.monotonic() - self._reduce_end < self.reduce_retry_s:
-            return True
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover - only ever called from run()
-            log.critical("margin ratio %s too high but no running event loop to reduce from", high)
-            return True
-        log.critical("margin ratio %s >= %s: flattening with reduce-only taker orders", high,
-                     self.cfg.reduce_margin_ratio)
-        self._record("margin_reduce", {"venues": high})
+            log.critical("%s but no running event loop to reduce from", why)
+            return
+        log.critical("%s: flattening with reduce-only taker orders", why)
+        self._record(event, data)
         self._reduce_task = loop.create_task(self._run_reducer(), name="risk:reduce")
-        return True
 
     async def _run_reducer(self) -> None:
         assert self._reducer is not None
@@ -272,6 +296,96 @@ class RiskManager:
             log.exception("margin reduction failed")
         finally:
             self._reduce_end = time.monotonic()
+
+    # ================================================================== price move auto close
+    def _load_move_refs(self) -> dict[str, tuple[Decimal, float]]:
+        get = getattr(self.store, "get_meta", None)
+        if not callable(get):
+            return {}
+        try:
+            raw = json.loads(get(MOVE_REFS_META) or "{}")
+            return {str(s): (Decimal(str(v["price"])), float(v.get("ts") or 0)) for s, v in raw.items()
+                    if Decimal(str(v["price"])) > 0}
+        except Exception:
+            log.exception("cannot read stored price-move references; starting without")
+            return {}
+
+    def _save_move_refs(self) -> None:
+        put = getattr(self.store, "set_meta", None)
+        if not callable(put):
+            return
+        try:
+            put(MOVE_REFS_META, json.dumps({s: {"price": str(p), "ts": t} for s, (p, t) in self._move_refs.items()}))
+        except Exception:
+            log.exception("cannot store price-move references")
+
+    def move_reference(self, symbol: str) -> Decimal | None:
+        ref = self._move_refs.get(symbol)
+        return ref[0] if ref else None
+
+    def reset_move_refs(self, symbols: list[str] | None = None) -> None:
+        """Forget the reference price of ``symbols`` (all when None): the next exposure takes a fresh one.
+        The engine calls this when a close-all leaves a pair flat and at startup for pairs without positions."""
+        syms = list(self._move_refs) if symbols is None else [s for s in symbols if s in self._move_refs]
+        if not syms:
+            return
+        for s in syms:
+            self._move_refs.pop(s, None)
+            self._moves.pop(s, None)
+            self._move_warned.discard(s)
+        log.info("price-move reference reset for %s", ", ".join(sorted(syms)))
+        self._save_move_refs()
+
+    def check_price_move(self) -> bool:
+        """Halt + flatten everything once an exposed market moved ``auto_close_move_frac`` (either direction)
+        from its reference price. Takes a reference for exposed markets that have none, warns once at
+        ``MOVE_WARN_AT`` of the threshold. Returns True when it (re)started or keeps the auto close-all."""
+        frac = abs(Decimal(str(self.cfg.auto_close_move_frac or 0)))
+        if frac <= 0:
+            return False
+        exposed = {sym for per in self._exposure.values() for sym, n in per.items() if n > 0}
+        if not exposed:
+            return False
+        marks = self._marks(exposed)
+        added: list[str] = []
+        hit: list[tuple[str, Decimal, Decimal, Decimal]] = []
+        for sym in sorted(exposed):
+            mark = marks.get(sym)
+            if mark is None or mark <= 0:
+                continue
+            ref = self._move_refs.get(sym)
+            if ref is None:
+                self._move_refs[sym] = (mark, self._clock())
+                self._moves[sym] = ZERO
+                added.append(sym)
+                log.info("%s price-move reference %s: auto close-all at %s / %s (±%s%%)", sym, fmt(mark),
+                         fmt(mark * (1 - frac), 6), fmt(mark * (1 + frac), 6), fmt(frac * 100, 2))
+                continue
+            move = mark / ref[0] - 1
+            self._moves[sym] = move
+            if abs(move) >= frac:
+                hit.append((sym, ref[0], mark, move))
+            elif abs(move) >= frac * MOVE_WARN_AT:
+                if sym not in self._move_warned:
+                    self._move_warned.add(sym)
+                    msg = (f"{sym} moved {move * 100:+.1f}% from its reference {fmt(ref[0])} (now {fmt(mark)}); "
+                           f"the bot closes everything at ±{fmt(frac * 100, 2)}% - consider rebalancing collateral")
+                    log.warning(msg)
+                    self._record("price_move_warning", {"symbol": sym, "ref": ref[0], "mark": mark, "move": move})
+                    self._notify(f"WARNING: {msg}")
+            elif abs(move) < frac * MOVE_WARN_RESET:
+                self._move_warned.discard(sym)
+        if added:
+            self._save_move_refs()
+        if not hit:
+            return False
+        desc = "; ".join(f"{s} {m * 100:+.1f}% ({fmt(r)} -> {fmt(mk)})" for s, r, mk, m in hit)
+        eq = ", ".join(f"{v} equity {b.equity:.2f}" for v, b in self._balances.items())
+        self.halt(f"price moved >= ±{fmt(frac * 100, 2)}% from the reference: {desc}"
+                  + (f" [{eq}]" if eq else "") + ": closing every pair", kind=HALT_MOVE)
+        self._start_reducer(f"price move {desc}", "auto_close_move",
+                            {"moves": {s: {"ref": r, "mark": mk, "move": m} for s, r, mk, m in hit}})
+        return True
 
     # ================================================================== daily loss
     def _venue_marks(self, symbols: set[str]) -> dict[tuple[str, str], Decimal]:
@@ -571,6 +685,9 @@ class RiskManager:
             "max_daily_loss": self.cfg.max_daily_loss,
             "max_margin_ratio": self.cfg.max_margin_ratio,
             "reduce_margin_ratio": self.cfg.reduce_margin_ratio,
+            "auto_close_move_frac": self.cfg.auto_close_move_frac,
+            "price_moves": {s: {"ref": p, "ref_ts": t, "move": self._moves.get(s)}
+                            for s, (p, t) in self._move_refs.items()},
             "errors": dict(self._errors),
             "last_errors": dict(self._last_error),
             "exposure": {v: {"total": sum(d.values(), ZERO), "by_symbol": dict(d)} for v, d in self._exposure.items()},
@@ -589,4 +706,4 @@ class RiskManager:
         }
 
 
-__all__ = ["HALT_ERROR", "HALT_LOSS", "HALT_MANUAL", "HALT_MARGIN", "RiskManager", "utc_midnight"]
+__all__ = ["HALT_ERROR", "HALT_LOSS", "HALT_MANUAL", "HALT_MARGIN", "HALT_MOVE", "RiskManager", "utc_midnight"]

@@ -90,6 +90,11 @@ construction, minus hedge slippage from the taker latency).
   manager's reducer (`Engine.close_all("taker")`: reduce-only IOCs on both legs of every pair, independent of
   halt / edge / book gates), retried while the ratio stays high. Diverging venue equities
   (`max_equity_divergence_frac`) are reported: the bot never moves collateral between venues.
+- Price move: the first time a pair has exposure the risk manager stores its mark as the reference (Store meta
+  `risk.move_refs`; survives restarts, churn cycles do not reset it). At `auto_close_move_frac` from the reference
+  (either direction: one leg always loses) -> `HALT_MOVE` + the same reducer; warning at 75 % of the threshold.
+  `Engine.close_all` drops the reference (and zeroes reported exposure) of pairs it leaves flat; a pair that
+  starts with no position starts without a reference.
 - Unhedged delta persisting beyond `unhedged_timeout_s` -> cancel quotes, aggressive hedge with
   2x slippage; beyond 3x timeout -> emergency flatten of the maker leg with a taker order, then no quoting
   for `emergency_cooldown_s`; `max_emergencies_per_hour` emergencies -> halt.

@@ -503,12 +503,22 @@ td.wrap { white-space: normal; min-width: 180px; color: var(--ink-2); }
     $("balTable").replaceChildren(h("thead", {}, head), h("tbody", {}, ...rows, errRow));
   }
 
+  function moveCell(pm, lim) {
+    const mv = pm ? num(pm.move) : null;
+    if (mv === null) return h("td", { class: "num muted" }, "–");
+    const near = lim > 0 && Math.abs(mv) >= 0.75 * lim;
+    const txt = (mv >= 0 ? "+" : "") + nf(1).format(mv * 100) + "%" + (lim > 0 ? " / ±" + nf(0).format(lim * 100) + "%" : "");
+    return h("td", { class: "num" + (near ? " neg" : ""), title: "referans " + pm.ref }, txt);
+  }
+
   function renderMarkets(eng) {
     const mk = eng && eng.markets ? Object.entries(eng.markets) : [];
     $("mktEmpty").classList.toggle("hidden", mk.length > 0);
     if (!mk.length) { $("mktTable").replaceChildren(); return; }
     const head = h("tr", {}, ...["Çift", "Faz", "Yön", "Maker poz.", "Taker poz.", "Delta", "Kotasyon",
-      "Carry APR", "Baz", "Durum"].map((x, i) => h("th", { class: i >= 3 && i <= 5 || i === 7 || i === 8 ? "num" : "" }, x)));
+      "Carry APR", "Baz", "Fiyat hareketi", "Durum"].map((x, i) => h("th", { class: i >= 3 && i <= 5 || i >= 7 && i <= 9 ? "num" : "" }, x)));
+    // price move from the reference taken when the bot first opened the market; at ±auto_close_move_frac it closes all
+    const risk = eng.risk || {}, moves = risk.price_moves || {}, lim = num(risk.auto_close_move_frac) || 0;
     const rows = mk.map(([sym, m]) => {
       const hd = m.hedger || {};
       const q = m.quote;
@@ -531,7 +541,8 @@ td.wrap { white-space: normal; min-width: 180px; color: var(--ink-2); }
         h("td", { class: "num" }, fmtQty(m.taker_pos !== undefined ? m.taker_pos : hd.taker_pos)),
         h("td", { class: "num " + (exposed ? "neg" : "") }, fmtQty(delta)),
         h("td", {}, q ? `${q.side === "BUY" ? "ALIŞ" : "SATIŞ"} ${fmtQty(q.remaining)} @ ${fmtQty(q.price)}` : "–"),
-        h("td", { class: "num" }, apr), h("td", { class: "num" }, basis), h("td", { class: "wrap" }, status));
+        h("td", { class: "num" }, apr), h("td", { class: "num" }, basis), moveCell(moves[sym], lim),
+        h("td", { class: "wrap" }, status));
     });
     $("mktTable").replaceChildren(h("thead", {}, head), h("tbody", {}, ...rows));
   }
@@ -539,7 +550,8 @@ td.wrap { white-space: normal; min-width: 180px; color: var(--ink-2); }
   const EVENT_NAMES = { phase: "Faz", direction: "Yön", halt: "HALT", resume: "Devam", close_all: "Close-all",
     pairs: "Çiftler", shutdown: "Kapanış", hedge_escalated: "Hedge gecikmesi", emergency_flatten: "Acil kapatma",
     emergency_unresolved: "Acil durum", position_adopted: "Pozisyon düzeltildi", unmanaged_positions: "Yönetilmeyen poz.",
-    margin_reduce: "Marj azaltma", equity_divergence: "Özsermaye farkı" };
+    margin_reduce: "Marj azaltma", equity_divergence: "Özsermaye farkı", auto_close_move: "Fiyat hareketi: kapat",
+    price_move_warning: "Fiyat hareketi uyarısı" };
   function eventText(kind, d) {
     if (!d || typeof d !== "object") return "";
     if (kind === "phase") return `${d.symbol} ${PHASES[d.from] || d.from} → ${PHASES[d.to] || d.to} (${d.reason})`;

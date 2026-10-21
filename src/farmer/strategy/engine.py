@@ -120,6 +120,9 @@ class Engine:
             await self._cancel_stale_orders()
         m_pos, t_pos = await self._read_positions()
         self._warn_unmanaged(m_pos, t_pos)
+        if self._trading:  # a pair that starts without positions starts a fresh price-move reference
+            self._reset_flat_risk([p.symbol for p in self.pairs
+                                   if not m_pos.get(p.maker_symbol) and not t_pos.get(p.taker_symbol)])
 
         for p in self.pairs:
             h = Hedger(p, self.maker, self.taker, scfg, self.cfg.risk, self.risk, self.store, notifier=self.notifier)
@@ -554,6 +557,7 @@ class Engine:
                     h.close_mode = False
         result = {s: {"maker_pos": h.maker_pos, "taker_pos": h.taker_pos, "flat": self._is_flat(h, mode)}
                   for s, h in self.hedgers.items()}
+        self._reset_flat_risk([s for s, r in result.items() if r["flat"]])
         not_flat = [s for s, r in result.items() if not r["flat"]]
         msg = (f"close_all({mode}) done" if not not_flat else
                f"close_all({mode}) TIMED OUT, not flat: " + ", ".join(
@@ -562,6 +566,21 @@ class Engine:
         self._notify(msg)
         self._record("close_all", {"mode": mode, "result": result})
         return result
+
+    def _reset_flat_risk(self, symbols: list[str]) -> None:
+        """Flat pairs: zero their reported exposure (taker-mode traders are stopped and report nothing) and drop
+        their price-move reference so the next position takes a fresh one."""
+        if not symbols or self.risk is None:
+            return
+        try:
+            for s in symbols:
+                self.risk.update_exposure(s, self.maker.name, ZERO)
+                self.risk.update_exposure(s, self.taker.name, ZERO)
+            reset = getattr(self.risk, "reset_move_refs", None)
+            if callable(reset):
+                reset(symbols)
+        except Exception:
+            log.exception("risk reset for flat pairs failed")
 
     @staticmethod
     async def _flatten_pending(hedgers: list[Hedger]) -> None:

@@ -243,6 +243,9 @@ class RiskConfig(_Base):
     reduce_margin_ratio: Decimal = Decimal("0.4")  # halt + flatten every pair with reduce-only taker orders
     min_free_collateral_mult: Decimal = Decimal("1.5")  # opening needs free collateral >= clip/leverage x this
     max_equity_divergence_frac: Decimal = Decimal("0.3")  # warn when venue equities differ by more (0 = off)
+    # halt + flatten every pair (reduce-only taker) once a market's price is this far (either direction) from the
+    # reference taken when the bot first opened it; a trend drains one venue's collateral (0 = off)
+    auto_close_move_frac: Decimal = Decimal("0.19")
     max_daily_loss: Decimal = Decimal("15")  # USD realized+fees+funding; stop the bot if breached (0 = off)
     max_consecutive_errors: int = 20
     # a circuit-breaker halt (max_consecutive_errors) clears itself after this long without any venue error; the
