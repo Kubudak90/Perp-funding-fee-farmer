@@ -24,6 +24,7 @@ def build(tmp_path, *, markets=("BTC", "ETH"), risk_kw=None, **skw):
     maker.funding["BTC"] = FundingInfo("arcus", "BTC", D("0.0000125"))
     taker.funding["BTC"] = FundingInfo("lighter", "BTC", D("0.000012"))
     skw.setdefault("direction_mode", "long_maker")
+    skw.setdefault("leverage", 5)  # explicit (not the small-account default)
     scfg = fast_strategy(markets=[MarketConfig(symbol=s) for s in markets], target_notional=D("1000"),
                          order_notional=D("500"), **skw)
     cfg = AppConfig(strategy=scfg, risk=fast_risk(**(risk_kw or {})),

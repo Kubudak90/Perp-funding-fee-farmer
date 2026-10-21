@@ -118,14 +118,13 @@ class MarketConfig(_Base):
 class StrategyConfig(_Base):
     maker_venue: Venue = "arcus"
     taker_venue: Venue = "lighter"
-    markets: list[MarketConfig] = Field(
-        default_factory=lambda: [MarketConfig(symbol="BTC"), MarketConfig(symbol="ETH"), MarketConfig(symbol="SOL")]
-    )
+    # defaults are sized for ~$200 of collateral per venue (README "Varsayılan ayarlar"); scale all USD sizes together
+    markets: list[MarketConfig] = Field(default_factory=lambda: [MarketConfig(symbol="ETH"), MarketConfig(symbol="SOL")])
 
     # --- sizing (USD notional)
-    target_notional: Decimal = Decimal("2000")  # |position| per leg at the top of a cycle
-    order_notional: Decimal = Decimal("500")  # maker clip size
-    leverage: int = 5
+    target_notional: Decimal = Decimal("150")  # |position| per leg at the top of a cycle (3 clips)
+    order_notional: Decimal = Decimal("50")  # maker clip size (~5 x the $10 Lighter minimum)
+    leverage: int = 3  # cross margin: sets reserved initial margin and the venue-side notional cap, not liquidation
 
     # --- pricing
     # Maker quote is placed so that hedging on the taker venue at its current VWAP yields at
@@ -231,18 +230,20 @@ class ResolvedMarket(_Base):
 
 # --------------------------------------------------------------------------- risk
 class RiskConfig(_Base):
-    max_unhedged_notional: Decimal = Decimal("150")  # USD delta tolerated before emergency action
+    # USD delta that pauses quotes + widens the hedge after unhedged_grace_s (< one clip, above dust / small partials)
+    max_unhedged_notional: Decimal = Decimal("40")
     unhedged_timeout_s: float = 5.0  # how long a delta above min-size may persist
-    max_total_notional: Decimal = Decimal("20000")  # sum |position notional| over all markets per venue
+    # sum |position notional| over all markets per venue; keep >= sum of targets + one clip (price drift headroom)
+    max_total_notional: Decimal = Decimal("350")
     max_divergence_bps: Decimal = Decimal("60")  # pause if |maker_mid/taker_mid - 1| exceeds this (absolute)
     max_basis_dev_bps: Decimal = Decimal("5")  # pause if the instant basis deviates from its EMA by more
     stale_book_s: float = 5.0  # cancel quotes if a book is older than this
-    # maintenance/equity per venue (liquidation at 1.0; ~0.06-0.08 at 5x fully used with BTC margin fractions)
+    # maintenance/equity per venue (liquidation at 1.0; ~0.02-0.05 with the defaults fully used on $200 per venue)
     max_margin_ratio: Decimal = Decimal("0.25")  # stop opening at/above this (equity < 4 x maintenance)
     reduce_margin_ratio: Decimal = Decimal("0.4")  # halt + flatten every pair with reduce-only taker orders
     min_free_collateral_mult: Decimal = Decimal("1.5")  # opening needs free collateral >= clip/leverage x this
     max_equity_divergence_frac: Decimal = Decimal("0.3")  # warn when venue equities differ by more (0 = off)
-    max_daily_loss: Decimal = Decimal("100")  # USD realized+fees+funding; stop the bot if breached
+    max_daily_loss: Decimal = Decimal("15")  # USD realized+fees+funding; stop the bot if breached (0 = off)
     max_consecutive_errors: int = 20
     # a circuit-breaker halt (max_consecutive_errors) clears itself after this long without any venue error; the
     # cooldown doubles with every automatic resume within 24 h (0 = off: stay halted until restart)
@@ -261,13 +262,13 @@ class RiskConfig(_Base):
 
 # --------------------------------------------------------------------------- misc
 class PaperConfig(_Base):
-    initial_balance: Decimal = Decimal("10000")
+    initial_balance: Decimal = Decimal("200")  # per venue; mirrors the live account the defaults are sized for
     maker_latency_ms: dict[str, float] = Field(default_factory=lambda: {"arcus": 50.0, "lighter": 0.0})
     taker_latency_ms: dict[str, float] = Field(default_factory=lambda: {"arcus": 50.0, "lighter": 300.0})
     # Fee overrides for simulation (fractions). None = use venue market metadata.
     maker_fee: dict[str, Decimal] = Field(default_factory=dict)
     taker_fee: dict[str, Decimal] = Field(default_factory=dict)
-    default_leverage: int = 5  # paper leverage until set_leverage is called
+    default_leverage: int = 3  # paper leverage until set_leverage is called (= strategy.leverage)
     # emulate the inner venue's request budget (Lighter Standard: shared 60/min bucket, 40 tx/min, tx_budget_wait_s)
     emulate_rate_limits: bool = True
 
@@ -299,6 +300,19 @@ class AppConfig(_Base):
         if self.strategy.taker_venue == "lighter" and self.lighter.ws_watchdog_s >= self.strategy.hedge_timeout_s:
             out.append(f"lighter.ws_watchdog_s ({self.lighter.ws_watchdog_s}) should be below strategy.hedge_timeout_s "
                        f"({self.strategy.hedge_timeout_s}): a stalled socket should reconnect before hedges expire")
+        mkts = self.enabled_markets()
+        if mkts:
+            # opening refuses a clip once a venue's exposure would pass max_total_notional; a market that cannot reach
+            # its target stays in OPENING (no volume) until prices move back
+            need = sum((m.target_notional for m in mkts), Decimal(0)) + max(m.order_notional for m in mkts)
+            if self.risk.max_total_notional < need:
+                out.append(f"risk.max_total_notional ({self.risk.max_total_notional}) is below the sum of the enabled "
+                           f"markets' target_notional plus one clip ({need}): the last market may never reach its "
+                           f"target and stop producing volume")
+        if not self.strategy.set_leverage_on_start and self.paper.default_leverage != self.strategy.leverage:
+            out.append(f"paper.default_leverage ({self.paper.default_leverage}) differs from strategy.leverage "
+                       f"({self.strategy.leverage}) while set_leverage_on_start is false: paper margin checks use a "
+                       f"different leverage than the risk manager")
         return out
 
     def enabled_markets(self) -> list[ResolvedMarket]:

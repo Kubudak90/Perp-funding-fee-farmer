@@ -36,10 +36,13 @@ def fake_venues():
 
 
 def write_config(path, data_dir):
-    scfg = fast_strategy(direction_mode="long_maker").model_dump(mode="json", exclude={"markets"})
+    # explicit sizes for the fake $100k BTC market (its 0.002 BTC minimum is above the small-account defaults)
+    scfg = fast_strategy(direction_mode="long_maker", target_notional=D("2000"), order_notional=D("500"),
+                         leverage=5).model_dump(mode="json", exclude={"markets"})
     path.write_text(yaml.safe_dump({
         "data_dir": str(data_dir), "strategy": {**scfg, "markets": [{"symbol": "BTC"}]},
-        "risk": fast_risk().model_dump(mode="json"), "monitoring": {"report_interval_s": 0.2}}))
+        "risk": fast_risk(max_total_notional=D("20000")).model_dump(mode="json"),
+        "monitoring": {"report_interval_s": 0.2}}))
 
 
 @pytest.fixture
@@ -165,6 +168,7 @@ async def test_settings_are_validated_and_written_with_a_backup(dash):
     data = await r.json()
     assert data["values"]["strategy"]["direction_mode"] == "long_maker" and data["markets"][0]["symbol"] == "BTC"
     assert any(f["name"] == "max_daily_loss" for f in data["fields"])
+    assert not any("max_total_notional" in w for w in data["warnings"])  # (fast test timings do warn: watchdog)
     patch = {"strategy": {"min_edge_bps": "-0.25", "churn": False}, "risk": {"max_daily_loss": "40"},
              "markets": [{"symbol": "btc"}, {"symbol": "eth", "enabled": False, "order_notional": "250"}]}
     r = await client.put("/api/config", json=patch, headers=AUTH)
@@ -183,6 +187,10 @@ async def test_settings_are_validated_and_written_with_a_backup(dash):
         r = await client.put("/api/config", json=bad, headers=AUTH)
         assert r.status == 400 and err in (await r.json())["error"], bad
     assert (tmp / "config.yaml").read_text() == before
+    # valid but inconsistent: saved, and the consistency warning comes back to the form
+    r = await client.put("/api/config", json={"risk": {"max_total_notional": "1000"}}, headers=AUTH)
+    data = await r.json()
+    assert r.status == 200 and data["saved"] and any("max_total_notional" in w for w in data["warnings"])
 
 
 def test_settings_schema_matches_the_config_models():

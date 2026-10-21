@@ -395,6 +395,7 @@ async def test_status_shape():
     assert st["balances"]["arcus"]["equity"] == D("10000") and st["balances"]["arcus"]["margin_ratio"] == 0
     assert st["errors"] == {"lighter": 1} and st["last_errors"] == {"lighter": "oops"}
     assert st["must_reduce"] is False
+    assert st["max_margin_ratio"] == D("0.25") and st["reduce_margin_ratio"] == D("0.4")  # dashboard thresholds
 
 
 def test_utc_midnight():
@@ -421,7 +422,8 @@ async def test_check_open_requires_free_collateral_for_the_clip():
     """The hedge venue must be able to post the clip's initial margin (with a buffer) BEFORE the maker leg opens;
     the margin ratio alone stays far below its limit while free collateral runs out."""
     venues = {"arcus": FakeExchange("arcus"), "lighter": FakeExchange("lighter")}
-    rm = RiskManager(RiskConfig(min_free_collateral_mult=D("1.5")), venues, leverage={"BTC": 5}, default_leverage=2)
+    rm = RiskManager(RiskConfig(min_free_collateral_mult=D("1.5"), max_total_notional=D("20000")), venues,
+                     leverage={"BTC": 5}, default_leverage=2)
     venues["lighter"].balance = Balance("lighter", equity=D("1000"), available=D("149"), maintenance_margin=D("60"))
     await rm.refresh_balances()
     assert rm.balance("lighter").margin_ratio < D("0.1")
@@ -430,7 +432,7 @@ async def test_check_open_requires_free_collateral_for_the_clip():
     assert rm.check_open("BTC", D("490"))[0]  # 147 <= 149
     assert not rm.check_open("ETH", D("200"))[0]  # unknown symbol -> default 2x: 150 > 149
     assert rm.check_open("ETH", D("200"), leverage=5)[0]  # explicit leverage wins
-    rm.cfg = RiskConfig(min_free_collateral_mult=D("0"))  # 0 disables the check
+    rm.cfg = RiskConfig(min_free_collateral_mult=D("0"), max_total_notional=D("20000"))  # 0 disables the check
     assert rm.check_open("BTC", D("5000"))[0]
 
 

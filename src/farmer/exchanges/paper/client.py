@@ -32,7 +32,8 @@ mid; both venues value funding at the index), rates cached from ``inner.fetch_fu
 
 Accounting (cash method): ``equity = initial_balance + cash_flow + funding + sum(size * mid)`` with
 ``cash_flow = sum(-signed_size * price) - fees``; initial margin = notional / leverage,
-maintenance = notional / (2 * leverage).
+maintenance = notional * the inner market's ``maintenance_margin_fraction`` (as on the live venue; e.g. 1.2-3.3 % on
+BTC/ETH/SOL), else notional / (2 * leverage) when the venue metadata has none.
 
 Limitations: state is in memory only (a restart starts flat with ``initial_balance``); no queue
 position / trade-tape fills (a maker order resting inside the spread only fills when the book
@@ -75,7 +76,7 @@ from farmer.utils.ratelimit import SlidingWindowLimiter
 # identical size) within this window is the same market-maker order: not fresh liquidity
 CONSUMED_GONE_GRACE_S = 1.0
 
-DEFAULT_LEVERAGE = 5  # used until set_leverage() is called for a symbol
+DEFAULT_LEVERAGE = int(PaperConfig.model_fields["default_leverage"].default)  # until set_leverage() is called
 FUNDING_REFRESH_S = 60.0  # how often the funding-rate cache is refreshed from the inner adapter
 FUNDING_PRE_SETTLE_S = 15.0  # extra refresh this close before a settlement (rates can change late)
 FUNDING_MAX_AGE_S = 600.0  # cached rate older than this at settlement -> skip (logged)
@@ -805,6 +806,14 @@ class PaperExchange(Exchange):
                                 unrealized_pnl=upnl, leverage=Decimal(self.leverage(sym)), ts=now)
         return out
 
+    def _maintenance_fraction(self, symbol: str, lev: Decimal) -> Decimal:
+        """Venue maintenance margin per USD notional; fallback 1 / (2 x leverage) without metadata."""
+        m = self.markets.get(symbol)
+        mmf = m.maintenance_margin_fraction if m is not None else None
+        if mmf is not None and mmf > 0:
+            return Decimal(mmf)
+        return 1 / (2 * lev)
+
     def balance_now(self) -> Balance:
         """Synchronous balance snapshot (marks = current inner book mids)."""
         value = ZERO
@@ -818,7 +827,7 @@ class PaperExchange(Exchange):
             lev = Decimal(self.leverage(sym))
             value += p.size * mark
             im += notional / lev
-            mm += notional / (2 * lev)
+            mm += notional * self._maintenance_fraction(sym, lev)
         equity = self.initial_balance + self._cash + self._funding_total + value
         return Balance(venue=self.name, equity=equity, available=equity - im, margin_used=im, maintenance_margin=mm,
                        ts=self._clock())

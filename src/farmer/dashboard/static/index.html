@@ -461,7 +461,8 @@ td.wrap { white-space: normal; min-width: 180px; color: var(--ink-2); }
       tile("Toplam hacim", fmtUsd(rep.all.volume, 0), vNote("all")),
       tile("PnL tahmini (24 sa)", fmtSigned(rep.pnl_24h), null, signClass(rep.pnl_24h)),
       tile("PnL tahmini (toplam)", fmtSigned(rep.pnl_all), perMillion(rep), signClass(rep.pnl_all)),
-      tile("Funding (toplam)", fmtSigned(rep.all.funding), "24 sa: " + fmtSigned(rep["24h"].funding), signClass(rep.all.funding)),
+      tile("Funding (toplam)", fmtSigned(rep.all.funding, 4), "24 sa: " + fmtSigned(rep["24h"].funding, 4),
+        signClass(rep.all.funding)),
       tile("Ücretler (toplam)", fmtUsd(rep.all.fees), "24 sa: " + fmtUsd(rep["24h"].fees)),
     ];
     const dp = eng && eng.risk && eng.risk.daily_pnl;
@@ -483,13 +484,13 @@ td.wrap { white-space: normal; min-width: 180px; color: var(--ink-2); }
     const bals = risk && risk.balances ? Object.entries(risk.balances) : [];
     $("balEmpty").classList.toggle("hidden", bals.length > 0);
     if (!bals.length) { $("balTable").replaceChildren(); return; }
-    const maxMr = num(risk.max_margin_ratio) || 0.25;
+    const maxMr = num(risk.max_margin_ratio) || 0.25, redMr = num(risk.reduce_margin_ratio) || 0.4;
     const head = h("tr", {}, h("th", {}, "Borsa"), h("th", { class: "num" }, "Özsermaye"),
       h("th", { class: "num" }, "Serbest teminat"), h("th", { class: "num" }, "Kullanılan marj"),
       h("th", { class: "num" }, "Marj oranı"), h("th", {}, "Durum"));
     const rows = bals.map(([v, b]) => {
       const mr = num(b.margin_ratio);
-      const kind = mr === null ? "" : mr >= 0.4 ? "critical" : mr >= maxMr ? "warning" : "good";
+      const kind = mr === null ? "" : mr >= redMr ? "critical" : mr >= maxMr ? "warning" : "good";
       const label = { critical: "kapatma eşiği", warning: "yeni pozisyon yok", good: "normal" }[kind] || "–";
       return h("tr", {}, h("td", {}, v), h("td", { class: "num" }, fmtUsd(b.equity)),
         h("td", { class: "num" }, fmtUsd(b.available)), h("td", { class: "num" }, fmtUsd(b.margin_used)),
@@ -517,8 +518,9 @@ td.wrap { white-space: normal; min-width: 180px; color: var(--ink-2); }
       const basis = m.basis && m.basis.ema_bps !== null && m.basis.ema_bps !== undefined ?
         nf(1).format(num(m.basis.ema_bps)) + " bps" : "–";
       const delta = num(m.delta !== undefined ? m.delta : hd.delta);
-      // dust below the venue minimum is normal; red only for real unhedged exposure
-      const exposed = hd.escalated || (num(hd.unhedged_notional) || 0) >= 10;
+      // dust below the hedge venue's minimum order is normal; red only for real unhedged exposure
+      const dust = num(hd.hedge_min_notional) || 10;
+      const exposed = hd.escalated || (num(hd.unhedged_notional) || 0) >= dust;
       let status = m.block_reason || (q ? "kotasyonda" : "–");
       if (hd.close_only) status = "yalnızca kapatma (reduce-only piyasa)";
       if (hd.escalated) status = "⚠ " + (hd.escalated_reason || "hedge gecikiyor");
@@ -739,8 +741,11 @@ td.wrap { white-space: normal; min-width: 180px; color: var(--ink-2); }
     cfg.markets = out;
     return out;
   }
+  // valid but inconsistent settings (e.g. max_total_notional below the sum of the targets)
+  const cfgWarnings = () => (cfg && cfg.warnings && cfg.warnings.length ? "Uyarı: " + cfg.warnings.join(" | ") : "");
   async function loadConfig() {
-    try { cfg = await api("/api/config"); renderConfig(); msg($("cfgMsg"), ""); } catch (e) { msg($("cfgMsg"), e.message, false); }
+    try { cfg = await api("/api/config"); renderConfig(); msg($("cfgMsg"), cfgWarnings(), false); }
+    catch (e) { msg($("cfgMsg"), e.message, false); }
   }
   $("btnAddMkt").addEventListener("click", () => { readMarkets(); cfg.markets.push({ symbol: "", enabled: true }); renderMarketRows(); });
   $("btnReloadCfg").addEventListener("click", loadConfig);
@@ -752,7 +757,9 @@ td.wrap { white-space: normal; min-width: 180px; color: var(--ink-2); }
     patch.markets = readMarkets().map((m) => Object.fromEntries(Object.entries(m).filter(([, v]) => v !== "")));
     try {
       cfg = await api("/api/config", { method: "PUT", body: patch }); renderConfig();
-      msg($("cfgMsg"), "Kaydedildi." + (cfg.running ? " Bot çalışıyor: yeni ayarlar bir sonraki başlatmada geçerli." : ""), true);
+      const warn = cfgWarnings();
+      msg($("cfgMsg"), "Kaydedildi." + (cfg.running ? " Bot çalışıyor: yeni ayarlar bir sonraki başlatmada geçerli." : "") +
+        (warn ? " " + warn : ""), !warn);
     } catch (e) { msg($("cfgMsg"), e.message, false); }
   });
 

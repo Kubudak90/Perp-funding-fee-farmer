@@ -85,6 +85,8 @@ class MarketInfo:
     taker_fee: Decimal = ZERO
     category: MarketCategory = MarketCategory.CRYPTO
     max_leverage: Decimal | None = None
+    # maintenance margin per USD of position notional (fraction, e.g. 0.0167); None = unknown
+    maintenance_margin_fraction: Decimal | None = None
     tick_tiers: tuple[TickTier, ...] = ()
     active: bool = True
     # Venue-specific integer scaling (Lighter): price_int = price * 10**price_decimals

@@ -569,6 +569,8 @@ class RiskManager:
             "daily_pnl": self._daily_pnl,
             "daily_pnl_ts": self._daily_pnl_ts,
             "max_daily_loss": self.cfg.max_daily_loss,
+            "max_margin_ratio": self.cfg.max_margin_ratio,
+            "reduce_margin_ratio": self.cfg.reduce_margin_ratio,
             "errors": dict(self._errors),
             "last_errors": dict(self._last_error),
             "exposure": {v: {"total": sum(d.values(), ZERO), "by_symbol": dict(d)} for v, d in self._exposure.items()},

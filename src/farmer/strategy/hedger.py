@@ -993,6 +993,8 @@ class Hedger:
             "delta": self.delta,
             "unhedged": self.unhedged,
             "unhedged_notional": abs(self.unhedged) * px if px is not None else None,
+            # smallest hedge the taker venue accepts: a residual below it is dust (never escalates)
+            "hedge_min_notional": self.hedge_min(px) * px if px is not None else None,
             "unhedged_age_s": None if self._unhedged_since is None else round(now - self._unhedged_since, 3),
             "escalated": self.escalated,
             "escalated_reason": self._escalated_reason,

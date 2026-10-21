@@ -94,9 +94,9 @@ def test_render_report_full():
     arcus = next(line for line in lines if line.startswith("arcus"))
     assert "vol 1h $820 (M $820/T $0)" in arcus
     assert "24h $1,630 (M $1,630/T $0)" in arcus
-    assert "fills 2" in arcus and "fees 24h $0.10" in arcus and "funding 24h +$0.25" in arcus
+    assert "fills 2" in arcus and "fees 24h $0.10" in arcus and "funding 24h +$0.2500 " in arcus
     lighter = next(line for line in lines if line.startswith("lighter"))
-    assert "(M $0/T $820)" in lighter and "funding 24h -$0.05" in lighter
+    assert "(M $0/T $820)" in lighter and "funding 24h -$0.0500 " in lighter  # 4 decimals: small accounts
     # hedged: net base 0 -> PnL = spreads (+0.1 + 0.1) - fee 0.1 + funding 0.2
     total = next(line for line in lines if line.startswith("total"))
     assert "PnL est 24h +$0.30 all +$0.30" in total

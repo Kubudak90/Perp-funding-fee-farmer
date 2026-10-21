@@ -32,6 +32,8 @@ def test_parse_markets_core_fields(markets):
     assert eth.venue == "lighter" and eth.venue_symbol == "ETH" and eth.active
     assert (btc.market_id, btc.tick_size, btc.step_size, btc.min_size) == (1, D("0.1"), D("0.00001"), D("0.00007"))
     assert eth.extra["mmf"] == 120 and eth.extra["min_imf"] == 200 and eth.extra["raw"]["symbol"] == "ETH"
+    assert eth.maintenance_margin_fraction == D("0.012")  # 120 / 10000
+    assert markets["SOL"].maintenance_margin_fraction == D("0.024")
 
 
 def test_parse_markets_symbols_and_flags(markets):

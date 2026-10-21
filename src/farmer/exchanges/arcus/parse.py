@@ -102,6 +102,12 @@ def _max_leverage(imf: Decimal | None) -> Decimal | None:
     return lev.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
 
+def _fraction(v) -> Decimal | None:
+    """A positive margin fraction, else None (missing / malformed / zero)."""
+    d = dec(v)
+    return d if d is not None and d > 0 else None
+
+
 def market_fields(raw: dict, fee_level: int | None = None, discount_ppm: int = 0) -> dict:
     """All MarketInfo constructor fields for one ``/v1/markets`` row (also used for in-place refresh)."""
     imf = dec(raw.get("initialMarginFraction"))
@@ -147,6 +153,7 @@ def market_fields(raw: dict, fee_level: int | None = None, discount_ppm: int = 0
         taker_fee=taker,
         category=category,
         max_leverage=_max_leverage(imf),
+        maintenance_margin_fraction=_fraction(raw.get("maintenanceMarginFraction")),
         tick_tiers=tick_tiers(raw),
         active=str(raw.get("status") or "").upper() == "ONLINE",
         extra=extra,

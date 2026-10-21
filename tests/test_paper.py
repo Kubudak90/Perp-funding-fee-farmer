@@ -20,6 +20,7 @@ DATA = Path(__file__).parent / "data" / "paper"
 
 
 def pcfg(maker_ms: float = 0.0, taker_ms: float = 0.0, **kw) -> PaperConfig:
+    kw.setdefault("initial_balance", D("10000"))  # explicit: the accounting math below is written for 10k
     return PaperConfig(maker_latency_ms={"arcus": maker_ms, "lighter": maker_ms},
                        taker_latency_ms={"arcus": taker_ms, "lighter": taker_ms}, **kw)
 
@@ -526,9 +527,23 @@ async def test_position_flip_and_average_entry():
     assert await px.fetch_positions() == {}
 
 
+async def test_maintenance_uses_the_venue_fraction_else_half_the_initial_margin():
+    """Live venues charge notional x maintenance fraction (BTC 1.2-1.7 %); without metadata: notional/(2 x lev)."""
+    inner, px = make()
+    await px.set_leverage("BTC", 3)
+    inner.set_book("BTC", [(99, 10)], [(100, 10)])
+    await px.place_market("BTC", Side.BUY, D("2"), worst_price=D("100"))
+    bal = await px.fetch_balance()
+    assert bal.margin_used == D("199") / 3 and bal.maintenance_margin == D("199") / 6
+    inner.markets["BTC"].maintenance_margin_fraction = D("0.012")
+    bal = await px.fetch_balance()
+    assert bal.margin_used == D("199") / 3 and bal.maintenance_margin == D("199") * D("0.012")
+    assert bal.margin_ratio == bal.maintenance_margin / bal.equity
+
+
 async def test_set_leverage_clamped_and_default():
     inner, px = make()
-    assert px.leverage("BTC") == DEFAULT_LEVERAGE
+    assert px.leverage("BTC") == DEFAULT_LEVERAGE == PaperConfig().default_leverage
     inner.markets["BTC"].max_leverage = D("20")
     await px.set_leverage("BTC", 50)
     assert px.leverage("BTC") == 20

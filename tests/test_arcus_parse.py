@@ -33,6 +33,7 @@ def test_parse_btc_market():
     assert m.category is MarketCategory.CRYPTO and m.active and is_market_open(m)
     assert m.max_leverage == D("40") and str(m.max_leverage) == "40"
     assert m.extra["imf"] == D("0.025") and m.extra["mmf"] == D("0.016667")
+    assert m.maintenance_margin_fraction == D("0.016667")
     assert m.extra["is_outside_rth"] is False and m.extra["next_funding_at"] > 1_700_000_000
     assert m.extra["raw"]["marketDisplayName"] == "BTC-USD"
     # tiers: upToPrice is EXCLUSIVE
@@ -73,8 +74,12 @@ def test_update_market_in_place():
     raw["initialMarginFraction"] = "0.1"
     raw["minOrderSize"] = "0.1"
     raw["status"] = "OFFLINE"
+    raw["maintenanceMarginFraction"] = "0.05"
     update_market(m, raw)
     assert id(m) == ident and m.max_leverage == D("10") and m.min_size == D("0.1") and not m.active
+    assert m.maintenance_margin_fraction == D("0.05")
+    raw["maintenanceMarginFraction"] = None  # unknown -> None (the paper model falls back to its estimate)
+    assert parse_market(raw).maintenance_margin_fraction is None
 
 
 def test_funding_info_uses_predicted_rate():

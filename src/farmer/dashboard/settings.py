@@ -71,13 +71,15 @@ def schema() -> dict:
 
 
 def current(path: Path) -> dict:
-    """Effective values of the editable fields (file + defaults) and the configured markets."""
-    cfg = load_config(path if path.exists() else None, env_file=None, environ={})
+    """Effective values of the editable fields (file + defaults), the configured markets and the config's
+    consistency warnings (``AppConfig.warnings``)."""
+    cfg = load_config(path if path.exists() else None, env_file=None, environ={}, warn=False)
     values = {s: {} for s, *_ in FIELDS}
     for s, f, _, _ in FIELDS:
         values[s][f] = _plain(getattr(getattr(cfg, s), f))
     markets = [{f: _plain(getattr(m, f)) for f, _, _ in MARKET_FIELDS} for m in cfg.strategy.markets]
-    return {"values": values, "markets": markets, "path": str(path), "exists": path.exists()}
+    return {"values": values, "markets": markets, "path": str(path), "exists": path.exists(),
+            "warnings": cfg.warnings()}
 
 
 def _coerce(kind: str, v: Any, label: str) -> Any:

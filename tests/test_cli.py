@@ -55,7 +55,7 @@ def test_parser_subcommands():
 
 def test_default_config_may_be_missing_but_explicit_may_not(tmp_path):
     cfg = cli._load(cli.build_parser().parse_args(["stats"]))
-    assert cfg.mode == "paper" and [m.symbol for m in cfg.strategy.markets] == ["BTC", "ETH", "SOL"]
+    assert cfg.mode == "paper" and [m.symbol for m in cfg.strategy.markets] == ["ETH", "SOL"]
     assert cli.main(["stats", "--config", str(tmp_path / "nope.yaml")]) == cli.EXIT_USAGE
 
 
@@ -255,6 +255,7 @@ def test_scan_rows_sort_by_carry():
 async def test_status_prints_delta_per_pair(monkeypatch):
     creds_env(monkeypatch)
     cfg = cli._load(cli.build_parser().parse_args(["status"]))
+    cfg.strategy.markets = [MarketConfig(symbol=s) for s in ("BTC", "ETH", "SOL")]  # explicit, not the defaults
     venues = fake_venues()
     venues["arcus"].positions["BTC"] = D("0.01")
     venues["lighter"].positions["BTC"] = D("-0.008")

@@ -91,6 +91,8 @@ async def test_residual_below_taker_minimum_waits_for_more_fills():
         await asyncio.sleep(0.08)
         assert markets(taker) == [] and h.delta == D("0.001") and h.is_hedged()
         assert h.quoting_blocked() is None  # dust is not an unhedged alarm
+        st = h.status()  # the dashboard colours a delta red only from the hedge minimum up
+        assert st["hedge_min_notional"] == D("0.002") * D("100001") and st["unhedged_notional"] < st["hedge_min_notional"]
         maker_fill(maker, Side.BUY, "0.001")
         await wait_until(lambda: h.taker_pos == D("-0.002"))
     assert [c[3] for c in markets(taker)] == [D("0.002")]

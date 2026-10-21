@@ -7,6 +7,21 @@
 # varsayılanı kullanır. Bilinmeyen alan adı yazarsanız program hata verir (yazım hatası koruması).
 #
 # Birimler: notional = USD; bps = 0.01 % (1 bps = 0.0001); funding = saatlik oran (0.0001 = %0.01/saat).
+#
+# VARSAYILANLAR KÜÇÜK HESAP İÇİNDİR: her borsada ~$200 teminat (Arcus USDG, Lighter USDC).
+#   2 piyasa (ETH, SOL) x $150 hedef = döngü tepesinde borsa başına en fazla ~$300 pozisyon (~1,5x efektif
+#   kaldıraç). Bir bacağın likide olması için fiyatın tek yönde ~%60 oynaması gerekir.
+#
+# ÖLÇEKLEME (teminat artınca, ör. borsa başına $1000 = 5 katı): USD alanlarını teminatla AYNI oranda büyütün.
+#   strategy.target_notional       150 -> 750    (piyasa başına; toplam = teminatın ~1,5 katı / piyasa sayısı)
+#   strategy.order_notional         50 -> 250    (hedefin 1/3'ü; Lighter derinliğine bakın: `farmer scan` RT@$)
+#   risk.max_total_notional        350 -> 1750   (= piyasa sayısı x hedef + bir clip; altında kalırsa son piyasa
+#                                                 hedefe ulaşamaz ve hacim durur, program uyarır)
+#   risk.max_unhedged_notional      40 -> 200    (bir clip'in ~%80'i: normal bir dolum 1 sn içinde hedgelenmezse alarm)
+#   risk.max_daily_loss             15 -> 75     (iki borsadaki toplam teminatın ~%4'ü)
+#   paper.initial_balance          200 -> 1000   (paper, canlı hesabı taklit etsin)
+#   strategy.leverage ve risk.*_ratio / *_mult / *_frac oranları DEĞİŞMEZ (oransaldır).
+#   Piyasa eklerseniz risk.max_total_notional'ı da artırın (piyasa sayısı x hedef + bir clip).
 # =============================================================================
 
 # paper = canlı halka açık veri + SİMÜLE emirler (gerçek para yok).  live = GERÇEK emirler.
@@ -92,30 +107,36 @@ strategy:
   maker_venue: arcus
   taker_venue: lighter
 
-  # İşlem yapılacak piyasalar. Önerilen başlangıç: BTC, ETH, SOL (7/24, derin defter, düşük maliyet).
-  # Her alanı piyasa bazında geçersiz kılabilirsiniz (target_notional, order_notional, leverage,
+  # İşlem yapılacak piyasalar. Varsayılan: ETH ve SOL (7/24; 2026-10 ölçümlerinde $50 clip ile en çok dolum ve
+  # en düşük round-trip maliyet). BTC'nin Arcus defteri tek tick genişliğinde ve önünde çok büyük kuyruk var: daha
+  # az dolum. Her alanı piyasa bazında geçersiz kılabilirsiniz (target_notional, order_notional, leverage,
   # min_edge_bps, max_slippage_bps, arcus_symbol, lighter_symbol).
+  # Piyasa eklerken risk.max_total_notional'ı artırın: >= piyasa sayısı x target_notional + order_notional.
   markets:
-    - symbol: BTC
     - symbol: ETH
     - symbol: SOL
+    # - symbol: BTC                  # 3. piyasa: risk.max_total_notional en az 500 olmalı (3 x 150 + 50)
+    # - symbol: HYPE                 # SOL yerine: daha çok dolum ve daha istikrarlı funding, ama Arcus bakım marjı
+    #                                #   %6,7, likidasyon ücreti %1 (ETH+HYPE'ta likidasyon ~%59 harekette)
     # - symbol: BONK                 # Arcus KBONK <-> Lighter 1000BONK (otomatik eşleşir, fiyat oranı kontrol edilir)
-    #   order_notional: 200
     #
     # RWA (hisse/ETF) örnekleri. Arcus'ta yalnızca normal işlem saatlerinde (isOutsideRth == false,
     # yaklaşık 04:00-20:00 ET, hafta içi) kotasyon verilir; saat dışında yeni pozisyon açılmaz.
     # Funding taşıma getirisi RWA'da genelde daha yüksektir ama hafta sonu/gece pozisyon taşınır.
     # - symbol: SPY
-    #   target_notional: 2000
+    #   target_notional: 100
     # - symbol: QQQ                  # Arcus açık pozisyon (OI) tavanına yakın olabilir, `farmer scan` ile kontrol edin
     # - symbol: NVDA
     # - symbol: AAPL
     # - symbol: TSLA
 
-  # --- boyutlar (USD notional, bacak başına)
-  target_notional: 2000            # döngünün tepesinde hedeflenen pozisyon büyüklüğü
-  order_notional: 500              # tek maker emir (clip) büyüklüğü
-  leverage: 5                      # iki borsada da ayarlanır; düşük tutun (likidasyon riski her bacakta ayrı!)
+  # --- boyutlar (USD notional, bacak başına; ~$200 / borsa teminat için)
+  target_notional: 150             # döngünün tepesinde hedeflenen pozisyon büyüklüğü (3 clip)
+  order_notional: 50               # tek maker emir (clip) büyüklüğü (~5 x Lighter'ın $10 asgari emri; daha küçüğü
+                                   #   asgari emre yuvarlanır, daha büyüğü Lighter defterinde daha çok kayar)
+  leverage: 3                      # iki borsada da ayarlanır. Çapraz marjda likidasyon fiyatını değil, ayrılan
+                                   #   başlangıç marjını ve borsanın izin verdiği tavanı (özsermaye x kaldıraç) belirler.
+                                   #   3x: tek borsada ~$90 zarara kadar döngü sürer; tavan $600. Düşük tutun.
 
   # --- fiyatlama
   min_edge_bps: 0.5                # Lighter'da hedge sonrası en az bu kadar kâr kalacak şekilde kotasyon (negatif = hacim için küçük maliyet kabul)
@@ -178,19 +199,22 @@ strategy:
 # Risk
 # -----------------------------------------------------------------------------
 risk:
-  max_unhedged_notional: 150       # bu kadar USD hedgelenmemiş delta varsa kotasyonu durdur
+  max_unhedged_notional: 40        # bu kadar USD hedgelenmemiş delta varsa kotasyonu durdur + hedge 2x kayma ile
+                                   #   (bir clip'ten küçük, Lighter asgarisinin altındaki kırıntının üstünde)
   unhedged_grace_s: 1.0            # ...ama ancak bu süre boyunca devam ederse (normal dolum+hedge ~0.6 s)
   unhedged_timeout_s: 5.0          # delta bu kadar sürerse agresif hedge / acil durum
-  max_total_notional: 20000        # borsa başına toplam pozisyon notional üst sınırı
+  max_total_notional: 350          # borsa başına toplam pozisyon notional üst sınırı (= 2 x 150 + bir clip;
+                                   #   döngü içinde fiyat ~%15 oynasa da son clip açılabilir)
   max_divergence_bps: 60           # iki borsanın orta fiyatı bundan fazla ayrışırsa dur
   max_basis_dev_bps: 5             # anlık baz, ortalamasından bundan fazla saparsa dur
   stale_book_s: 5.0                # defter bu kadar eskiyse kotasyonları iptal et
-  # bakım marjı / özsermaye (borsa başına; 1.0 = likidasyon). 5x tam kullanımda BTC için başlangıç ~0.06-0.08.
+  # bakım marjı / özsermaye (borsa başına; 1.0 = likidasyon). Varsayılanlarla tam kullanımda ~0.03-0.05.
   max_margin_ratio: 0.25           # bunu aşarsa yeni pozisyon açma (özsermaye < 4 x bakım marjı)
   reduce_margin_ratio: 0.4         # bunu aşarsa bot durur (halt) ve tüm çiftleri reduce-only taker emirle kapatır
   min_free_collateral_mult: 1.5    # yeni pozisyon için serbest teminat >= clip / kaldıraç x bu (her iki borsada)
   max_equity_divergence_frac: 0.3  # iki borsadaki özsermaye bu oranda ayrışırsa uyarı (teminatı dengeleyin; 0 = kapalı)
-  max_daily_loss: 100              # USD (gerçekleşen + ücret + funding); aşılırsa bot durur (0 = kapalı)
+  max_daily_loss: 15               # USD (gerçekleşen + ücret + funding); aşılırsa bot durur (0 = kapalı). Normal
+                                   #   çalışmada tetikleniyorsa limiti değil min_edge_bps'i yükseltin.
   max_consecutive_errors: 20       # bir borsada art arda bu kadar kalıcı hata olursa devre kesici bot'u durdurur (halt)
   error_halt_cooldown_s: 300.0     # devre kesici halt'ı bu kadar süre hiç hata gelmezse kendiliğinden kalkar (0 = kalkmaz)
   max_auto_resumes_per_day: 3      # 24 saatte en fazla bu kadar otomatik devam; bekleme süresi her seferinde iki katına çıkar
@@ -207,12 +231,13 @@ risk:
 # Paper (simülasyon) ayarları
 # -----------------------------------------------------------------------------
 paper:
-  initial_balance: 10000           # her borsa için başlangıç bakiyesi (bellekte; yeniden başlatınca sıfırlanır)
+  initial_balance: 200             # her borsa için başlangıç bakiyesi (canlı hesabı taklit eder; bellekte,
+                                   #   yeniden başlatınca sıfırlanır). Bakım marjı borsanın gerçek oranıyla hesaplanır.
   maker_latency_ms: {arcus: 50.0, lighter: 0.0}
   taker_latency_ms: {arcus: 50.0, lighter: 300.0}   # Lighter Standard taker gecikmesi ~300 ms
   maker_fee: {}                    # ör. {arcus: 0}; boş = borsa piyasa verisinden
   taker_fee: {}                    # ör. {lighter: 0}
-  default_leverage: 5
+  default_leverage: 3              # = strategy.leverage (yalnızca set_leverage_on_start: false iken kullanılır)
   emulate_rate_limits: true        # Lighter Standard bütçesini (60 istek/dk ortak, 40 tx/dk, tx_budget_wait_s) taklit et
 
 # -----------------------------------------------------------------------------

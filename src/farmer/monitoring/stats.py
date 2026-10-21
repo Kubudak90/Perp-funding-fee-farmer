@@ -533,7 +533,7 @@ class StatsReporter:
             lines.append(
                 f"{v:<{width}} vol 1h {vol(a)} | 24h {vol(b)} | all {_usd(c.volume if c else ZERO)}"
                 f" | fills {c.fills if c else 0} | fees 24h {_usd(b.fees if b else ZERO, 2)} all {_usd(c.fees if c else ZERO, 2)}"
-                f" | funding 24h {_signed_usd(b.funding if b else ZERO)} all {_signed_usd(c.funding if c else ZERO)}"
+                f" | funding 24h {_signed_usd(b.funding if b else ZERO, 4)} all {_signed_usd(c.funding if c else ZERO, 4)}"
             )
 
         pnl24, miss24 = self._pnl(status, s24)
@@ -542,7 +542,7 @@ class StatsReporter:
         tot24 = sum((s.volume for s in s24.values()), ZERO)
         fund = sum((s.funding for s in sall.values()), ZERO)
         fees = sum((s.fees for s in sall.values()), ZERO)
-        pnl_line = (f"total vol 24h {_usd(tot24)} all {_usd(tot_vol)} | fees {_usd(fees, 2)} | funding {_signed_usd(fund)}"
+        pnl_line = (f"total vol 24h {_usd(tot24)} all {_usd(tot_vol)} | fees {_usd(fees, 2)} | funding {_signed_usd(fund, 4)}"
                     f" | PnL est 24h {_signed_usd(pnl24)} all {_signed_usd(pnl_all)}")
         missing = sorted(set(miss24) | set(miss_all))
         if missing:

@@ -254,6 +254,7 @@ def parse_market(d: dict) -> MarketInfo | None:
     status = str(d.get("status", ""))
     min_imf = int(d.get("min_initial_margin_fraction") or 0)
     max_lev = (TEN_THOUSAND / Decimal(min_imf)) if min_imf > 0 else None
+    mmf = int(d.get("maintenance_margin_fraction") or 0)  # 1/10000 units (120 = 1.2 %)
     extra = {
         "status": status,
         "force_reduce_only": force_ro,
@@ -261,7 +262,7 @@ def parse_market(d: dict) -> MarketInfo | None:
         "isolated_only": cfg.get("market_margin_mode") == 1,
         "min_imf": min_imf,
         "default_imf": int(d.get("default_initial_margin_fraction") or 0),
-        "mmf": int(d.get("maintenance_margin_fraction") or 0),
+        "mmf": mmf,
         "order_quote_limit": dec(d.get("order_quote_limit")),
         "funding_premium_multiplier": d.get("funding_premium_multiplier"),
         "base_interest_rate": d.get("base_interest_rate"),
@@ -281,6 +282,7 @@ def parse_market(d: dict) -> MarketInfo | None:
         taker_fee=ZERO,
         category=market_category(d),
         max_leverage=max_lev,
+        maintenance_margin_fraction=(Decimal(mmf) / TEN_THOUSAND) if mmf > 0 else None,
         active=status == "active" and not force_ro and not frozen,
         price_decimals=pd,
         size_decimals=sd,

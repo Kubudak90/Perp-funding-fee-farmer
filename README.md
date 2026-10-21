@@ -27,10 +27,11 @@ Botun iki amacı vardır:
 5. [İlk çalıştırma (önerilen sıra)](#i̇lk-çalıştırma-önerilen-sıra)
 6. [Komutlar](#komutlar)
 7. [Web paneli (dashboard)](#web-paneli-dashboard)
-8. [Yapılandırma: öne çıkanlar](#yapılandırma-öne-çıkanlar)
-9. [İzleme ve Telegram](#i̇zleme-ve-telegram)
-10. [Sorun giderme ve hata kodları](#sorun-giderme-ve-hata-kodları)
-11. [Geliştirici notları](#geliştirici-notları)
+8. [Varsayılan ayarlar ($200 / borsa)](#varsayılan-ayarlar-200--borsa)
+9. [Yapılandırma: öne çıkanlar](#yapılandırma-öne-çıkanlar)
+10. [İzleme ve Telegram](#i̇zleme-ve-telegram)
+11. [Sorun giderme ve hata kodları](#sorun-giderme-ve-hata-kodları)
+12. [Geliştirici notları](#geliştirici-notları)
 
 ---
 
@@ -57,8 +58,8 @@ Bot her piyasayı (ör. BTC) bağımsız bir çift olarak yönetir: **Arcus BTC-
    - Funding ödemesine `protect_funding_window_s` saniye kala kapanış ertelenir. Böylece ödeme anında pozisyon açık
      kalır.
 
-**Döngü başına hacim:** her borsada `2 × (target - floor)` notional. Örnek: `target_notional: 2000` ve floor 0 ile her
-tam döngü Arcus'ta yaklaşık $4.000, Lighter'da da yaklaşık $4.000 hacim üretir.
+**Döngü başına hacim:** her borsada `2 × (target - floor)` notional. Örnek: varsayılan `target_notional: 150` ve
+floor 0 ile her tam döngü, piyasa başına Arcus'ta yaklaşık $300, Lighter'da da yaklaşık $300 hacim üretir.
 
 **Güvenlik mekanizmaları:**
 
@@ -119,8 +120,8 @@ maliyet ≈ Lighter_etki(alış) + Lighter_etki(satış) - Arcus_spread + ters s
   | AMD | %8 – 26 |
 
   İyimser uç, ileriye bakma (look-ahead) içerdiği için üst tahmindir.
-- Örnek: BTC'de bacak başına $2.000 pozisyon, %1 APR ile yılda yaklaşık **$20** eder. Carry tek başına küçüktür. Asıl
-  "ürün" çoğunlukla **hacimdir**.
+- Örnek: varsayılan bacak başına $150 pozisyon, %2 APR ile yılda yaklaşık **$3** eder (iki piyasada ~$6). Carry tek
+  başına küçüktür. Asıl "ürün" çoğunlukla **hacimdir**.
 
 **Yapısal baz (kripto).** Arcus fiyatları USD, Lighter'ın kripto endeksi ise fiilen USDT bazlıdır. Bu yüzden Arcus orta
 fiyatı Lighter'ın **~9–14 bps altındadır**.
@@ -153,7 +154,7 @@ fiyatı Lighter'ın **~9–14 bps altındadır**.
 5. **Likidasyon riski her bacakta ayrıdır.** Toplam delta sıfırdır, ama teminat iki borsada ayrı tutulur. Sert bir
    fiyat hareketinde bir bacak kâr ederken diğeri zarar eder ve o borsadaki teminat yetmezse **likide olabilir**.
    - Her iki borsada da yeterli teminat tutun.
-   - **Düşük kaldıraç** kullanın (2–5x).
+   - **Düşük kaldıraç** kullanın (2–5x; varsayılan 3x).
    - Marj oranını (bakım marjı / özsermaye; 1,0 = likidasyon) izleyin: `farmer status`, Telegram raporları.
    - Risk yöneticisi `max_margin_ratio` (0,25) üstünde yeni pozisyon açmaz. Serbest teminat bir clip'in başlangıç
      marjını (`clip / kaldıraç × min_free_collateral_mult`) karşılamıyorsa da açmaz. Bu kontrol iki borsada da
@@ -260,13 +261,18 @@ Komut, `.env` dosyasına yapıştırılacak satırları basar (`ARCUS_ADDRESS=..
    - Hedge borsasının istek bütçesi azalınca (`strategy.min_taker_budget`) kotasyonlar geçici olarak çekilir.
    - Lighter Standard bütçesi (ortak 60 istek/dk, 40 tx/dk, `tx_budget_wait_s`) taklit edilir
      (`paper.emulate_rate_limits`). Bütçe dolunca hedge'ler bekler ya da reddedilir, canlıdaki gibi.
-3. **Küçük canlı deneme.** `config.yaml` içinde `target_notional: 200` ve `order_notional: 100` gibi küçük değerler
-   kullanın. İki borsada da biraz teminat olsun.
+   - Hesap canlıyı taklit eder: her borsada `paper.initial_balance` (varsayılan $200) bakiye; bakım marjı borsanın
+     gerçek oranıyla hesaplanır (ör. ETH Arcus %2,7, Lighter %1,2).
+3. **Küçük canlı deneme.** Varsayılanlar borsa başına ~$200 teminat içindir
+   ([Varsayılan ayarlar](#varsayılan-ayarlar-200--borsa)). İki borsaya da en az bu kadar teminat yatırın. Daha
+   temkinli başlamak için ilk saatlerde tek piyasa kullanabilirsiniz (`strategy.markets` altında yalnızca
+   `- symbol: ETH`).
    ```bash
    farmer status                  # bakiyeler, pozisyonlar, açık emirler, çift başına delta
    farmer run --live --yes        # ya da config'te mode: live
    ```
-4. Birkaç gün izleyin (`farmer stats`, Telegram), sonra boyutları **kademeli** artırın.
+4. Birkaç gün izleyin (`farmer stats`, Telegram, panel), sonra teminatı ve boyutları **birlikte, kademeli** artırın
+   ([ölçekleme kuralı](#varsayılan-ayarlar-200--borsa)).
 
 Botu durdurmak için **Ctrl+C** veya `kill -TERM <pid>` kullanın (SIGHUP da aynı şekilde işlenir; `nohup` ile yok
 sayılmışsa dokunulmaz). Bot kotasyonları iptal eder, açık deltayı hedge eder ve kapanır. `farmer close-all` sinyalle
@@ -333,28 +339,99 @@ ssh -L 8080:127.0.0.1:8080 kullanici@sunucu   # sonra yerelde http://127.0.0.1:8
 Her API isteği token ister; başka sitelerden gelen istekler (Origin / Host kontrolü) reddedilir. Sayfa dışarıdan hiçbir
 script ya da dosya yüklemez.
 
+## Varsayılan ayarlar ($200 / borsa)
+
+Varsayılanlar, **her borsada yaklaşık $200 teminatı** (Arcus USDG, Lighter USDC) olan küçük bir hesap için
+ayarlıdır. Öncelik sırası: önce güvenlik (likidasyon riski yok, bot kilitlenmez), sonra ~sıfır maliyetle en çok hacim;
+funding ek gelirdir. Rakamlar 2026-10-21 tarihli halka açık borsa verilerinden ve kısa paper koşularından gelir.
+
+| Alan | Değer | Neden |
+|---|---|---|
+| `strategy.markets` | ETH, SOL | $50 clip ile en çok dolum ve en düşük round-trip maliyet (SOL ~0,2 bps, ETH ~0,6 bps). BTC'nin Arcus defteri tek tick genişliğinde ve önünde ~$450k kuyruk var; hareketli piyasada SOL'un ~1/4'ü kadar dolum aldı. |
+| `strategy.target_notional` | 150 | Piyasa başına 3 clip. Döngü tepesinde borsa başına en fazla ~$300 pozisyon (~1,5x efektif kaldıraç). |
+| `strategy.order_notional` | 50 | Lighter'ın $10 asgari emrinin ~5 katı; Lighter defter etkisi ~0,3–0,4 bps. |
+| `strategy.leverage` | 3 | Çapraz marjda likidasyon fiyatını değiştirmez. Ayrılan başlangıç marjını ($300 / 3 = $100) ve borsanın izin verdiği tavanı (özsermaye × 3 = $600) belirler. |
+| `risk.max_total_notional` | 350 | 2 × 150 + bir clip: fiyat döngü içinde ~%15 oynasa da son clip açılır. |
+| `risk.max_unhedged_notional` | 40 | Bir clip'ten küçük: 1 sn içinde hedgelenmeyen tam bir dolum kotasyonu durdurur ve hedge'i 2x kayma ile gönderir. Lighter asgarisinin (~$10) altındaki kırıntı ve küçük kısmi dolumlar alarm vermez. |
+| `risk.max_daily_loss` | 15 | İki borsadaki toplam teminatın (~$400) ~%4'ü. |
+| `paper.initial_balance` / `paper.default_leverage` | 200 / 3 | Paper, canlı hesabı taklit eder. |
+
+Oransal ayarlar değişmedi ve her boyutta çalışır: `max_margin_ratio` 0,25, `reduce_margin_ratio` 0,4,
+`min_free_collateral_mult` 1,5, `max_equity_divergence_frac` 0,3, `min_edge_bps` 0,5, `max_slippage_bps` 8.
+`config.example.yaml` aynı değerleri açıklamalarıyla içerir. HYPE, SOL yerine seçilebilir (daha çok dolum ve daha
+istikrarlı funding), ama Arcus bakım marjı %6,7 ve likidasyon ücreti %1'dir.
+
+**Marj ve stres** (borsa başına $200, döngü tepesinde $300 pozisyon, 3x):
+
+- Başlangıç marjı $100, serbest teminat $100. Yeni bir clip için gereken serbest teminat 50 / 3 × 1,5 = **$25**. Bu
+  kontrol döngünün her adımında iki borsada da geçer.
+- Marj oranı (bakım marjı / özsermaye) tepede Arcus'ta ~0,045, Lighter'da ~0,027'dir. Yeni pozisyon sınırı 0,25'tir.
+- Fiyat tek yönde oynadığında zarar eden borsada ($300 tek yönlü pozisyon) olanlar:
+
+  | Fiyat hareketi | Ne olur |
+  |---|---|
+  | ~%12 | İki borsanın özsermayesi %30'dan fazla ayrışır: uyarı gelir, teminatı dengeleyin. |
+  | ~%19 (kısa bacak) / ~%37 (uzun bacak) | Serbest teminat yetmez: yeni clip açılmaz. |
+  | ~%55 (Arcus kısa) / ~%65 (Lighter uzun) | `reduce_margin_ratio`: bot durur ve iki bacağı reduce-only taker emirle kapatır. |
+  | ~%62 / ~%66 | Likidasyon. |
+
+  Asıl koruma düşük efektif kaldıraçtır (~1,5x). Bot borsalar arasında para transferi yapmaz; teminatı düzenli
+  dengeleyin.
+- Tek borsada ~$90'a kadar birikmiş zararla da tam döngü açılabilir. Daha fazlasında yeni clip açılmaz ve hacim durur;
+  teminatı dengeleyince bot kendiliğinden devam eder.
+
+**Beklenen hacim ve maliyet** (kısa paper ölçümleri, garanti değil):
+
+- ETH + SOL ile Arcus'ta hareketli piyasada saatte **~$10.000**, sakin piyasada saatte **~$200–600** maker hacmi.
+  Lighter'da aynı kadar hedge hacmi oluşur.
+- Hedge'ler piyasa başına dakikada 0,1–2 işlemdir; Lighter'ın 40 tx/dk sınırının ≤ %10'u.
+- Kısa paper koşularında maliyet Arcus hacminin her $1M'ı için ~$70–165 oldu (−0,7 ile −1,7 bps). Bu oranla
+  `max_daily_loss` (15) günde ~$90–200k Arcus hacminde dolar. Normal çalışmada tetikleniyorsa limiti değil
+  `min_edge_bps` değerini yükseltin.
+- Funding $150 pozisyonda günde $0,02'nin altındadır.
+- Arcus emir havuzu dolan her $1 için 10 işlem hakkı kazandırır (bir $50 dolum = 500 hak). Hiç dolum olmayan sakin
+  saatlerde iki piyasa saatte ~3.900 hak harcar; havuz yarıya inince bot fiyat iyileştirmelerini kendiliğinden
+  yavaşlatır. Hareketli bir saat havuzu fazlasıyla doldurur.
+
+**Ölçekleme.** Teminat artınca USD alanlarını teminatla aynı oranda büyütün. Kaldıraç ve oransal ayarlar değişmez.
+
+| Alan | Kural | $200 / borsa | $1000 / borsa |
+|---|---|---|---|
+| `strategy.target_notional` | teminat × 1,5 / piyasa sayısı | 150 | 750 |
+| `strategy.order_notional` | hedefin ~1/3'ü (Lighter derinliği: `farmer scan` → `RT@$`) | 50 | 250 |
+| `risk.max_total_notional` | piyasa sayısı × hedef + bir clip | 350 | 1750 |
+| `risk.max_unhedged_notional` | bir clip'in ~%80'i | 40 | 200 |
+| `risk.max_daily_loss` | toplam teminatın ~%4'ü | 15 | 75 |
+| `paper.initial_balance` | borsa başına teminat | 200 | 1000 |
+
+Piyasa eklerken `risk.max_total_notional` değerini de artırın (ör. BTC eklenirse 3 × 150 + 50 = 500). Hedeflerin
+toplamı artı bir clip bu sınırı aşarsa son piyasa hedefine ulaşamaz ve hacim üretmez; program başlarken logda,
+panelde de ayarları kaydederken uyarı verir.
+
 ## Yapılandırma: öne çıkanlar
 
 Tüm alanlar Türkçe açıklamalarıyla `config.example.yaml` içindedir. En önemlileri:
 
 | Alan | Varsayılan | Not |
 |---|---|---|
-| `strategy.markets` | BTC, ETH, SOL | Piyasa başına `target_notional`, `order_notional`, `leverage`, `min_edge_bps` ayrı ayarlanabilir. RWA örnekleri yorum satırı olarak duruyor. |
-| `strategy.target_notional` | 2000 | Döngü tepesindeki pozisyon (USD, bacak başına). |
-| `strategy.order_notional` | 500 | Maker clip. Lighter derinliğine göre seçin (`farmer scan` → `L ToB $`, `RT@$`). |
-| `strategy.leverage` | 5 | İki borsada ayarlanır. Düşük tutun. |
+| `strategy.markets` | ETH, SOL | Piyasa başına `target_notional`, `order_notional`, `leverage`, `min_edge_bps` ayrı ayarlanabilir. BTC, HYPE ve RWA örnekleri yorum satırı olarak duruyor. |
+| `strategy.target_notional` | 150 | Döngü tepesindeki pozisyon (USD, bacak başına). |
+| `strategy.order_notional` | 50 | Maker clip. Lighter derinliğine göre seçin (`farmer scan` → `L ToB $`, `RT@$`). |
+| `strategy.leverage` | 3 | İki borsada ayarlanır. Düşük tutun. |
 | `strategy.min_edge_bps` | 0.5 | Hedge sonrası hedeflenen minimum kâr. **Negatif** değer, hacim için küçük bir maliyeti kabul etmek demektir; daha çok dolum olur. |
 | `strategy.max_slippage_bps` | 8 | Hedge IOC emrinin en kötü fiyatı. |
 | `strategy.hold_seconds` / `hold_through_funding` | 0 / false | Carry için pozisyonu funding ödemesine kadar tutmak isterseniz `hold_through_funding: true`. |
 | `strategy.churn_floor_frac` | 0 | Kapanışta hedefin bu oranı açık kalır. Örneğin 0.5, pozisyonun yarısını hep tutar, yarısıyla hacim üretir. |
 | `strategy.direction_mode` | auto | `long_maker` / `short_maker` yönü sabitler. |
-| `risk.max_unhedged_notional` | 150 | Bu USD deltanın üstünde kotasyon durur. |
-| `risk.max_daily_loss` | 100 | Aşılırsa bot durur (halt). Yeniden başlatana kadar kotasyon vermez. |
+| `risk.max_unhedged_notional` | 40 | Bu USD delta 1 sn'den uzun sürerse kotasyon durur, hedge 2x kayma ile gönderilir. |
+| `risk.max_total_notional` | 350 | Borsa başına toplam pozisyon sınırı. En az piyasa sayısı × hedef + bir clip olmalı. |
+| `risk.max_daily_loss` | 15 | Aşılırsa bot durur (halt). Yeniden başlatana kadar kotasyon vermez. |
 | `risk.max_consecutive_errors` / `error_halt_cooldown_s` | 20 / 300 | Bir borsada art arda bu kadar kalıcı hata devre kesiciyi tetikler. Bu süre boyunca hata gelmezse halt kendiliğinden kalkar (0 = kalkmaz). |
 | `risk.max_margin_ratio` / `reduce_margin_ratio` | 0.25 / 0.4 | Bakım marjı / özsermaye. Sırasıyla yeni pozisyon açmayı durdurur / botu durdurup tüm pozisyonları taker ile kapatır. |
 | `risk.min_free_collateral_mult` | 1.5 | Yeni pozisyon için her borsada serbest teminat >= clip / kaldıraç × bu değer. |
 | `risk.max_equity_divergence_frac` | 0.3 | İki borsanın özsermayesi bu oranda ayrışırsa uyarı (teminatı dengeleyin). |
 | `risk.close_on_exit` | false | `true`: kapanışta iki bacak da taker ile kapatılır. |
+| `paper.initial_balance` | 200 | Paper modunda borsa başına başlangıç bakiyesi. |
 | `arcus.dead_mans_switch_s` | 60 | Bot ölürse Arcus emirleri bu kadar saniye sonra iptal edilir. |
 | `lighter.max_requests_per_minute` / `read_reserve` | 55 / 25 | Standard 60/dk limitini korur. |
 
