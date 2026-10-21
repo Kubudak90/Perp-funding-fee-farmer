@@ -87,3 +87,33 @@ async def test_fetch_registered_pubkey(server):
     async with aiohttp.ClientSession() as s:
         assert await keys.fetch_registered_pubkey(1, 4, url=url, session=s) == "ab" * 40
         assert await keys.fetch_registered_pubkey(1, 5, url=url, session=s) is None
+
+
+ERR = ("private key does not match the one on Lighter. ownPubKey: " + "af" * 40 + " response: " + "49" * 40
+       + " on api key 4")
+
+
+async def test_explain_key_mismatch_finds_the_right_slot(server):
+    url, responses = server
+    responses["/api/v1/apikeys"] = (200, {"code": 200, "api_keys": [
+        {"account_index": 7, "api_key_index": 2, "public_key": "AF" * 40},
+        {"account_index": 7, "api_key_index": 4, "public_key": "49" * 40}]})
+    hint = await keys.explain_key_mismatch(ERR, account_index=7, api_key_index=4, url=url)
+    assert "LIGHTER_API_KEY_INDEX=2" in hint
+
+
+async def test_explain_key_mismatch_not_registered(server):
+    url, responses = server
+    responses["/api/v1/apikeys"] = (200, {"code": 200, "api_keys": [
+        {"account_index": 7, "api_key_index": 0, "public_key": "11" * 40},
+        {"account_index": 7, "api_key_index": 4, "public_key": "49" * 40}]})
+    hint = await keys.explain_key_mismatch(ERR, account_index=7, api_key_index=4, url=url)
+    assert "not registered on account 7" in hint and "slots: 0, 4" in hint and "farmer keygen lighter" in hint
+    assert "af" * 40 not in hint  # only a short prefix of the public key, never anything secret
+
+
+async def test_explain_key_mismatch_unknown_inputs(server):
+    url, responses = server
+    assert await keys.explain_key_mismatch("some other error", account_index=7, api_key_index=4, url=url) is None
+    responses["/api/v1/apikeys"] = (500, {"code": 500})
+    assert await keys.explain_key_mismatch(ERR, account_index=7, api_key_index=4, url=url) is None

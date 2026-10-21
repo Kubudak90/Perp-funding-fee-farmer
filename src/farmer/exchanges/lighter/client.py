@@ -77,6 +77,7 @@ from farmer.exchanges.lighter.helpers import (
     trade_to_fill,
     worst_price_to_int,
 )
+from farmer.exchanges.lighter.keys import explain_key_mismatch
 from farmer.exchanges.lighter.signer import (
     CANCEL_ALL_IMMEDIATE,
     CROSS_MARGIN_MODE,
@@ -385,7 +386,18 @@ class LighterExchange(Exchange):
                 if code == ERR_RESTRICTED:
                     self._set_restricted()
                     raise ExchangeError(RESTRICTED_MESSAGE, retryable=False, code=ERR_RESTRICTED)
-                raise ExchangeError(f"lighter API key check failed: {err} (register the key; see keys.py)", retryable=False)
+                hint = None
+                if "does not match" in str(err):
+                    try:
+                        await self._limiter.acquire()
+                        hint = await asyncio.wait_for(explain_key_mismatch(
+                            str(err), account_index=int(cfg.account_index), api_key_index=int(cfg.api_key_index),
+                            url=cfg.url), 15.0)
+                    except Exception:
+                        hint = None
+                raise ExchangeError(f"lighter API key check failed: {err} -> "
+                                    f"{hint or 'register the key: farmer keygen lighter (see README, API anahtarları)'}",
+                                    retryable=False)
         if self._executor is None:
             self._executor = TxExecutor(self._transport, ack_timeout_s=self._tx_ack_timeout_s,
                                         rest_timeout_s=self._tx_rest_timeout_s)

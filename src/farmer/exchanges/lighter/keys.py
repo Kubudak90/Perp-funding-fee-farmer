@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
 import aiohttp
@@ -118,6 +119,42 @@ async def fetch_registered_pubkey(account_index: int, api_key_index: int, *, url
         if int(k.get("api_key_index", -1)) == api_key_index:
             return normalize_pubkey(k.get("public_key"))
     return None
+
+
+_OWN_PUBKEY_RE = re.compile(r"ownPubKey:\s*(?:0x)?([0-9a-fA-F]{16,})")
+
+
+async def explain_key_mismatch(err: str, *, account_index: int, api_key_index: int, url: str = MAINNET_URL,
+                               session: aiohttp.ClientSession | None = None) -> str | None:
+    """Turn the signer's "private key does not match" error into an actionable hint.
+
+    The error carries the public key derived from the configured private key (``ownPubKey``); ``/apikeys`` with
+    ``api_key_index=255`` lists every key slot of the account (public). Returns None when it cannot tell."""
+    m = _OWN_PUBKEY_RE.search(err or "")
+    if not m:
+        return None
+    own_pk = normalize_pubkey(m.group(1))
+    own_s = session is None
+    s = session or aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+    try:
+        status, j = await _get_json(s, f"{url}/api/v1/apikeys", {"account_index": account_index, "api_key_index": 255})
+    except Exception:
+        return None
+    finally:
+        if own_s:
+            await s.close()
+    if status != 200 or not isinstance(j, dict):
+        return None
+    slots = {int(k.get("api_key_index", -1)): normalize_pubkey(k.get("public_key")) for k in j.get("api_keys") or []}
+    match = sorted(i for i, pk in slots.items() if pk == own_pk)
+    if match and api_key_index not in match:
+        return (f"your private key IS registered on account {account_index}, as API key index {match[0]} (not "
+                f"{api_key_index}): set LIGHTER_API_KEY_INDEX={match[0]}")
+    used = ", ".join(str(i) for i in sorted(slots)) or "none"
+    return (f"your private key (public key {own_pk[:16]}...) is not registered on account {account_index} at {url} "
+            f"(registered key slots: {used}). Check LIGHTER_ACCOUNT_INDEX and the network (lighter.url: mainnet vs "
+            f"Robinhood Chain), or register a new key: `farmer keygen lighter` (needs LIGHTER_ETH_PRIVATE_KEY once) "
+            f"or create one in the Lighter app and copy its index + private key")
 
 
 async def fetch_next_nonce(account_index: int, api_key_index: int, *, url: str, session: aiohttp.ClientSession) -> int | None:
